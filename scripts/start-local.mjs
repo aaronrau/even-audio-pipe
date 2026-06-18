@@ -12,7 +12,8 @@ const asrWorkerDir = join(rootDir, 'asr-worker')
 const localAsrPython = process.platform === 'win32'
   ? join(asrWorkerDir, '.venv', 'Scripts', 'python.exe')
   : join(asrWorkerDir, '.venv', 'bin', 'python')
-const config = loadConfig()
+const configPath = resolve(rootDir, process.env.EVEN_AUDIO_PIPE_CONFIG || 'config.json')
+const config = loadConfig(configPath)
 const storageConfig = resolveStorageConfig(config.storage)
 const transcriptCleanupConfig = resolveTranscriptCleanupConfig(config.transcriptCleanup)
 
@@ -100,6 +101,7 @@ spawnManaged('receiver', 'npm', ['start'], {
     TRANSCRIPT_CLEANUP_TIMEOUT_MS: String(transcriptCleanupConfig.timeoutMs),
     TRANSCRIPT_CLEANUP_PROMPT: transcriptCleanupConfig.prompt,
     TRANSCRIPT_CLEANUP_API_KEY: transcriptCleanupConfig.apiKey,
+    EVEN_AUDIO_PIPE_CONFIG_PATH: configPath,
   },
 })
 
@@ -151,8 +153,7 @@ function interfaceScore(name, address) {
   return score
 }
 
-function loadConfig() {
-  const configPath = resolve(rootDir, process.env.EVEN_AUDIO_PIPE_CONFIG || 'config.json')
+function loadConfig(configPath) {
   if (!existsSync(configPath)) return {}
 
   try {
@@ -349,6 +350,7 @@ function defaultCleanupPrompt() {
   return [
     'You clean short ASR transcript chunks from smart glasses.',
     'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
+    'Always rewrite the misheard phrases "ling few", "lane view", and "lanefuse" as "Langfuse".',
     "Preserve the speaker's meaning and wording.",
     'Do not add facts, commands, explanations, or markdown.',
     'If uncertain, keep the original wording.',

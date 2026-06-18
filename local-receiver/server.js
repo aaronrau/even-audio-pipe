@@ -1,6 +1,6 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { appendFileSync, createWriteStream, mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, createWriteStream, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 
@@ -27,19 +27,27 @@ const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
-const transcriptCleanupEnabled = !isDisabled(process.env.TRANSCRIPT_CLEANUP_ENABLED || '0')
-const transcriptCleanupUrl = process.env.TRANSCRIPT_CLEANUP_URL || 'http://127.0.0.1:8080/v1/chat/completions'
-const transcriptCleanupModel = process.env.TRANSCRIPT_CLEANUP_MODEL || 'gemma-4-e4b-it-q4_0'
-const transcriptCleanupTemperature = Number(process.env.TRANSCRIPT_CLEANUP_TEMPERATURE || 0)
-const transcriptCleanupTimeoutMs = Number(process.env.TRANSCRIPT_CLEANUP_TIMEOUT_MS || 15_000)
-const transcriptCleanupPrompt = process.env.TRANSCRIPT_CLEANUP_PROMPT || defaultCleanupPrompt()
-const transcriptCleanupApiKey = process.env.TRANSCRIPT_CLEANUP_API_KEY || ''
+const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
+const transcriptCleanupEnv = {
+  enabled: !isDisabled(process.env.TRANSCRIPT_CLEANUP_ENABLED || '0'),
+  url: process.env.TRANSCRIPT_CLEANUP_URL || 'http://127.0.0.1:8080/v1/chat/completions',
+  model: process.env.TRANSCRIPT_CLEANUP_MODEL || 'gemma-4-e4b-it-q4_0',
+  temperature: Number(process.env.TRANSCRIPT_CLEANUP_TEMPERATURE || 0),
+  timeoutMs: Number(process.env.TRANSCRIPT_CLEANUP_TIMEOUT_MS || 15_000),
+  prompt: process.env.TRANSCRIPT_CLEANUP_PROMPT || defaultCleanupPrompt(),
+  apiKey: process.env.TRANSCRIPT_CLEANUP_API_KEY || '',
+}
 
 mkdirSync(audioDirPath, { recursive: true })
 mkdirSync(transcriptDirPath, { recursive: true })
 
 let asrQueue = Promise.resolve()
 let asrJobId = 0
+let runtimePromptCache = {
+  mtimeMs: -1,
+  prompt: '',
+  warned: false,
+}
 
 const server = createServer((req, res) => {
   if (req.url === '/health') {
@@ -173,6 +181,7 @@ function defaultCleanupPrompt() {
   return [
     'You clean short ASR transcript chunks from smart glasses.',
     'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
+    'Always rewrite the misheard phrases "ling few", "lane view", and "lanefuse" as "Langfuse".',
     "Preserve the speaker's meaning and wording.",
     'Do not add facts, commands, explanations, or markdown.',
     'If uncertain, keep the original wording.',
@@ -233,8 +242,43 @@ async function transcribeWithWorker(wavPath) {
   return normalizeTranscript(body?.text || '')
 }
 
-async function cleanTranscript(rawTranscript) {
-  if (!transcriptCleanupEnabled) {
+function currentTranscriptCleanupConfig() {
+  const runtimePrompt = readRuntimeCleanupPrompt()
+
+  return {
+    ...transcriptCleanupEnv,
+    temperature: Number.isFinite(transcriptCleanupEnv.temperature) ? transcriptCleanupEnv.temperature : 0,
+    timeoutMs: Number.isFinite(transcriptCleanupEnv.timeoutMs) ? transcriptCleanupEnv.timeoutMs : 15_000,
+    prompt: runtimePrompt || transcriptCleanupEnv.prompt || defaultCleanupPrompt(),
+  }
+}
+
+function readRuntimeCleanupPrompt() {
+  if (!runtimeConfigPath) return ''
+
+  try {
+    const stat = statSync(runtimeConfigPath)
+    if (stat.mtimeMs === runtimePromptCache.mtimeMs) return runtimePromptCache.prompt
+
+    const config = JSON.parse(readFileSync(runtimeConfigPath, 'utf8'))
+    const prompt = config?.transcriptCleanup?.prompt
+    runtimePromptCache = {
+      mtimeMs: stat.mtimeMs,
+      prompt: typeof prompt === 'string' ? prompt : '',
+      warned: false,
+    }
+    return runtimePromptCache.prompt
+  } catch (err) {
+    if (err?.code !== 'ENOENT' && !runtimePromptCache.warned) {
+      console.warn(`[cleanup] could not reload prompt from config; keeping previous prompt: ${err.message}`)
+      runtimePromptCache.warned = true
+    }
+    return runtimePromptCache.prompt
+  }
+}
+
+async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptCleanupConfig()) {
+  if (!cleanupConfig.enabled) {
     return {
       enabled: false,
       ok: true,
@@ -243,26 +287,26 @@ async function cleanTranscript(rawTranscript) {
   }
 
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), transcriptCleanupTimeoutMs)
+  const timeout = setTimeout(() => controller.abort(), cleanupConfig.timeoutMs)
   timeout.unref?.()
 
   try {
     const headers = { 'content-type': 'application/json' }
-    if (transcriptCleanupApiKey) {
-      headers.authorization = `Bearer ${transcriptCleanupApiKey}`
+    if (cleanupConfig.apiKey) {
+      headers.authorization = `Bearer ${cleanupConfig.apiKey}`
     }
 
-    const res = await fetch(transcriptCleanupUrl, {
+    const res = await fetch(cleanupConfig.url, {
       method: 'POST',
       headers,
       signal: controller.signal,
       body: JSON.stringify({
-        model: transcriptCleanupModel,
-        temperature: transcriptCleanupTemperature,
+        model: cleanupConfig.model,
+        temperature: cleanupConfig.temperature,
         messages: [
           {
             role: 'system',
-            content: transcriptCleanupPrompt,
+            content: cleanupConfig.prompt,
           },
           {
             role: 'user',
@@ -299,18 +343,18 @@ async function cleanTranscript(rawTranscript) {
     return {
       enabled: true,
       ok: true,
-      model: transcriptCleanupModel,
+      model: cleanupConfig.model,
       text: cleaned,
     }
   } catch (err) {
     const error = err?.name === 'AbortError'
-      ? `cleanup timed out after ${transcriptCleanupTimeoutMs}ms`
+      ? `cleanup timed out after ${cleanupConfig.timeoutMs}ms`
       : err?.message || String(err)
     console.error(`[cleanup] failed; using raw transcript: ${error}`)
     return {
       enabled: true,
       ok: false,
-      model: transcriptCleanupModel,
+      model: cleanupConfig.model,
       text: rawTranscript,
       error,
     }
@@ -357,7 +401,8 @@ async function processRecording(paths, bytes, targetSocket, jobId) {
   }
 
   if (rawTranscript) {
-    if (transcriptCleanupEnabled) {
+    const cleanupConfig = currentTranscriptCleanupConfig()
+    if (cleanupConfig.enabled) {
       sendSocketJson(targetSocket, {
         type: 'asr_status',
         status: 'cleaning',
@@ -366,7 +411,7 @@ async function processRecording(paths, bytes, targetSocket, jobId) {
       })
     }
 
-    const cleanup = await cleanTranscript(rawTranscript)
+    const cleanup = await cleanTranscript(rawTranscript, cleanupConfig)
     const cleanedTranscript = cleanup.text
 
     writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup)
@@ -658,6 +703,7 @@ wss.on('connection', (socket, req) => {
 })
 
 server.listen(port, '0.0.0.0', () => {
+  const startupCleanupConfig = currentTranscriptCleanupConfig()
   console.log(`[server] HTTP health: http://0.0.0.0:${port}/health`)
   console.log(`[server] WebSocket audio: ws://0.0.0.0:${port}/audio`)
   console.log('[server] Use your laptop LAN/Tailscale IP in the Even Hub app, not localhost.')
@@ -669,6 +715,9 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)
   console.log(`[server] ASR command fallback: ${asrCommand ? 'configured' : 'not configured'}`)
   console.log(
-    `[server] Transcript cleanup: ${transcriptCleanupEnabled ? `${transcriptCleanupModel} at ${transcriptCleanupUrl}` : 'disabled'}`,
+    `[server] Transcript cleanup: ${startupCleanupConfig.enabled ? `${startupCleanupConfig.model} at ${startupCleanupConfig.url}` : 'disabled'}`,
   )
+  if (runtimeConfigPath) {
+    console.log(`[server] Cleanup prompt hot reload: ${runtimeConfigPath}`)
+  }
 })

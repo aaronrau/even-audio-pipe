@@ -199,6 +199,10 @@ When `autoStart` is enabled, `npm start` will:
 If cleanup cannot be reused or started, the app keeps running with raw ASR
 transcripts unless `transcriptCleanup.required` is set to `true`.
 
+Changes to `transcriptCleanup.prompt` in `config.json` are picked up by the
+receiver on the next cleanup request. You do not need to restart for prompt-only
+edits.
+
 Prerequisites for the automatic llama.cpp path:
 
 - ROCm HIP SDK installed and `hipconfig` on `PATH`.
