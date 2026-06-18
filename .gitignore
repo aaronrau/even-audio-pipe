@@ -1,0 +1,27 @@
+node_modules/
+
+# Build output
+dist/
+app/dist/
+
+# Local generated app config
+config.json
+app/.env.local
+app/app.json
+
+# Runtime audio and transcript artifacts
+data/
+local-receiver/recordings/
+*.pcm
+*.wav
+*.log
+
+# Python runtime artifacts
+asr-worker/.venv/
+asr-worker/__pycache__/
+*.pyc
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/

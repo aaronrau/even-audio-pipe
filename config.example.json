@@ -1,0 +1,7 @@
+{
+  "storage": {
+    "audioDir": "data/audio",
+    "transcriptDir": "data/transcripts",
+    "transcriptsLog": "data/transcripts/transcripts.log"
+  }
+}

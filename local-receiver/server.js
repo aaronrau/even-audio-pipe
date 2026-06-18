@@ -1,0 +1,493 @@
+import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
+import { appendFileSync, createWriteStream, mkdirSync, writeFileSync } from 'node:fs'
+import { basename, join, resolve } from 'node:path'
+import { WebSocket, WebSocketServer } from 'ws'
+
+const port = Number(process.env.PORT || 8787)
+const audioDir = process.env.AUDIO_DIR || process.env.OUT_DIR || 'recordings'
+const audioDirPath = resolve(audioDir)
+const transcriptDir = process.env.TRANSCRIPT_DIR || audioDirPath
+const transcriptDirPath = resolve(transcriptDir)
+const asrCommand = process.env.ASR_COMMAND || ''
+const asrWorkerUrl = process.env.ASR_WORKER_URL || ''
+const terminalUrl = process.env.EVEN_TERMINAL_URL || ''
+const terminalToken = process.env.EVEN_TERMINAL_TOKEN || ''
+const terminalProvider = process.env.EVEN_TERMINAL_PROVIDER || 'codex'
+const terminalSessionId = process.env.EVEN_TERMINAL_SESSION_ID || ''
+const minAsrBytes = Number(process.env.MIN_ASR_BYTES || 6400)
+const segmentSeconds = Number(process.env.ASR_SEGMENT_SECONDS || 20)
+const bytesPerSecond = 16_000 * 2
+const segmentBytesLimit = segmentSeconds > 0 ? Math.floor(segmentSeconds * bytesPerSecond) : 0
+const chunkMode = (process.env.ASR_CHUNK_MODE || 'vad').toLowerCase()
+const useVad = chunkMode !== 'fixed'
+const vadThreshold = Number(process.env.VAD_THRESHOLD || 0.0018)
+const vadSilenceMs = Number(process.env.VAD_SILENCE_MS || 700)
+const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
+const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
+const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
+const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
+
+mkdirSync(audioDirPath, { recursive: true })
+mkdirSync(transcriptDirPath, { recursive: true })
+
+let asrQueue = Promise.resolve()
+let asrJobId = 0
+
+const server = createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true }))
+    return
+  }
+
+  res.writeHead(200, { 'content-type': 'text/plain' })
+  res.end('Even Audio Pipe receiver. WebSocket path: /audio\n')
+})
+
+const wss = new WebSocketServer({ server, path: '/audio' })
+
+function stamp() {
+  const now = new Date()
+  const pad = (value, length = 2) => String(value).padStart(length, '0')
+
+  return [
+    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`,
+    `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`,
+    pad(now.getMilliseconds(), 3),
+  ].join('-')
+}
+
+function toBuffer(data) {
+  if (Buffer.isBuffer(data)) return data
+  if (data instanceof ArrayBuffer) return Buffer.from(data)
+  if (Array.isArray(data)) return Buffer.concat(data.map(toBuffer))
+  return Buffer.from(data)
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+function renderAsrCommand(template, paths) {
+  const replacements = {
+    pcm: shellQuote(paths.pcm),
+    wav: shellQuote(paths.wav),
+    txt: shellQuote(paths.txt),
+    json: shellQuote(paths.json),
+  }
+
+  return template.replace(/\{(pcm|wav|txt|json)\}/g, (_match, key) => replacements[key])
+}
+
+function runShell(command, label) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('bash', ['-lc', command], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    })
+    let stdout = ''
+    let stderr = ''
+
+    child.stdout.on('data', chunk => {
+      const text = chunk.toString()
+      stdout += text
+      process.stdout.write(`[${label}] ${text}`)
+    })
+
+    child.stderr.on('data', chunk => {
+      const text = chunk.toString()
+      stderr += text
+      process.stderr.write(`[${label}] ${text}`)
+    })
+
+    child.on('error', reject)
+    child.on('exit', code => {
+      if (code === 0) {
+        resolve({ stdout, stderr })
+      } else {
+        reject(new Error(`${label} exited with code ${code}: ${stderr || stdout}`))
+      }
+    })
+  })
+}
+
+async function convertPcmToWav(pcmPath, wavPath) {
+  const command = [
+    'ffmpeg',
+    '-hide_banner',
+    '-loglevel error',
+    '-y',
+    '-f s16le',
+    '-ar 16000',
+    '-ac 1',
+    `-i ${shellQuote(pcmPath)}`,
+    shellQuote(wavPath),
+  ].join(' ')
+
+  await runShell(command, 'ffmpeg')
+}
+
+function sendSocketJson(socket, payload) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false
+
+  try {
+    socket.send(JSON.stringify(payload))
+    return true
+  } catch (err) {
+    console.error(`[socket] failed to send ${payload?.type || 'message'}: ${err.message}`)
+    return false
+  }
+}
+
+function normalizeTranscript(text) {
+  return text
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim()
+}
+
+async function maybePostToTerminal(text) {
+  if (!terminalUrl || !terminalToken || !text) return
+
+  const body = {
+    text,
+    provider: terminalProvider,
+  }
+
+  if (terminalSessionId) body.sessionId = terminalSessionId
+
+  const res = await fetch(`${terminalUrl.replace(/\/$/, '')}/api/prompt`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${terminalToken}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => '')
+    throw new Error(`even-terminal POST failed: HTTP ${res.status} ${errorText.slice(0, 200)}`)
+  }
+
+  console.log(`[terminal] posted transcript to ${terminalUrl}`)
+}
+
+async function transcribeWithWorker(wavPath) {
+  const res = await fetch(`${asrWorkerUrl.replace(/\/$/, '')}/transcribe`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ wavPath }),
+  })
+
+  const bodyText = await res.text()
+  let body
+  try {
+    body = JSON.parse(bodyText)
+  } catch {
+    body = { ok: false, error: bodyText }
+  }
+
+  if (!res.ok || body?.ok === false) {
+    throw new Error(`ASR worker failed: HTTP ${res.status} ${body?.error || bodyText}`)
+  }
+
+  return normalizeTranscript(body?.text || '')
+}
+
+async function processRecording(paths, bytes, targetSocket, jobId) {
+  if (bytes < minAsrBytes) {
+    console.log(`[asr] skipping short recording (${bytes} bytes < ${minAsrBytes})`)
+    return
+  }
+
+  console.log(`[asr] converting PCM to WAV: ${paths.wav}`)
+  await convertPcmToWav(paths.pcm, paths.wav)
+
+  if (!asrWorkerUrl && !asrCommand) {
+    console.log('[asr] ASR_WORKER_URL/ASR_COMMAND is not set; WAV saved but no transcription was run')
+    return
+  }
+
+  let transcript = ''
+  if (asrWorkerUrl) {
+    console.log(`[asr] sending WAV to worker: ${asrWorkerUrl}`)
+    sendSocketJson(targetSocket, {
+      type: 'asr_status',
+      status: 'transcribing',
+      jobId,
+      file: basename(paths.wav),
+    })
+    transcript = await transcribeWithWorker(paths.wav)
+  } else {
+    const command = renderAsrCommand(asrCommand, paths)
+    console.log(`[asr] running ASR command: ${command}`)
+    sendSocketJson(targetSocket, {
+      type: 'asr_status',
+      status: 'transcribing',
+      jobId,
+      file: basename(paths.wav),
+    })
+    const result = await runShell(command, 'asr')
+    transcript = normalizeTranscript(result.stdout)
+  }
+
+  if (transcript) {
+    writeTextFile(paths.txt, `${transcript}\n`)
+    appendTranscript(transcript, paths)
+    console.log(`[transcript] ${transcript}`)
+    console.log(`[asr] transcript saved: ${paths.txt}`)
+    sendSocketJson(targetSocket, {
+      type: 'transcript',
+      text: transcript,
+      jobId,
+      file: basename(paths.txt),
+      createdAt: new Date().toISOString(),
+    })
+    await maybePostToTerminal(transcript)
+  } else {
+    console.log('[asr] no transcript returned')
+    sendSocketJson(targetSocket, {
+      type: 'asr_status',
+      status: 'no_transcript',
+      jobId,
+      file: basename(paths.wav),
+    })
+  }
+}
+
+function writeTextFile(path, content) {
+  writeFileSync(path, content)
+}
+
+function appendTranscript(text, paths) {
+  const line = `${new Date().toISOString()} ${text.replace(/\s+/g, ' ').trim()} file=${paths.wav}\n`
+  appendFileSync(transcriptsLog, line)
+}
+
+function enqueueRecording(paths, bytes, reason, targetSocket) {
+  const jobId = ++asrJobId
+
+  asrQueue = asrQueue
+    .catch(() => {})
+    .then(async () => {
+      console.log(`[asr] job ${jobId} started (${reason}): ${paths.pcm}`)
+      await processRecording(paths, bytes, targetSocket, jobId)
+      console.log(`[asr] job ${jobId} finished`)
+    })
+    .catch(err => {
+      console.error(`[asr] job ${jobId} failed: ${err.message}`)
+    })
+}
+
+function recordingPaths(connectionStamp, segmentIndex) {
+  const id = `g2-${connectionStamp}-${String(segmentIndex).padStart(3, '0')}`
+
+  return {
+    pcm: join(audioDirPath, `${id}.pcm`),
+    wav: join(audioDirPath, `${id}.wav`),
+    txt: join(transcriptDirPath, `${id}.txt`),
+    json: join(transcriptDirPath, `${id}.json`),
+  }
+}
+
+function bufferDurationMs(buffer) {
+  return (buffer.byteLength / bytesPerSecond) * 1000
+}
+
+function pcmRms(buffer) {
+  const samples = Math.floor(buffer.byteLength / 2)
+  if (!samples) return 0
+
+  let sumSquares = 0
+  for (let offset = 0; offset + 1 < buffer.byteLength; offset += 2) {
+    const value = buffer.readInt16LE(offset) / 32768
+    sumSquares += value * value
+  }
+  return Math.sqrt(sumSquares / samples)
+}
+
+function pushPreRoll(preRoll, chunk, maxBytes) {
+  if (maxBytes <= 0) return
+  preRoll.buffers.push(chunk)
+  preRoll.bytes += chunk.byteLength
+
+  while (preRoll.bytes > maxBytes && preRoll.buffers.length) {
+    const removed = preRoll.buffers.shift()
+    preRoll.bytes -= removed.byteLength
+  }
+}
+
+wss.on('connection', (socket, req) => {
+  const connectionStamp = stamp()
+  let currentSegment = null
+  let segmentIndex = 0
+  let bytes = 0
+  let chunks = 0
+  let lastBytes = 0
+  const preRoll = { buffers: [], bytes: 0 }
+  const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
+
+  console.log(`[audio] connected from ${req.socket.remoteAddress}`)
+  sendSocketJson(socket, {
+    type: 'receiver_status',
+    status: 'connected',
+    asrConfigured: Boolean(asrWorkerUrl || asrCommand),
+    chunkMode: useVad ? 'vad' : 'fixed',
+  })
+
+  if (useVad) {
+    console.log(
+      `[audio] VAD chunking threshold=${vadThreshold} silence=${vadSilenceMs}ms max=${segmentSeconds}s`,
+    )
+  } else if (segmentBytesLimit) {
+    console.log(`[audio] fixed recordings every ${segmentSeconds}s (${segmentBytesLimit} bytes)`)
+  } else {
+    console.log('[audio] recording one file until the socket closes')
+  }
+
+  const meter = setInterval(() => {
+    const delta = bytes - lastBytes
+    lastBytes = bytes
+    console.log(`[audio] ${chunks} chunks, ${bytes} bytes total, ${delta} B/s`)
+  }, 1000)
+
+  socket.on('message', (data, isBinary) => {
+    if (!isBinary) {
+      const text = data.toString()
+      console.log(`[audio] control ${text}`)
+      return
+    }
+
+    const chunk = toBuffer(data)
+    chunks += 1
+    bytes += chunk.byteLength
+
+    if (useVad) {
+      handleVadChunk(chunk)
+    } else {
+      const segment = getCurrentSegment()
+      writeSegmentChunk(segment, chunk)
+
+      if (segmentBytesLimit && segment.bytes >= segmentBytesLimit) {
+        closeCurrentSegment('segment limit')
+      }
+    }
+  })
+
+  socket.on('close', () => {
+    clearInterval(meter)
+    closeCurrentSegment('socket close')
+    console.log(`[audio] closed: ${chunks} chunks, ${bytes} bytes total`)
+  })
+
+  socket.on('error', err => {
+    console.error(`[audio] socket error: ${err.message}`)
+  })
+
+  function getCurrentSegment() {
+    if (currentSegment) return currentSegment
+
+    segmentIndex += 1
+    const paths = recordingPaths(connectionStamp, segmentIndex)
+    currentSegment = {
+      paths,
+      stream: createWriteStream(paths.pcm),
+      bytes: 0,
+      chunks: 0,
+      speechMs: 0,
+      silenceMs: 0,
+      durationMs: 0,
+      hasSpeech: false,
+    }
+    console.log(`[audio] writing raw PCM to ${paths.pcm}`)
+    return currentSegment
+  }
+
+  function handleVadChunk(chunk) {
+    const rms = pcmRms(chunk)
+    const durationMs = bufferDurationMs(chunk)
+    const isSpeech = rms >= vadThreshold
+    let wroteCurrentChunk = false
+
+    if (!currentSegment) {
+      if (!isSpeech) {
+        pushPreRoll(preRoll, chunk, preRollBytes)
+        return
+      }
+
+      const segment = getCurrentSegment()
+      for (const buffered of preRoll.buffers) {
+        writeSegmentChunk(segment, buffered, { countChunk: false })
+      }
+      preRoll.buffers = []
+      preRoll.bytes = 0
+    }
+
+    const segment = getCurrentSegment()
+    if (!wroteCurrentChunk) {
+      writeSegmentChunk(segment, chunk)
+    }
+
+    if (isSpeech) {
+      segment.speechMs += durationMs
+      segment.silenceMs = 0
+      segment.hasSpeech = true
+    } else {
+      segment.silenceMs += durationMs
+    }
+
+    if (segmentBytesLimit && segment.bytes >= segmentBytesLimit) {
+      closeCurrentSegment('max utterance')
+      return
+    }
+
+    if (
+      segment.hasSpeech &&
+      segment.speechMs >= vadMinSpeechMs &&
+      segment.durationMs >= vadMinUtteranceMs &&
+      segment.silenceMs >= vadSilenceMs
+    ) {
+      closeCurrentSegment('vad silence')
+    }
+  }
+
+  function writeSegmentChunk(segment, chunk, options = {}) {
+    const countChunk = options.countChunk !== false
+    segment.bytes += chunk.byteLength
+    segment.durationMs += bufferDurationMs(chunk)
+    if (countChunk) segment.chunks += 1
+    segment.stream.write(chunk)
+  }
+
+  function closeCurrentSegment(reason) {
+    if (!currentSegment) return
+
+    const segment = currentSegment
+    currentSegment = null
+
+    segment.stream.end(() => {
+      console.log(
+        `[audio] segment closed (${reason}): ${segment.chunks} chunks, ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, file=${segment.paths.pcm}`,
+      )
+      enqueueRecording(segment.paths, segment.bytes, reason, socket)
+    })
+  }
+})
+
+server.listen(port, '0.0.0.0', () => {
+  console.log(`[server] HTTP health: http://0.0.0.0:${port}/health`)
+  console.log(`[server] WebSocket audio: ws://0.0.0.0:${port}/audio`)
+  console.log('[server] Use your laptop LAN/Tailscale IP in the Even Hub app, not localhost.')
+  console.log(`[server] Audio directory: ${audioDirPath}`)
+  console.log(`[server] Transcript directory: ${transcriptDirPath}`)
+  console.log(`[server] Transcript log: ${transcriptsLog}`)
+  console.log(`[server] Chunk mode: ${useVad ? 'vad' : 'fixed'}`)
+  console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)
+  console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)
+  console.log(`[server] ASR command fallback: ${asrCommand ? 'configured' : 'not configured'}`)
+})

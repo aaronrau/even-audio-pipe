@@ -1,0 +1,12 @@
+{
+  "name": "even-audio-pipe",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/start-local.mjs",
+    "dev": "node scripts/start-local.mjs",
+    "setup": "npm --prefix local-receiver ci && npm --prefix app ci",
+    "check": "npm run setup && node --check scripts/start-local.mjs && npm --prefix local-receiver run check && npm --prefix app run build"
+  }
+}
