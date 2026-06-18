@@ -94,6 +94,7 @@ Default config:
     "model": "gemma-4-e4b-it-q4_0",
     "temperature": 0,
     "timeoutMs": 15000,
+    "required": false,
     "prompt": "You clean short ASR transcript chunks from smart glasses. Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only. Preserve the speaker's meaning and wording. Do not add facts, commands, explanations, or markdown. If uncertain, keep the original wording. Return only the cleaned transcript text.",
     "llamaCpp": {
       "autoStart": false,
@@ -194,6 +195,9 @@ When `autoStart` is enabled, `npm start` will:
 5. Start `llama-server` on the configured host and port.
 6. Wait for `http://127.0.0.1:8080/v1/models`.
 7. Send cleanup requests to `/v1/chat/completions`.
+
+If cleanup cannot be reused or started, the app keeps running with raw ASR
+transcripts unless `transcriptCleanup.required` is set to `true`.
 
 Prerequisites for the automatic llama.cpp path:
 

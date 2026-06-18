@@ -43,14 +43,20 @@ writeLocalEnv()
 updateAppManifest()
 
 if (transcriptCleanupConfig.enabled && transcriptCleanupConfig.llamaCpp.autoStart) {
-  const reusedCleanupServer = await findReusableLlamaCppServer(transcriptCleanupConfig)
-  if (reusedCleanupServer) {
-    transcriptCleanupConfig.url = reusedCleanupServer.url
-    transcriptCleanupConfig.model = reusedCleanupServer.model
-    console.log(`Using existing llama.cpp cleanup server: ${reusedCleanupServer.baseUrl} (${reusedCleanupServer.model})`)
-  } else {
-    await startLlamaCpp(transcriptCleanupConfig.llamaCpp)
-    await waitForHttp(llamaCppModelsUrl(transcriptCleanupConfig.url), 'llama.cpp', 900_000)
+  try {
+    const reusedCleanupServer = await findReusableLlamaCppServer(transcriptCleanupConfig)
+    if (reusedCleanupServer) {
+      transcriptCleanupConfig.url = reusedCleanupServer.url
+      transcriptCleanupConfig.model = reusedCleanupServer.model
+      console.log(`Using existing llama.cpp cleanup server: ${reusedCleanupServer.baseUrl} (${reusedCleanupServer.model})`)
+    } else {
+      await startLlamaCpp(transcriptCleanupConfig.llamaCpp)
+      await waitForHttp(llamaCppModelsUrl(transcriptCleanupConfig.url), 'llama.cpp', 900_000)
+    }
+  } catch (err) {
+    if (transcriptCleanupConfig.required) throw err
+    console.warn(`Transcript cleanup unavailable; continuing without cleanup: ${err.message}`)
+    transcriptCleanupConfig.enabled = false
   }
 } else if (transcriptCleanupConfig.enabled) {
   console.log(`Using external transcript cleanup endpoint: ${transcriptCleanupConfig.url}`)
@@ -222,6 +228,11 @@ function resolveTranscriptCleanupConfig(cleanup = {}) {
     cleanup.enabled ??
     '0',
   )
+  const required = !isDisabled(
+    process.env.TRANSCRIPT_CLEANUP_REQUIRED ??
+    cleanup.required ??
+    '0',
+  )
 
   if (llamaCpp.autoStart && !process.env.TRANSCRIPT_CLEANUP_URL) {
     url = chatCompletionsUrl(`http://${llamaCpp.serverHost}:${llamaCpp.serverPort}/v1`)
@@ -238,6 +249,7 @@ function resolveTranscriptCleanupConfig(cleanup = {}) {
     timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15_000,
     prompt,
     apiKey,
+    required,
     llamaCpp,
   }
 }
