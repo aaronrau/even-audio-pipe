@@ -12,6 +12,8 @@ app/app.json
 # Runtime audio and transcript artifacts
 data/
 local-receiver/recordings/
+tools/
+models/
 *.pcm
 *.wav
 *.log

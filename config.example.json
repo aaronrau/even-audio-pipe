@@ -3,5 +3,29 @@
     "audioDir": "data/audio",
     "transcriptDir": "data/transcripts",
     "transcriptsLog": "data/transcripts/transcripts.log"
+  },
+  "transcriptCleanup": {
+    "enabled": false,
+    "url": "http://127.0.0.1:8080/v1/chat/completions",
+    "model": "gemma-4-e4b-it-q4_0",
+    "temperature": 0,
+    "timeoutMs": 15000,
+    "prompt": "You clean short ASR transcript chunks from smart glasses. Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only. Preserve the speaker's meaning and wording. Do not add facts, commands, explanations, or markdown. If uncertain, keep the original wording. Return only the cleaned transcript text.",
+    "llamaCpp": {
+      "autoStart": false,
+      "repoUrl": "https://github.com/ggml-org/llama.cpp.git",
+      "repoDir": "tools/llama.cpp",
+      "buildDir": "build-rocm",
+      "serverHost": "127.0.0.1",
+      "serverPort": 8080,
+      "hfModel": "google/gemma-4-E4B-it-qat-q4_0-gguf:Q4_0",
+      "alias": "gemma-4-e4b-it-q4_0",
+      "gpuLayers": 999,
+      "contextSize": 8192,
+      "parallel": 1,
+      "rocmArch": "",
+      "extraCmakeArgs": [],
+      "extraServerArgs": []
+    }
   }
 }

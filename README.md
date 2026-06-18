@@ -87,6 +87,30 @@ Default config:
     "audioDir": "data/audio",
     "transcriptDir": "data/transcripts",
     "transcriptsLog": "data/transcripts/transcripts.log"
+  },
+  "transcriptCleanup": {
+    "enabled": false,
+    "url": "http://127.0.0.1:8080/v1/chat/completions",
+    "model": "gemma-4-e4b-it-q4_0",
+    "temperature": 0,
+    "timeoutMs": 15000,
+    "prompt": "You clean short ASR transcript chunks from smart glasses. Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only. Preserve the speaker's meaning and wording. Do not add facts, commands, explanations, or markdown. If uncertain, keep the original wording. Return only the cleaned transcript text.",
+    "llamaCpp": {
+      "autoStart": false,
+      "repoUrl": "https://github.com/ggml-org/llama.cpp.git",
+      "repoDir": "tools/llama.cpp",
+      "buildDir": "build-rocm",
+      "serverHost": "127.0.0.1",
+      "serverPort": 8080,
+      "hfModel": "google/gemma-4-E4B-it-qat-q4_0-gguf:Q4_0",
+      "alias": "gemma-4-e4b-it-q4_0",
+      "gpuLayers": 999,
+      "contextSize": 8192,
+      "parallel": 1,
+      "rocmArch": "",
+      "extraCmakeArgs": [],
+      "extraServerArgs": []
+    }
   }
 }
 ```
@@ -138,6 +162,69 @@ PARAKEET_ONNX_QUANTIZATION=int8 \
 npm start
 ```
 
+## Transcript Cleanup
+
+Transcript cleanup is an optional post-ASR stage. It sends each final ASR
+segment to an OpenAI-compatible chat completions endpoint, writes both the raw
+and cleaned transcript, and displays the cleaned text on the glasses.
+
+Enable Gemma 4 E4B QAT GGUF through llama.cpp:
+
+```json
+{
+  "transcriptCleanup": {
+    "enabled": true,
+    "prompt": "You clean short ASR transcript chunks from smart glasses...",
+    "llamaCpp": {
+      "autoStart": true,
+      "hfModel": "google/gemma-4-E4B-it-qat-q4_0-gguf:Q4_0",
+      "alias": "gemma-4-e4b-it-q4_0"
+    }
+  }
+}
+```
+
+When `autoStart` is enabled, `npm start` will:
+
+1. Clone llama.cpp into `tools/llama.cpp` if it is missing.
+2. Build `llama-server` with ROCm using CMake and `-DGGML_HIP=ON`.
+3. Start `llama-server` on the configured host and port.
+4. Wait for `http://127.0.0.1:8080/v1/models`.
+5. Send cleanup requests to `/v1/chat/completions`.
+
+Prerequisites for the automatic llama.cpp path:
+
+- ROCm HIP SDK installed and `hipconfig` on `PATH`.
+- `cmake`, `git`, and a working C++ build toolchain.
+- Network access to Hugging Face, and access to the configured Gemma model.
+
+Set `llamaCpp.rocmArch` when auto-detection is wrong, for example:
+
+```json
+{
+  "transcriptCleanup": {
+    "llamaCpp": {
+      "rocmArch": "gfx1100"
+    }
+  }
+}
+```
+
+Use an existing cleanup server instead of the managed llama.cpp server:
+
+```json
+{
+  "transcriptCleanup": {
+    "enabled": true,
+    "baseUrl": "http://127.0.0.1:8080/v1",
+    "model": "gemma-4-e4b-it-q4_0",
+    "llamaCpp": {
+      "autoStart": false
+    }
+  }
+}
+```
+
 ## Chunking
 
 By default, the receiver uses simple energy-based VAD to close utterance chunks:
@@ -162,8 +249,11 @@ Runtime artifacts are written to the configured storage paths:
 ```text
 *.pcm              raw PCM s16le, 16 kHz, mono
 *.wav              converted WAV sent to ASR
-*.txt              final transcript for that segment
-transcripts.log    timestamped transcript log
+*.raw.txt          raw ASR transcript for that segment
+*.clean.txt        cleaned transcript for that segment
+*.txt              display transcript for that segment
+*.json             metadata with raw text, cleaned text, and cleanup status
+transcripts.log    append-only JSONL transcript log
 ```
 
 These files can contain private audio and transcripts. They are ignored by
@@ -178,6 +268,8 @@ placeholders:
 {pcm} raw PCM path
 {wav} converted WAV path
 {txt} transcript output path
+{rawTxt} raw transcript output path
+{cleanTxt} cleaned transcript output path
 {json} optional JSON output path
 ```
 
@@ -242,6 +334,8 @@ recordings are ignored:
 - `app/dist/`
 - `config.json`
 - `data/`
+- `tools/`
+- `models/`
 - `node_modules/`
 - `asr-worker/.venv/`
 - `local-receiver/recordings/`

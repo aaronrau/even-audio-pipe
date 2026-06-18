@@ -27,6 +27,13 @@ const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
+const transcriptCleanupEnabled = !isDisabled(process.env.TRANSCRIPT_CLEANUP_ENABLED || '0')
+const transcriptCleanupUrl = process.env.TRANSCRIPT_CLEANUP_URL || 'http://127.0.0.1:8080/v1/chat/completions'
+const transcriptCleanupModel = process.env.TRANSCRIPT_CLEANUP_MODEL || 'gemma-4-e4b-it-q4_0'
+const transcriptCleanupTemperature = Number(process.env.TRANSCRIPT_CLEANUP_TEMPERATURE || 0)
+const transcriptCleanupTimeoutMs = Number(process.env.TRANSCRIPT_CLEANUP_TIMEOUT_MS || 15_000)
+const transcriptCleanupPrompt = process.env.TRANSCRIPT_CLEANUP_PROMPT || defaultCleanupPrompt()
+const transcriptCleanupApiKey = process.env.TRANSCRIPT_CLEANUP_API_KEY || ''
 
 mkdirSync(audioDirPath, { recursive: true })
 mkdirSync(transcriptDirPath, { recursive: true })
@@ -74,10 +81,12 @@ function renderAsrCommand(template, paths) {
     pcm: shellQuote(paths.pcm),
     wav: shellQuote(paths.wav),
     txt: shellQuote(paths.txt),
+    rawTxt: shellQuote(paths.rawTxt),
+    cleanTxt: shellQuote(paths.cleanTxt),
     json: shellQuote(paths.json),
   }
 
-  return template.replace(/\{(pcm|wav|txt|json)\}/g, (_match, key) => replacements[key])
+  return template.replace(/\{(pcm|wav|txt|rawTxt|cleanTxt|json)\}/g, (_match, key) => replacements[key])
 }
 
 function runShell(command, label) {
@@ -150,6 +159,31 @@ function normalizeTranscript(text) {
     .trim()
 }
 
+function stripCleanupDecorations(text) {
+  return normalizeTranscript(text)
+    .replace(/^```(?:text)?/i, '')
+    .replace(/```$/i, '')
+    .replace(/^cleaned transcript:\s*/i, '')
+    .replace(/^cleaned:\s*/i, '')
+    .replace(/^["“](.*)["”]$/s, '$1')
+    .trim()
+}
+
+function defaultCleanupPrompt() {
+  return [
+    'You clean short ASR transcript chunks from smart glasses.',
+    'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
+    "Preserve the speaker's meaning and wording.",
+    'Do not add facts, commands, explanations, or markdown.',
+    'If uncertain, keep the original wording.',
+    'Return only the cleaned transcript text.',
+  ].join(' ')
+}
+
+function isDisabled(value) {
+  return /^(|0|false|none|off|no)$/i.test(String(value).trim())
+}
+
 async function maybePostToTerminal(text) {
   if (!terminalUrl || !terminalToken || !text) return
 
@@ -199,6 +233,92 @@ async function transcribeWithWorker(wavPath) {
   return normalizeTranscript(body?.text || '')
 }
 
+async function cleanTranscript(rawTranscript) {
+  if (!transcriptCleanupEnabled) {
+    return {
+      enabled: false,
+      ok: true,
+      text: rawTranscript,
+    }
+  }
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), transcriptCleanupTimeoutMs)
+  timeout.unref?.()
+
+  try {
+    const headers = { 'content-type': 'application/json' }
+    if (transcriptCleanupApiKey) {
+      headers.authorization = `Bearer ${transcriptCleanupApiKey}`
+    }
+
+    const res = await fetch(transcriptCleanupUrl, {
+      method: 'POST',
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: transcriptCleanupModel,
+        temperature: transcriptCleanupTemperature,
+        messages: [
+          {
+            role: 'system',
+            content: transcriptCleanupPrompt,
+          },
+          {
+            role: 'user',
+            content: [
+              'Raw ASR transcript:',
+              rawTranscript,
+              '',
+              'Cleaned transcript:',
+            ].join('\n'),
+          },
+        ],
+      }),
+    })
+
+    const bodyText = await res.text()
+    let body
+    try {
+      body = JSON.parse(bodyText)
+    } catch {
+      body = { error: bodyText }
+    }
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${body?.error?.message || body?.error || bodyText}`)
+    }
+
+    const content = body?.choices?.[0]?.message?.content ?? body?.choices?.[0]?.text ?? ''
+    const cleaned = stripCleanupDecorations(content)
+
+    if (!cleaned) {
+      throw new Error('cleanup model returned empty text')
+    }
+
+    return {
+      enabled: true,
+      ok: true,
+      model: transcriptCleanupModel,
+      text: cleaned,
+    }
+  } catch (err) {
+    const error = err?.name === 'AbortError'
+      ? `cleanup timed out after ${transcriptCleanupTimeoutMs}ms`
+      : err?.message || String(err)
+    console.error(`[cleanup] failed; using raw transcript: ${error}`)
+    return {
+      enabled: true,
+      ok: false,
+      model: transcriptCleanupModel,
+      text: rawTranscript,
+      error,
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 async function processRecording(paths, bytes, targetSocket, jobId) {
   if (bytes < minAsrBytes) {
     console.log(`[asr] skipping short recording (${bytes} bytes < ${minAsrBytes})`)
@@ -213,7 +333,7 @@ async function processRecording(paths, bytes, targetSocket, jobId) {
     return
   }
 
-  let transcript = ''
+  let rawTranscript = ''
   if (asrWorkerUrl) {
     console.log(`[asr] sending WAV to worker: ${asrWorkerUrl}`)
     sendSocketJson(targetSocket, {
@@ -222,7 +342,7 @@ async function processRecording(paths, bytes, targetSocket, jobId) {
       jobId,
       file: basename(paths.wav),
     })
-    transcript = await transcribeWithWorker(paths.wav)
+    rawTranscript = await transcribeWithWorker(paths.wav)
   } else {
     const command = renderAsrCommand(asrCommand, paths)
     console.log(`[asr] running ASR command: ${command}`)
@@ -233,22 +353,45 @@ async function processRecording(paths, bytes, targetSocket, jobId) {
       file: basename(paths.wav),
     })
     const result = await runShell(command, 'asr')
-    transcript = normalizeTranscript(result.stdout)
+    rawTranscript = normalizeTranscript(result.stdout)
   }
 
-  if (transcript) {
-    writeTextFile(paths.txt, `${transcript}\n`)
-    appendTranscript(transcript, paths)
-    console.log(`[transcript] ${transcript}`)
+  if (rawTranscript) {
+    if (transcriptCleanupEnabled) {
+      sendSocketJson(targetSocket, {
+        type: 'asr_status',
+        status: 'cleaning',
+        jobId,
+        file: basename(paths.wav),
+      })
+    }
+
+    const cleanup = await cleanTranscript(rawTranscript)
+    const cleanedTranscript = cleanup.text
+
+    writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup)
+    appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup)
+    console.log(`[transcript:raw] ${rawTranscript}`)
+    console.log(`[transcript:clean] ${cleanedTranscript}`)
     console.log(`[asr] transcript saved: ${paths.txt}`)
     sendSocketJson(targetSocket, {
       type: 'transcript',
-      text: transcript,
+      text: cleanedTranscript,
+      rawText: rawTranscript,
+      cleanedText: cleanedTranscript,
+      cleanup: {
+        enabled: cleanup.enabled,
+        ok: cleanup.ok,
+        model: cleanup.model,
+        error: cleanup.error,
+      },
       jobId,
       file: basename(paths.txt),
+      rawFile: basename(paths.rawTxt),
+      cleanFile: basename(paths.cleanTxt),
       createdAt: new Date().toISOString(),
     })
-    await maybePostToTerminal(transcript)
+    await maybePostToTerminal(cleanedTranscript)
   } else {
     console.log('[asr] no transcript returned')
     sendSocketJson(targetSocket, {
@@ -264,9 +407,42 @@ function writeTextFile(path, content) {
   writeFileSync(path, content)
 }
 
-function appendTranscript(text, paths) {
-  const line = `${new Date().toISOString()} ${text.replace(/\s+/g, ' ').trim()} file=${paths.wav}\n`
-  appendFileSync(transcriptsLog, line)
+function writeJsonFile(path, value) {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
+}
+
+function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup) {
+  writeTextFile(paths.rawTxt, `${rawTranscript}\n`)
+  writeTextFile(paths.cleanTxt, `${cleanedTranscript}\n`)
+  writeTextFile(paths.txt, `${cleanedTranscript}\n`)
+  writeJsonFile(paths.json, {
+    createdAt: new Date().toISOString(),
+    raw: rawTranscript,
+    cleaned: cleanedTranscript,
+    cleanup,
+    files: {
+      audio: paths.wav,
+      rawTranscript: paths.rawTxt,
+      cleanedTranscript: paths.cleanTxt,
+      displayTranscript: paths.txt,
+    },
+  })
+}
+
+function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup) {
+  const line = JSON.stringify({
+    createdAt: new Date().toISOString(),
+    raw: rawTranscript,
+    cleaned: cleanedTranscript,
+    cleanup,
+    files: {
+      audio: paths.wav,
+      rawTranscript: paths.rawTxt,
+      cleanedTranscript: paths.cleanTxt,
+      displayTranscript: paths.txt,
+    },
+  })
+  appendFileSync(transcriptsLog, `${line}\n`)
 }
 
 function enqueueRecording(paths, bytes, reason, targetSocket) {
@@ -291,6 +467,8 @@ function recordingPaths(connectionStamp, segmentIndex) {
     pcm: join(audioDirPath, `${id}.pcm`),
     wav: join(audioDirPath, `${id}.wav`),
     txt: join(transcriptDirPath, `${id}.txt`),
+    rawTxt: join(transcriptDirPath, `${id}.raw.txt`),
+    cleanTxt: join(transcriptDirPath, `${id}.clean.txt`),
     json: join(transcriptDirPath, `${id}.json`),
   }
 }
@@ -490,4 +668,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)
   console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)
   console.log(`[server] ASR command fallback: ${asrCommand ? 'configured' : 'not configured'}`)
+  console.log(
+    `[server] Transcript cleanup: ${transcriptCleanupEnabled ? `${transcriptCleanupModel} at ${transcriptCleanupUrl}` : 'disabled'}`,
+  )
 })

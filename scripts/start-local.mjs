@@ -1,8 +1,8 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { networkInterfaces } from 'node:os'
+import { cpus, networkInterfaces } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -14,6 +14,7 @@ const localAsrPython = process.platform === 'win32'
   : join(asrWorkerDir, '.venv', 'bin', 'python')
 const config = loadConfig()
 const storageConfig = resolveStorageConfig(config.storage)
+const transcriptCleanupConfig = resolveTranscriptCleanupConfig(config.transcriptCleanup)
 
 const hostIp = process.env.EVEN_AUDIO_PIPE_HOST || detectHostIp()
 const appPort = Number(process.env.EVEN_AUDIO_PIPE_APP_PORT || 5173)
@@ -41,6 +42,13 @@ await ensureDependencies(appDir)
 writeLocalEnv()
 updateAppManifest()
 
+if (transcriptCleanupConfig.enabled && transcriptCleanupConfig.llamaCpp.autoStart) {
+  await startLlamaCpp(transcriptCleanupConfig.llamaCpp)
+  await waitForHttp(llamaCppModelsUrl(transcriptCleanupConfig.url), 'llama.cpp', 900_000)
+} else if (transcriptCleanupConfig.enabled) {
+  console.log(`Using external transcript cleanup endpoint: ${transcriptCleanupConfig.url}`)
+}
+
 if (asrEnabled && !process.env.ASR_WORKER_URL) {
   const python = await ensureAsrPython()
   spawnManaged('asr-worker', python, ['server.py'], {
@@ -60,6 +68,7 @@ console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
 console.log(`  Audio dir:      ${displayPath(storageConfig.audioDir)}`)
 console.log(`  Transcript dir: ${displayPath(storageConfig.transcriptDir)}`)
 console.log(`  Transcript log: ${displayPath(storageConfig.transcriptsLog)}`)
+console.log(`  Cleanup:        ${transcriptCleanupConfig.enabled ? `${transcriptCleanupConfig.model} at ${transcriptCleanupConfig.url}` : 'disabled'}`)
 console.log('')
 
 spawnManaged('receiver', 'npm', ['start'], {
@@ -71,6 +80,13 @@ spawnManaged('receiver', 'npm', ['start'], {
     AUDIO_DIR: storageConfig.audioDir,
     TRANSCRIPT_DIR: storageConfig.transcriptDir,
     TRANSCRIPTS_LOG: storageConfig.transcriptsLog,
+    TRANSCRIPT_CLEANUP_ENABLED: transcriptCleanupConfig.enabled ? '1' : '0',
+    TRANSCRIPT_CLEANUP_URL: transcriptCleanupConfig.url,
+    TRANSCRIPT_CLEANUP_MODEL: transcriptCleanupConfig.model,
+    TRANSCRIPT_CLEANUP_TEMPERATURE: String(transcriptCleanupConfig.temperature),
+    TRANSCRIPT_CLEANUP_TIMEOUT_MS: String(transcriptCleanupConfig.timeoutMs),
+    TRANSCRIPT_CLEANUP_PROMPT: transcriptCleanupConfig.prompt,
+    TRANSCRIPT_CLEANUP_API_KEY: transcriptCleanupConfig.apiKey,
   },
 })
 
@@ -157,8 +173,350 @@ function resolveStorageConfig(storage = {}) {
   return { audioDir, transcriptDir, transcriptsLog }
 }
 
+function resolveTranscriptCleanupConfig(cleanup = {}) {
+  const llamaCpp = resolveLlamaCppConfig(cleanup.llamaCpp || {})
+  const baseUrl = String(
+    process.env.TRANSCRIPT_CLEANUP_BASE_URL ||
+    cleanup.baseUrl ||
+    '',
+  ).trim()
+  let url = String(
+    process.env.TRANSCRIPT_CLEANUP_URL ||
+    cleanup.url ||
+    (baseUrl ? chatCompletionsUrl(baseUrl) : 'http://127.0.0.1:8080/v1/chat/completions'),
+  ).trim()
+  let model = String(
+    process.env.TRANSCRIPT_CLEANUP_MODEL ||
+    cleanup.model ||
+    'gemma-4-e4b-it-q4_0',
+  ).trim()
+  const temperature = Number(
+    process.env.TRANSCRIPT_CLEANUP_TEMPERATURE ??
+    cleanup.temperature ??
+    0,
+  )
+  const timeoutMs = Number(
+    process.env.TRANSCRIPT_CLEANUP_TIMEOUT_MS ??
+    cleanup.timeoutMs ??
+    15_000,
+  )
+  const prompt = String(
+    process.env.TRANSCRIPT_CLEANUP_PROMPT ||
+    cleanup.prompt ||
+    defaultCleanupPrompt(),
+  )
+  const apiKey = String(
+    process.env.TRANSCRIPT_CLEANUP_API_KEY ||
+    cleanup.apiKey ||
+    '',
+  )
+  const enabled = !isDisabled(
+    process.env.TRANSCRIPT_CLEANUP_ENABLED ??
+    cleanup.enabled ??
+    '0',
+  )
+
+  if (llamaCpp.autoStart && !process.env.TRANSCRIPT_CLEANUP_URL) {
+    url = chatCompletionsUrl(`http://${llamaCpp.serverHost}:${llamaCpp.serverPort}/v1`)
+  }
+  if (llamaCpp.autoStart && !process.env.TRANSCRIPT_CLEANUP_MODEL) {
+    model = llamaCpp.alias || llamaCpp.hfModel
+  }
+
+  return {
+    enabled,
+    url,
+    model,
+    temperature: Number.isFinite(temperature) ? temperature : 0,
+    timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15_000,
+    prompt,
+    apiKey,
+    llamaCpp,
+  }
+}
+
+function resolveLlamaCppConfig(config = {}) {
+  const serverPort = Number(
+    process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_PORT ??
+    config.serverPort ??
+    8080,
+  )
+  const gpuLayers = Number(
+    process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_GPU_LAYERS ??
+    config.gpuLayers ??
+    999,
+  )
+  const contextSize = Number(
+    process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_CONTEXT_SIZE ??
+    config.contextSize ??
+    8192,
+  )
+  const parallel = Number(
+    process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_PARALLEL ??
+    config.parallel ??
+    1,
+  )
+
+  return {
+    autoStart: !isDisabled(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_AUTO_START ??
+      config.autoStart ??
+      '0',
+    ),
+    repoUrl: String(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_REPO_URL ||
+      config.repoUrl ||
+      'https://github.com/ggml-org/llama.cpp.git',
+    ),
+    repoDir: resolveConfigPath(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_REPO_DIR ||
+      config.repoDir ||
+      'tools/llama.cpp',
+    ),
+    buildDir: String(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_BUILD_DIR ||
+      config.buildDir ||
+      'build-rocm',
+    ),
+    serverHost: String(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_HOST ||
+      config.serverHost ||
+      '127.0.0.1',
+    ),
+    serverPort: Number.isFinite(serverPort) ? serverPort : 8080,
+    hfModel: String(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_HF_MODEL ||
+      config.hfModel ||
+      'google/gemma-4-E4B-it-qat-q4_0-gguf:Q4_0',
+    ),
+    alias: String(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_ALIAS ||
+      config.alias ||
+      'gemma-4-e4b-it-q4_0',
+    ),
+    gpuLayers: Number.isFinite(gpuLayers) ? gpuLayers : 999,
+    contextSize: Number.isFinite(contextSize) ? contextSize : 8192,
+    parallel: Number.isFinite(parallel) ? parallel : 1,
+    rocmArch: String(
+      process.env.LLAMACPP_ROCM_ARCH ||
+      process.env.AMDGPU_TARGETS ||
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_ROCM_ARCH ||
+      config.rocmArch ||
+      '',
+    ),
+    extraCmakeArgs: stringArray(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_EXTRA_CMAKE_ARGS,
+      config.extraCmakeArgs,
+    ),
+    extraServerArgs: stringArray(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_EXTRA_SERVER_ARGS,
+      config.extraServerArgs,
+    ),
+  }
+}
+
+function chatCompletionsUrl(baseUrl) {
+  const cleaned = baseUrl.replace(/\/$/, '')
+  if (cleaned.endsWith('/chat/completions')) return cleaned
+  if (cleaned.endsWith('/v1')) return `${cleaned}/chat/completions`
+  return `${cleaned}/v1/chat/completions`
+}
+
+function defaultCleanupPrompt() {
+  return [
+    'You clean short ASR transcript chunks from smart glasses.',
+    'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
+    "Preserve the speaker's meaning and wording.",
+    'Do not add facts, commands, explanations, or markdown.',
+    'If uncertain, keep the original wording.',
+    'Return only the cleaned transcript text.',
+  ].join(' ')
+}
+
 function resolveConfigPath(value) {
   return resolve(rootDir, String(value))
+}
+
+function stringArray(envValue, configValue) {
+  if (envValue) return String(envValue).split(/\s+/).map(value => value.trim()).filter(Boolean)
+  if (Array.isArray(configValue)) return configValue.map(value => String(value)).filter(Boolean)
+  if (typeof configValue === 'string') return configValue.split(/\s+/).map(value => value.trim()).filter(Boolean)
+  return []
+}
+
+async function startLlamaCpp(config) {
+  const modelsUrl = llamaCppModelsUrl(chatCompletionsUrl(`http://${config.serverHost}:${config.serverPort}/v1`))
+  if (await httpReady(modelsUrl)) {
+    console.log(`Using existing llama.cpp server: ${modelsUrl}`)
+    return
+  }
+
+  const serverBinary = await ensureLlamaCpp(config)
+  const args = llamaCppServerArgs(config)
+
+  console.log(`Starting llama.cpp transcript cleanup: ${config.hfModel}`)
+  spawnManaged('llama.cpp', serverBinary, args, {
+    cwd: config.repoDir,
+    env: process.env,
+  })
+}
+
+async function ensureLlamaCpp(config) {
+  if (!existsSync(config.repoDir)) {
+    ensureCommandAvailable('git', 'Install git or set transcriptCleanup.llamaCpp.repoDir to an existing llama.cpp checkout.')
+    mkdirSync(dirname(config.repoDir), { recursive: true })
+    console.log(`Cloning llama.cpp into ${displayPath(config.repoDir)}...`)
+    await runCommand('git', ['clone', '--depth', '1', config.repoUrl, config.repoDir], { cwd: rootDir })
+  }
+
+  const existingBinary = findLlamaServerBinary(config)
+  if (existingBinary) return existingBinary
+
+  ensureCommandAvailable('cmake', 'Install cmake to build llama.cpp with ROCm.')
+  ensureCommandAvailable('hipconfig', 'Install the ROCm HIP SDK so hipconfig is available on PATH.')
+
+  const rocmArch = config.rocmArch || detectRocmTargets() || defaultRocmTargets()
+  const buildEnv = {
+    ...process.env,
+    ...hipBuildEnv(),
+    LLAMACPP_ROCM_ARCH: rocmArch,
+  }
+  const cmakeArgs = [
+    '-S',
+    '.',
+    '-B',
+    config.buildDir,
+    '-DGGML_HIP=ON',
+    `-DAMDGPU_TARGETS=${rocmArch}`,
+    '-DCMAKE_BUILD_TYPE=Release',
+    '-DLLAMA_CURL=ON',
+    ...config.extraCmakeArgs,
+  ]
+
+  console.log(`Building llama.cpp with ROCm targets: ${rocmArch}`)
+  await runCommand('cmake', cmakeArgs, { cwd: config.repoDir, env: buildEnv })
+  await runCommand(
+    'cmake',
+    [
+      '--build',
+      config.buildDir,
+      '--config',
+      'Release',
+      '--target',
+      'llama-server',
+      `-j${Math.max(1, cpus().length)}`,
+    ],
+    { cwd: config.repoDir, env: buildEnv },
+  )
+
+  const builtBinary = findLlamaServerBinary(config)
+  if (!builtBinary) {
+    throw new Error(`llama-server was not found after build in ${displayPath(resolve(config.repoDir, config.buildDir))}`)
+  }
+
+  return builtBinary
+}
+
+function llamaCppServerArgs(config) {
+  const args = [
+    '--host',
+    config.serverHost,
+    '--port',
+    String(config.serverPort),
+    '-hf',
+    config.hfModel,
+    '-ngl',
+    String(config.gpuLayers),
+    '-c',
+    String(config.contextSize),
+    '-np',
+    String(config.parallel),
+  ]
+
+  if (config.alias) {
+    args.push('--alias', config.alias)
+  }
+
+  return [...args, ...config.extraServerArgs]
+}
+
+function llamaCppModelsUrl(chatCompletionsUrlValue) {
+  return chatCompletionsUrlValue
+    .replace(/\/chat\/completions\/?$/i, '/models')
+    .replace(/\/+$/, '')
+}
+
+function findLlamaServerBinary(config) {
+  return llamaServerBinaryCandidates(config).find(candidate => existsSync(candidate)) || ''
+}
+
+function llamaServerBinaryCandidates(config) {
+  const exe = process.platform === 'win32' ? '.exe' : ''
+  const buildDir = resolve(config.repoDir, config.buildDir)
+
+  return [
+    join(buildDir, 'bin', `llama-server${exe}`),
+    join(buildDir, 'tools', 'server', `llama-server${exe}`),
+    join(buildDir, `llama-server${exe}`),
+  ]
+}
+
+function hipBuildEnv() {
+  const clangDir = commandOutput('hipconfig', ['-l'])
+  const hipPath = commandOutput('hipconfig', ['-R'])
+  const env = {}
+
+  if (clangDir) env.HIPCXX = join(clangDir, 'clang')
+  if (hipPath) env.HIP_PATH = hipPath
+
+  return env
+}
+
+function detectRocmTargets() {
+  const result = spawnSync('rocminfo', [], {
+    encoding: 'utf8',
+    maxBuffer: 10 * 1024 * 1024,
+  })
+  if (result.error) return ''
+
+  const targets = new Set()
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`
+  for (const match of output.matchAll(/\bName:\s+(gfx[0-9a-f]+)/gi)) {
+    targets.add(match[1])
+  }
+
+  return [...targets].join(',')
+}
+
+function defaultRocmTargets() {
+  return 'gfx803,gfx900,gfx906,gfx908,gfx90a,gfx942,gfx1010,gfx1030,gfx1032,gfx1100,gfx1101,gfx1102'
+}
+
+function commandOutput(command, args) {
+  const result = spawnSync(command, args, { encoding: 'utf8' })
+  if (result.status !== 0 || result.error) return ''
+  return String(result.stdout || '').trim()
+}
+
+function ensureCommandAvailable(command, message) {
+  const result = spawnSync(command, ['--version'], { stdio: 'ignore' })
+  if (!result.error) return
+  throw new Error(message || `${command} is required but was not found on PATH.`)
+}
+
+async function httpReady(url) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 1000)
+  timeout.unref?.()
+
+  try {
+    const res = await fetch(url, { signal: controller.signal })
+    return res.ok
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function ensureDependencies(dir) {
