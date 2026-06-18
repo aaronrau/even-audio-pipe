@@ -43,8 +43,15 @@ writeLocalEnv()
 updateAppManifest()
 
 if (transcriptCleanupConfig.enabled && transcriptCleanupConfig.llamaCpp.autoStart) {
-  await startLlamaCpp(transcriptCleanupConfig.llamaCpp)
-  await waitForHttp(llamaCppModelsUrl(transcriptCleanupConfig.url), 'llama.cpp', 900_000)
+  const reusedCleanupServer = await findReusableLlamaCppServer(transcriptCleanupConfig)
+  if (reusedCleanupServer) {
+    transcriptCleanupConfig.url = reusedCleanupServer.url
+    transcriptCleanupConfig.model = reusedCleanupServer.model
+    console.log(`Using existing llama.cpp cleanup server: ${reusedCleanupServer.baseUrl} (${reusedCleanupServer.model})`)
+  } else {
+    await startLlamaCpp(transcriptCleanupConfig.llamaCpp)
+    await waitForHttp(llamaCppModelsUrl(transcriptCleanupConfig.url), 'llama.cpp', 900_000)
+  }
 } else if (transcriptCleanupConfig.enabled) {
   console.log(`Using external transcript cleanup endpoint: ${transcriptCleanupConfig.url}`)
 }
@@ -312,6 +319,10 @@ function resolveLlamaCppConfig(config = {}) {
       process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_EXTRA_SERVER_ARGS,
       config.extraServerArgs,
     ),
+    reuseUrls: stringArray(
+      process.env.TRANSCRIPT_CLEANUP_LLAMA_CPP_REUSE_URLS,
+      config.reuseUrls,
+    ),
   }
 }
 
@@ -338,10 +349,88 @@ function resolveConfigPath(value) {
 }
 
 function stringArray(envValue, configValue) {
-  if (envValue) return String(envValue).split(/\s+/).map(value => value.trim()).filter(Boolean)
+  if (envValue) return splitStringArray(envValue)
   if (Array.isArray(configValue)) return configValue.map(value => String(value)).filter(Boolean)
-  if (typeof configValue === 'string') return configValue.split(/\s+/).map(value => value.trim()).filter(Boolean)
+  if (typeof configValue === 'string') return splitStringArray(configValue)
   return []
+}
+
+function splitStringArray(value) {
+  return String(value).split(/[,\s]+/).map(item => item.trim()).filter(Boolean)
+}
+
+async function findReusableLlamaCppServer(cleanupConfig) {
+  const candidates = uniqueStrings([
+    cleanupConfig.url,
+    ...cleanupConfig.llamaCpp.reuseUrls,
+  ])
+
+  for (const candidate of candidates) {
+    const server = await probeLlamaCppServer(candidate)
+    if (server) return server
+  }
+
+  return null
+}
+
+async function probeLlamaCppServer(candidateUrl) {
+  const baseUrl = openAiBaseUrl(candidateUrl)
+  const modelsUrl = `${baseUrl}/models`
+
+  try {
+    const body = await fetchJsonWithTimeout(modelsUrl, 1000)
+    const model = firstModelId(body)
+    if (!model) return null
+
+    return {
+      baseUrl,
+      url: chatCompletionsUrl(baseUrl),
+      model,
+    }
+  } catch {
+    return null
+  }
+}
+
+function openAiBaseUrl(value) {
+  const url = String(value || '').trim().replace(/\/+$/, '')
+
+  if (url.endsWith('/chat/completions')) {
+    return url.replace(/\/chat\/completions$/i, '')
+  }
+  if (url.endsWith('/models')) {
+    return url.replace(/\/models$/i, '')
+  }
+  if (url.endsWith('/v1')) return url
+
+  return `${url}/v1`
+}
+
+function firstModelId(body) {
+  return String(
+    body?.data?.[0]?.id ||
+    body?.models?.[0]?.model ||
+    body?.models?.[0]?.name ||
+    '',
+  ).trim()
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  timeout.unref?.()
+
+  try {
+    const res = await fetch(url, { signal: controller.signal })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return await res.json()
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.map(value => String(value || '').trim()).filter(Boolean))]
 }
 
 async function startLlamaCpp(config) {

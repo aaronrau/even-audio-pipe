@@ -109,7 +109,8 @@ Default config:
       "parallel": 1,
       "rocmArch": "",
       "extraCmakeArgs": [],
-      "extraServerArgs": []
+      "extraServerArgs": [],
+      "reuseUrls": []
     }
   }
 }
@@ -186,11 +187,13 @@ Enable Gemma 4 E4B QAT GGUF through llama.cpp:
 
 When `autoStart` is enabled, `npm start` will:
 
-1. Clone llama.cpp into `tools/llama.cpp` if it is missing.
-2. Build `llama-server` with ROCm using CMake and `-DGGML_HIP=ON`.
-3. Start `llama-server` on the configured host and port.
-4. Wait for `http://127.0.0.1:8080/v1/models`.
-5. Send cleanup requests to `/v1/chat/completions`.
+1. Reuse the configured cleanup endpoint when `/v1/models` is already reachable.
+2. Probe any `llamaCpp.reuseUrls` endpoints and reuse the first reachable server.
+3. Clone llama.cpp into `tools/llama.cpp` if no reusable server is found.
+4. Build `llama-server` with ROCm using CMake and `-DGGML_HIP=ON`.
+5. Start `llama-server` on the configured host and port.
+6. Wait for `http://127.0.0.1:8080/v1/models`.
+7. Send cleanup requests to `/v1/chat/completions`.
 
 Prerequisites for the automatic llama.cpp path:
 
@@ -224,6 +227,26 @@ Use an existing cleanup server instead of the managed llama.cpp server:
   }
 }
 ```
+
+Reuse one of several already-running llama.cpp servers before building:
+
+```json
+{
+  "transcriptCleanup": {
+    "enabled": true,
+    "llamaCpp": {
+      "autoStart": true,
+      "reuseUrls": [
+        "http://127.0.0.1:18087/v1",
+        "http://127.0.0.1:18089/v1"
+      ]
+    }
+  }
+}
+```
+
+When a reusable server is found, the launcher uses the first model ID returned
+from `/v1/models` for cleanup requests.
 
 ## Chunking
 

@@ -25,7 +25,8 @@
       "parallel": 1,
       "rocmArch": "",
       "extraCmakeArgs": [],
-      "extraServerArgs": []
+      "extraServerArgs": [],
+      "reuseUrls": []
     }
   }
 }
