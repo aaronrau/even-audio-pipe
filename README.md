@@ -95,7 +95,7 @@ Default config:
     "temperature": 0,
     "timeoutMs": 15000,
     "required": false,
-    "prompt": "You clean short ASR transcript chunks from smart glasses. Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only. Preserve the speaker's meaning and wording. Do not add facts, commands, explanations, or markdown. If uncertain, keep the original wording. Return only the cleaned transcript text.",
+    "prompt": "You clean short ASR transcript chunks from smart glasses. Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only. Always rewrite the misheard phrases \"ling few\", \"lane view\", and \"lanefuse\" as \"Langfuse\". Preserve the speaker's meaning and wording. Do not add facts, commands, explanations, or markdown. If uncertain, keep the original wording. Return only the cleaned transcript text.",
     "llamaCpp": {
       "autoStart": false,
       "repoUrl": "https://github.com/ggml-org/llama.cpp.git",
