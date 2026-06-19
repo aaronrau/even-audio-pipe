@@ -6,7 +6,8 @@ import {
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
 
-const AUDIO_WS_URL = import.meta.env.VITE_AUDIO_WS_URL as string | undefined
+const BASE_AUDIO_WS_URL = import.meta.env.VITE_AUDIO_WS_URL as string | undefined
+const AUDIO_WS_URL = withLaunchToken(BASE_AUDIO_WS_URL)
 
 const statusEl = document.getElementById('status')!
 const statsEl = document.getElementById('stats')!
@@ -41,6 +42,35 @@ function setUiStatus(text: string) {
 function setStats() {
   statsEl.textContent =
     `${sentChunks} chunks, ${sentBytes} bytes, ${droppedChunks} dropped`
+}
+
+function launchToken() {
+  const params = new URLSearchParams(window.location.search)
+  return params.get('t') || params.get('token') || ''
+}
+
+function withLaunchToken(url: string | undefined) {
+  const token = launchToken()
+  if (!url || !token) return url
+
+  try {
+    const parsed = new URL(url)
+    parsed.searchParams.set('t', token)
+    return parsed.toString()
+  } catch {
+    return url
+  }
+}
+
+function displayWsUrl(url: string) {
+  try {
+    const parsed = new URL(url)
+    if (parsed.searchParams.has('t')) parsed.searchParams.set('t', '...')
+    if (parsed.searchParams.has('token')) parsed.searchParams.set('token', '...')
+    return parsed.toString()
+  } catch {
+    return url
+  }
 }
 
 function takeTail(text: string, limit: number) {
@@ -211,7 +241,7 @@ function connect() {
     return
   }
 
-  urlEl.textContent = AUDIO_WS_URL
+  urlEl.textContent = displayWsUrl(AUDIO_WS_URL)
   setUiStatus('Connecting to receiver...')
   ws = new WebSocket(AUDIO_WS_URL)
   ws.binaryType = 'arraybuffer'

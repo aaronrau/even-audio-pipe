@@ -27,6 +27,7 @@ const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
+const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
 const transcriptCleanupEnv = {
   enabled: !isDisabled(process.env.TRANSCRIPT_CLEANUP_ENABLED || '0'),
@@ -60,7 +61,26 @@ const server = createServer((req, res) => {
   res.end('Even Audio Pipe receiver. WebSocket path: /audio\n')
 })
 
-const wss = new WebSocketServer({ server, path: '/audio' })
+const wss = new WebSocketServer({ noServer: true })
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url || '/', 'http://localhost')
+
+  if (url.pathname !== '/audio') {
+    rejectUpgrade(socket, 404, 'Not Found')
+    return
+  }
+
+  if (!isAuthorizedAudioRequest(url)) {
+    console.warn(`[auth] rejected audio websocket from ${req.socket.remoteAddress}`)
+    rejectUpgrade(socket, 401, 'Unauthorized')
+    return
+  }
+
+  wss.handleUpgrade(req, socket, head, ws => {
+    wss.emit('connection', ws, req)
+  })
+})
 
 function stamp() {
   const now = new Date()
@@ -191,6 +211,16 @@ function defaultCleanupPrompt() {
 
 function isDisabled(value) {
   return /^(|0|false|none|off|no)$/i.test(String(value).trim())
+}
+
+function isAuthorizedAudioRequest(url) {
+  if (!accessToken) return true
+  return url.searchParams.get('t') === accessToken || url.searchParams.get('token') === accessToken
+}
+
+function rejectUpgrade(socket, statusCode, statusText) {
+  socket.write(`HTTP/1.1 ${statusCode} ${statusText}\r\nConnection: close\r\n\r\n`)
+  socket.destroy()
 }
 
 async function maybePostToTerminal(text) {
@@ -710,6 +740,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Audio directory: ${audioDirPath}`)
   console.log(`[server] Transcript directory: ${transcriptDirPath}`)
   console.log(`[server] Transcript log: ${transcriptsLog}`)
+  console.log(`[server] Audio auth: ${accessToken ? 'enabled' : 'disabled'}`)
   console.log(`[server] Chunk mode: ${useVad ? 'vad' : 'fixed'}`)
   console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)
   console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)

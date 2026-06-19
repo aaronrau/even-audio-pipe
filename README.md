@@ -83,6 +83,10 @@ Default config:
 
 ```json
 {
+  "auth": {
+    "enabled": true,
+    "token": ""
+  },
   "storage": {
     "audioDir": "data/audio",
     "transcriptDir": "data/transcripts",
@@ -134,6 +138,37 @@ AUDIO_DIR=/path/to/audio \
 TRANSCRIPT_DIR=/path/to/transcripts \
 TRANSCRIPTS_LOG=/path/to/transcripts/transcripts.log \
 npm start
+```
+
+## Local QR Auth
+
+The launcher enables local access-token auth by default. On each `npm start`,
+it generates a random token, puts it in the QR URL, and passes the same token to
+the receiver. The app copies the launch token into the WebSocket URL:
+
+```text
+QR URL:  http://YOUR_COMPUTER_IP:5173?t=TOKEN
+Audio:   ws://YOUR_COMPUTER_IP:8787/audio?t=TOKEN
+```
+
+The receiver rejects `/audio` WebSocket connections without the matching token.
+This is local LAN protection; anyone who can see the QR URL can use the token.
+
+Use a stable token:
+
+```json
+{
+  "auth": {
+    "enabled": true,
+    "token": "change-me"
+  }
+}
+```
+
+Disable local token auth:
+
+```bash
+EVEN_AUDIO_PIPE_AUTH=off npm start
 ```
 
 ## ASR Configuration

@@ -1,4 +1,8 @@
 {
+  "auth": {
+    "enabled": true,
+    "token": ""
+  },
   "storage": {
     "audioDir": "data/audio",
     "transcriptDir": "data/transcripts",

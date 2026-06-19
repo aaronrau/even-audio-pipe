@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,8 +24,10 @@ const receiverPort = Number(process.env.EVEN_AUDIO_PIPE_RECEIVER_PORT || 8787)
 const asrPort = Number(process.env.EVEN_AUDIO_PIPE_ASR_PORT || 8790)
 const asrEnabled = !isDisabled(process.env.EVEN_AUDIO_PIPE_ASR ?? '1')
 const asrWorkerUrl = process.env.ASR_WORKER_URL || `http://127.0.0.1:${asrPort}`
+const authConfig = resolveAuthConfig(config.auth)
 
 const appUrl = `http://${hostIp}:${appPort}`
+const qrUrl = authConfig.enabled ? withQueryParam(appUrl, 't', authConfig.token) : appUrl
 const wsUrl = `ws://${hostIp}:${receiverPort}/audio`
 const receiverHttpOrigin = `http://${hostIp}:${receiverPort}`
 const receiverWsOrigin = `ws://${hostIp}:${receiverPort}`
@@ -76,6 +79,7 @@ if (asrEnabled && !process.env.ASR_WORKER_URL) {
 console.log('')
 console.log('Even Audio Pipe')
 console.log(`  App URL:        ${appUrl}`)
+console.log(`  QR auth:        ${authConfig.enabled ? 'enabled' : 'disabled'}`)
 console.log(`  Audio WS URL:   ${wsUrl}`)
 console.log(`  Receiver health http://127.0.0.1:${receiverPort}/health`)
 console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
@@ -102,10 +106,11 @@ spawnManaged('receiver', 'npm', ['start'], {
     TRANSCRIPT_CLEANUP_PROMPT: transcriptCleanupConfig.prompt,
     TRANSCRIPT_CLEANUP_API_KEY: transcriptCleanupConfig.apiKey,
     EVEN_AUDIO_PIPE_CONFIG_PATH: configPath,
+    EVEN_AUDIO_PIPE_TOKEN: authConfig.enabled ? authConfig.token : '',
   },
 })
 
-spawnManaged('vite', 'npm', ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(appPort)], {
+spawnManaged('vite', 'npm', ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(appPort), '--strictPort'], {
   cwd: appDir,
   env: process.env,
 })
@@ -185,6 +190,30 @@ function resolveStorageConfig(storage = {}) {
   )
 
   return { audioDir, transcriptDir, transcriptsLog }
+}
+
+function resolveAuthConfig(auth = {}) {
+  const enabled = !isDisabled(
+    process.env.EVEN_AUDIO_PIPE_AUTH ??
+    auth.enabled ??
+    '1',
+  )
+  const token = String(
+    process.env.EVEN_AUDIO_PIPE_TOKEN ||
+    auth.token ||
+    '',
+  ).trim()
+
+  return {
+    enabled,
+    token: enabled ? token || randomBytes(18).toString('base64url') : '',
+  }
+}
+
+function withQueryParam(url, key, value) {
+  const parsed = new URL(url)
+  parsed.searchParams.set(key, value)
+  return parsed.toString()
 }
 
 function resolveTranscriptCleanupConfig(cleanup = {}) {
@@ -777,11 +806,11 @@ function isDisabled(value) {
 
 async function runQr() {
   try {
-    await runCommand('npx', ['evenhub', 'qr', '--url', appUrl], { cwd: appDir })
+    await runCommand('npx', ['evenhub', 'qr', '--url', qrUrl], { cwd: appDir })
   } catch (err) {
     console.error('')
     console.error(`Failed to run evenhub qr: ${err.message}`)
-    console.error(`Manual command: cd ${appDir} && npx evenhub qr --url ${appUrl}`)
+    console.error(`Manual command: cd ${appDir} && npx evenhub qr --url ${qrUrl}`)
   }
 }
 
