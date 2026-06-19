@@ -85,7 +85,11 @@ Default config:
 {
   "auth": {
     "enabled": true,
-    "token": ""
+    "token": "",
+    "allowedUserIds": [],
+    "allowedEmails": [],
+    "lastUser": null,
+    "scannedUsers": []
   },
   "storage": {
     "audioDir": "data/audio",
@@ -162,7 +166,9 @@ Use a stable token:
     "enabled": true,
     "token": "change-me",
     "allowedUserIds": [],
-    "allowedEmails": []
+    "allowedEmails": [],
+    "lastUser": null,
+    "scannedUsers": []
   }
 }
 ```
@@ -181,7 +187,8 @@ Restrict to specific Even users:
 ```
 
 The app sends `bridge.getUserInfo()` in the initial WebSocket `start` message.
-The receiver logs the discovered user:
+The receiver logs the discovered user and saves it back into `config.json` as
+`auth.lastUser` and `auth.scannedUsers` on each QR/WebSocket startup:
 
 ```text
 [auth] even user received: uid=12345 email=you@example.com name=You

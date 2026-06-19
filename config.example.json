@@ -3,7 +3,9 @@
     "enabled": true,
     "token": "",
     "allowedUserIds": [],
-    "allowedEmails": []
+    "allowedEmails": [],
+    "lastUser": null,
+    "scannedUsers": []
   },
   "storage": {
     "audioDir": "data/audio",

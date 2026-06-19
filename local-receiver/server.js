@@ -293,15 +293,7 @@ function readRuntimeConfig() {
   if (!runtimeConfigPath) return runtimeConfigCache.config
 
   try {
-    const stat = statSync(runtimeConfigPath)
-    if (stat.mtimeMs === runtimeConfigCache.mtimeMs) return runtimeConfigCache.config
-
-    runtimeConfigCache = {
-      mtimeMs: stat.mtimeMs,
-      config: JSON.parse(readFileSync(runtimeConfigPath, 'utf8')),
-      warned: false,
-    }
-    return runtimeConfigCache.config
+    return loadRuntimeConfigFile()
   } catch (err) {
     if (err?.code !== 'ENOENT' && !runtimeConfigCache.warned) {
       console.warn(`[config] could not reload runtime config; keeping previous values: ${err.message}`)
@@ -309,6 +301,18 @@ function readRuntimeConfig() {
     }
     return runtimeConfigCache.config
   }
+}
+
+function loadRuntimeConfigFile() {
+  const stat = statSync(runtimeConfigPath)
+  if (stat.mtimeMs === runtimeConfigCache.mtimeMs) return runtimeConfigCache.config
+
+  runtimeConfigCache = {
+    mtimeMs: stat.mtimeMs,
+    config: JSON.parse(readFileSync(runtimeConfigPath, 'utf8')),
+    warned: false,
+  }
+  return runtimeConfigCache.config
 }
 
 function currentUserAuthConfig() {
@@ -379,6 +383,63 @@ function parseControlMessage(text) {
   } catch {
     return null
   }
+}
+
+function persistScannedUser(user, status) {
+  if (!runtimeConfigPath || !user) return
+
+  try {
+    const config = loadRuntimeConfigFile()
+    const auth = config.auth && typeof config.auth === 'object' ? config.auth : {}
+    const seenAt = new Date().toISOString()
+    const savedUser = compactObject({
+      uid: user.uid,
+      email: user.email,
+      name: user.name,
+      country: user.country,
+      status,
+      seenAt,
+    })
+    const scannedUsers = Array.isArray(auth.scannedUsers) ? auth.scannedUsers : []
+    const nextScannedUsers = upsertScannedUser(scannedUsers, savedUser).slice(-25)
+
+    config.auth = {
+      ...auth,
+      lastUser: savedUser,
+      scannedUsers: nextScannedUsers,
+    }
+
+    writeFileSync(runtimeConfigPath, `${JSON.stringify(config, null, 2)}\n`)
+    runtimeConfigCache = {
+      mtimeMs: statSync(runtimeConfigPath).mtimeMs,
+      config,
+      warned: false,
+    }
+    console.log(`[auth] saved Even user to config: ${userLabel(user)} status=${status}`)
+  } catch (err) {
+    console.warn(`[auth] failed to save Even user to config: ${err.message}`)
+  }
+}
+
+function upsertScannedUser(users, user) {
+  const key = user.uid ? `uid:${user.uid}` : user.email ? `email:${user.email}` : ''
+  if (!key) return [...users, user]
+
+  const filtered = users.filter(existing => {
+    const existingKey = existing?.uid
+      ? `uid:${String(existing.uid)}`
+      : existing?.email
+        ? `email:${String(existing.email).toLowerCase()}`
+        : ''
+    return existingKey !== key
+  })
+  return [...filtered, user]
+}
+
+function compactObject(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== ''),
+  )
 }
 
 async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptCleanupConfig()) {
@@ -467,7 +528,7 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
   }
 }
 
-async function processRecording(paths, bytes, targetSocket, jobId) {
+async function processRecording(paths, bytes, targetSocket, jobId, user) {
   if (bytes < minAsrBytes) {
     console.log(`[asr] skipping short recording (${bytes} bytes < ${minAsrBytes})`)
     return
@@ -518,8 +579,8 @@ async function processRecording(paths, bytes, targetSocket, jobId) {
     const cleanup = await cleanTranscript(rawTranscript, cleanupConfig)
     const cleanedTranscript = cleanup.text
 
-    writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup)
-    appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup)
+    writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, user)
+    appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user)
     console.log(`[transcript:raw] ${rawTranscript}`)
     console.log(`[transcript:clean] ${cleanedTranscript}`)
     console.log(`[asr] transcript saved: ${paths.txt}`)
@@ -534,6 +595,7 @@ async function processRecording(paths, bytes, targetSocket, jobId) {
         model: cleanup.model,
         error: cleanup.error,
       },
+      user,
       jobId,
       file: basename(paths.txt),
       rawFile: basename(paths.rawTxt),
@@ -560,7 +622,7 @@ function writeJsonFile(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
 }
 
-function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup) {
+function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, user) {
   writeTextFile(paths.rawTxt, `${rawTranscript}\n`)
   writeTextFile(paths.cleanTxt, `${cleanedTranscript}\n`)
   writeTextFile(paths.txt, `${cleanedTranscript}\n`)
@@ -569,6 +631,7 @@ function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup) 
     raw: rawTranscript,
     cleaned: cleanedTranscript,
     cleanup,
+    user,
     files: {
       audio: paths.wav,
       rawTranscript: paths.rawTxt,
@@ -578,12 +641,13 @@ function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup) 
   })
 }
 
-function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup) {
+function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user) {
   const line = JSON.stringify({
     createdAt: new Date().toISOString(),
     raw: rawTranscript,
     cleaned: cleanedTranscript,
     cleanup,
+    user,
     files: {
       audio: paths.wav,
       rawTranscript: paths.rawTxt,
@@ -594,14 +658,14 @@ function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup) {
   appendFileSync(transcriptsLog, `${line}\n`)
 }
 
-function enqueueRecording(paths, bytes, reason, targetSocket) {
+function enqueueRecording(paths, bytes, reason, targetSocket, user) {
   const jobId = ++asrJobId
 
   asrQueue = asrQueue
     .catch(() => {})
     .then(async () => {
       console.log(`[asr] job ${jobId} started (${reason}): ${paths.pcm}`)
-      await processRecording(paths, bytes, targetSocket, jobId)
+      await processRecording(paths, bytes, targetSocket, jobId, user)
       console.log(`[asr] job ${jobId} finished`)
     })
     .catch(err => {
@@ -697,6 +761,7 @@ wss.on('connection', (socket, req) => {
         console.log(`[auth] even user received: ${userLabel(evenUser)}`)
         if (auth.required && !isAllowedUser(evenUser, auth)) {
           console.warn(`[auth] rejected Even user: ${userLabel(evenUser)}`)
+          persistScannedUser(evenUser, 'rejected')
           sendSocketJson(socket, {
             type: 'auth_status',
             status: 'rejected',
@@ -708,6 +773,7 @@ wss.on('connection', (socket, req) => {
 
         userAuthenticated = true
         console.log(`[auth] accepted Even user: ${userLabel(evenUser)}`)
+        persistScannedUser(evenUser, 'accepted')
         if (!auth.required) {
           console.log('[auth] no user allowlist configured; add auth.allowedUserIds or auth.allowedEmails in config.json to restrict users')
         }
@@ -842,7 +908,7 @@ wss.on('connection', (socket, req) => {
       console.log(
         `[audio] segment closed (${reason}): ${segment.chunks} chunks, ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, file=${segment.paths.pcm}`,
       )
-      enqueueRecording(segment.paths, segment.bytes, reason, socket)
+      enqueueRecording(segment.paths, segment.bytes, reason, socket, evenUser)
     })
   }
 })
