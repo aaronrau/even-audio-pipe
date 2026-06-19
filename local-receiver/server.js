@@ -44,9 +44,9 @@ mkdirSync(transcriptDirPath, { recursive: true })
 
 let asrQueue = Promise.resolve()
 let asrJobId = 0
-let runtimePromptCache = {
+let runtimeConfigCache = {
   mtimeMs: -1,
-  prompt: '',
+  config: {},
   warned: false,
 }
 
@@ -284,26 +284,100 @@ function currentTranscriptCleanupConfig() {
 }
 
 function readRuntimeCleanupPrompt() {
-  if (!runtimeConfigPath) return ''
+  const config = readRuntimeConfig()
+  const prompt = config?.transcriptCleanup?.prompt
+  return typeof prompt === 'string' ? prompt : ''
+}
+
+function readRuntimeConfig() {
+  if (!runtimeConfigPath) return runtimeConfigCache.config
 
   try {
     const stat = statSync(runtimeConfigPath)
-    if (stat.mtimeMs === runtimePromptCache.mtimeMs) return runtimePromptCache.prompt
+    if (stat.mtimeMs === runtimeConfigCache.mtimeMs) return runtimeConfigCache.config
 
-    const config = JSON.parse(readFileSync(runtimeConfigPath, 'utf8'))
-    const prompt = config?.transcriptCleanup?.prompt
-    runtimePromptCache = {
+    runtimeConfigCache = {
       mtimeMs: stat.mtimeMs,
-      prompt: typeof prompt === 'string' ? prompt : '',
+      config: JSON.parse(readFileSync(runtimeConfigPath, 'utf8')),
       warned: false,
     }
-    return runtimePromptCache.prompt
+    return runtimeConfigCache.config
   } catch (err) {
-    if (err?.code !== 'ENOENT' && !runtimePromptCache.warned) {
-      console.warn(`[cleanup] could not reload prompt from config; keeping previous prompt: ${err.message}`)
-      runtimePromptCache.warned = true
+    if (err?.code !== 'ENOENT' && !runtimeConfigCache.warned) {
+      console.warn(`[config] could not reload runtime config; keeping previous values: ${err.message}`)
+      runtimeConfigCache.warned = true
     }
-    return runtimePromptCache.prompt
+    return runtimeConfigCache.config
+  }
+}
+
+function currentUserAuthConfig() {
+  const auth = readRuntimeConfig()?.auth || {}
+  const allowedUserIds = stringSet(auth.allowedUserIds || auth.userIds || auth.uids)
+  const allowedEmails = stringSet(auth.allowedEmails || auth.emails, { lower: true })
+
+  return {
+    required: allowedUserIds.size > 0 || allowedEmails.size > 0,
+    allowedUserIds,
+    allowedEmails,
+  }
+}
+
+function stringSet(value, options = {}) {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,\s]+/)
+      : []
+  const normalized = values
+    .map(item => String(item).trim())
+    .filter(Boolean)
+    .map(item => options.lower ? item.toLowerCase() : item)
+
+  return new Set(normalized)
+}
+
+function userLabel(user) {
+  if (!user) return 'unknown'
+  return [
+    user.uid ? `uid=${user.uid}` : '',
+    user.email ? `email=${user.email}` : '',
+    user.name ? `name=${user.name}` : '',
+  ].filter(Boolean).join(' ') || 'unknown'
+}
+
+function normalizeUser(value) {
+  if (!value || typeof value !== 'object') return null
+
+  const user = {
+    uid: stringValue(value.uid ?? value.userId ?? value.id),
+    email: stringValue(value.email ?? value.mail).toLowerCase(),
+    name: stringValue(value.name ?? value.userName),
+    country: stringValue(value.country),
+  }
+
+  return user.uid || user.email || user.name || user.country ? user : null
+}
+
+function stringValue(value) {
+  if (value === null || value === undefined) return ''
+  return String(value).trim()
+}
+
+function isAllowedUser(user, auth) {
+  if (!auth.required) return true
+  if (!user) return false
+  if (user.uid && auth.allowedUserIds.has(user.uid)) return true
+  if (user.email && auth.allowedEmails.has(user.email)) return true
+  return false
+}
+
+function parseControlMessage(text) {
+  try {
+    const value = JSON.parse(text)
+    return value && typeof value === 'object' ? value : null
+  } catch {
+    return null
   }
 }
 
@@ -582,6 +656,8 @@ wss.on('connection', (socket, req) => {
   let bytes = 0
   let chunks = 0
   let lastBytes = 0
+  let userAuthenticated = false
+  let evenUser = null
   const preRoll = { buffers: [], bytes: 0 }
   const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
 
@@ -613,7 +689,46 @@ wss.on('connection', (socket, req) => {
     if (!isBinary) {
       const text = data.toString()
       console.log(`[audio] control ${text}`)
+      const control = parseControlMessage(text)
+      if (control?.type === 'start') {
+        evenUser = normalizeUser(control.user)
+        const auth = currentUserAuthConfig()
+
+        console.log(`[auth] even user received: ${userLabel(evenUser)}`)
+        if (auth.required && !isAllowedUser(evenUser, auth)) {
+          console.warn(`[auth] rejected Even user: ${userLabel(evenUser)}`)
+          sendSocketJson(socket, {
+            type: 'auth_status',
+            status: 'rejected',
+            user: evenUser,
+          })
+          socket.close(1008, 'Even user is not allowed')
+          return
+        }
+
+        userAuthenticated = true
+        console.log(`[auth] accepted Even user: ${userLabel(evenUser)}`)
+        if (!auth.required) {
+          console.log('[auth] no user allowlist configured; add auth.allowedUserIds or auth.allowedEmails in config.json to restrict users')
+        }
+        sendSocketJson(socket, {
+          type: 'auth_status',
+          status: 'accepted',
+          user: evenUser,
+          restricted: auth.required,
+        })
+      }
       return
+    }
+
+    if (!userAuthenticated) {
+      const auth = currentUserAuthConfig()
+      if (auth.required) {
+        console.warn('[auth] rejected audio before Even user start message')
+        socket.close(1008, 'Even user is required')
+        return
+      }
+      userAuthenticated = true
     }
 
     const chunk = toBuffer(data)
@@ -734,6 +849,7 @@ wss.on('connection', (socket, req) => {
 
 server.listen(port, '0.0.0.0', () => {
   const startupCleanupConfig = currentTranscriptCleanupConfig()
+  const startupUserAuthConfig = currentUserAuthConfig()
   console.log(`[server] HTTP health: http://0.0.0.0:${port}/health`)
   console.log(`[server] WebSocket audio: ws://0.0.0.0:${port}/audio`)
   console.log('[server] Use your laptop LAN/Tailscale IP in the Even Hub app, not localhost.')
@@ -741,6 +857,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Transcript directory: ${transcriptDirPath}`)
   console.log(`[server] Transcript log: ${transcriptsLog}`)
   console.log(`[server] Audio auth: ${accessToken ? 'enabled' : 'disabled'}`)
+  console.log(`[server] Even user allowlist: ${startupUserAuthConfig.required ? 'enabled' : 'disabled'}`)
   console.log(`[server] Chunk mode: ${useVad ? 'vad' : 'fixed'}`)
   console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)
   console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)

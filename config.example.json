@@ -1,7 +1,9 @@
 {
   "auth": {
     "enabled": true,
-    "token": ""
+    "token": "",
+    "allowedUserIds": [],
+    "allowedEmails": []
   },
   "storage": {
     "audioDir": "data/audio",

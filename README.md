@@ -160,10 +160,39 @@ Use a stable token:
 {
   "auth": {
     "enabled": true,
-    "token": "change-me"
+    "token": "change-me",
+    "allowedUserIds": [],
+    "allowedEmails": []
   }
 }
 ```
+
+Restrict to specific Even users:
+
+```json
+{
+  "auth": {
+    "enabled": true,
+    "token": "change-me",
+    "allowedUserIds": ["12345"],
+    "allowedEmails": ["you@example.com"]
+  }
+}
+```
+
+The app sends `bridge.getUserInfo()` in the initial WebSocket `start` message.
+The receiver logs the discovered user:
+
+```text
+[auth] even user received: uid=12345 email=you@example.com name=You
+[auth] accepted Even user: uid=12345 email=you@example.com name=You
+```
+
+If either allowlist is non-empty, the receiver closes the WebSocket unless the
+reported user `uid` or `email` matches. The installed Even Hub SDK documents
+`uid`, `name`, `avatar`, and `country`; email is supported here when the host
+runtime provides it. User info is not a signed token, so for internet proxying
+keep QR token auth enabled and use HTTPS/WSS at the proxy layer.
 
 Disable local token auth:
 

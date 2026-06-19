@@ -14,6 +14,13 @@ const statsEl = document.getElementById('stats')!
 const urlEl = document.getElementById('url')!
 const transcriptEl = document.getElementById('transcript')!
 
+type UserPayload = {
+  uid?: string
+  email?: string
+  name?: string
+  country?: string
+}
+
 let sentChunks = 0
 let sentBytes = 0
 let droppedChunks = 0
@@ -26,6 +33,7 @@ let clearTranscriptTimer: number | null = null
 let spinnerTimer: number | null = null
 let spinnerIndex = 0
 let unsubscribe: (() => void) | null = null
+let evenUserInfo: UserPayload | null = null
 
 const GLASSES_LINE_WIDTH = 52
 const GLASSES_MAX_LINES = 7
@@ -70,6 +78,38 @@ function displayWsUrl(url: string) {
     return parsed.toString()
   } catch {
     return url
+  }
+}
+
+function stringValue(value: unknown) {
+  if (value === null || value === undefined) return ''
+  return String(value).trim()
+}
+
+function sanitizeUserInfo(value: unknown): UserPayload | null {
+  if (!value || typeof value !== 'object') return null
+
+  const record = value as Record<string, unknown>
+  const user: UserPayload = {
+    uid: stringValue(record.uid ?? record.userId ?? record.id),
+    email: stringValue(record.email ?? record.mail),
+    name: stringValue(record.name ?? record.userName),
+    country: stringValue(record.country),
+  }
+
+  for (const key of Object.keys(user) as Array<keyof UserPayload>) {
+    if (!user[key]) delete user[key]
+  }
+
+  return Object.keys(user).length ? user : null
+}
+
+async function loadUserInfo() {
+  try {
+    return sanitizeUserInfo(await bridge.getUserInfo())
+  } catch (err) {
+    console.warn('getUserInfo failed', err)
+    return null
   }
 }
 
@@ -174,6 +214,7 @@ function normalizePcm(value: unknown): Uint8Array | null {
 }
 
 const bridge = await waitForEvenAppBridge()
+evenUserInfo = await loadUserInfo()
 
 const statusContainer = new TextContainerProperty({
   xPosition: 0,
@@ -248,13 +289,19 @@ function connect() {
 
   ws.addEventListener('open', async () => {
     if (!ws) return
-    ws.send(JSON.stringify({
+    const startMessage: Record<string, unknown> = {
       type: 'start',
       source: 'g2',
       encoding: 'pcm_s16le',
       sampleRate: 16000,
       channels: 1,
-    }))
+    }
+
+    if (evenUserInfo) {
+      startMessage.user = evenUserInfo
+    }
+
+    ws.send(JSON.stringify(startMessage))
     await setAudio(true)
     setUiStatus('Streaming G2 mic audio')
   })
