@@ -87,7 +87,6 @@ Default config:
     "enabled": true,
     "token": "",
     "allowedUserIds": [],
-    "allowedEmails": [],
     "lastUser": null,
     "scannedUsers": []
   },
@@ -166,7 +165,6 @@ Use a stable token:
     "enabled": true,
     "token": "change-me",
     "allowedUserIds": [],
-    "allowedEmails": [],
     "lastUser": null,
     "scannedUsers": []
   }
@@ -180,26 +178,27 @@ Restrict to specific Even users:
   "auth": {
     "enabled": true,
     "token": "change-me",
-    "allowedUserIds": ["12345"],
-    "allowedEmails": ["you@example.com"]
+    "allowedUserIds": ["12345"]
   }
 }
 ```
 
 The app sends `bridge.getUserInfo()` in the initial WebSocket `start` message.
-The receiver logs the discovered user and saves it back into `config.json` as
-`auth.lastUser` and `auth.scannedUsers` on each QR/WebSocket startup:
+Even Hub currently documents `uid`, `name`, `avatar`, and `country`; it does
+not document an email field or a signed user token for plugin apps. The receiver
+logs the discovered user and saves it back into `config.json` as `auth.lastUser`
+and `auth.scannedUsers` on each QR/WebSocket startup:
 
 ```text
-[auth] even user received: uid=12345 email=you@example.com name=You
-[auth] accepted Even user: uid=12345 email=you@example.com name=You
+[auth] even user received: uid=12345
+[auth] accepted Even user: uid=12345
 ```
 
-If either allowlist is non-empty, the receiver closes the WebSocket unless the
-reported user `uid` or `email` matches. The installed Even Hub SDK documents
-`uid`, `name`, `avatar`, and `country`; email is supported here when the host
-runtime provides it. User info is not a signed token, so for internet proxying
-keep QR token auth enabled and use HTTPS/WSS at the proxy layer.
+If `auth.allowedUserIds` is non-empty, the receiver closes the WebSocket unless
+the reported Even user `uid` matches. Email is not used for Even user
+authorization because the current SDK docs and observed runtime payload do not
+provide it. User info is not a signed token, so for internet proxying keep QR
+token auth enabled and use HTTPS/WSS at the proxy layer.
 
 Disable local token auth:
 

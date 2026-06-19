@@ -16,7 +16,6 @@ const transcriptEl = document.getElementById('transcript')!
 
 type UserPayload = {
   uid?: string
-  email?: string
   name?: string
   country?: string
 }
@@ -92,7 +91,6 @@ function sanitizeUserInfo(value: unknown): UserPayload | null {
   const record = value as Record<string, unknown>
   const user: UserPayload = {
     uid: stringValue(record.uid ?? record.userId ?? record.id),
-    email: stringValue(record.email ?? record.mail),
     name: stringValue(record.name ?? record.userName),
     country: stringValue(record.country),
   }

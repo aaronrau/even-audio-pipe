@@ -3,7 +3,6 @@
     "enabled": true,
     "token": "",
     "allowedUserIds": [],
-    "allowedEmails": [],
     "lastUser": null,
     "scannedUsers": []
   },

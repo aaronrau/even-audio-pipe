@@ -318,12 +318,10 @@ function loadRuntimeConfigFile() {
 function currentUserAuthConfig() {
   const auth = readRuntimeConfig()?.auth || {}
   const allowedUserIds = stringSet(auth.allowedUserIds || auth.userIds || auth.uids)
-  const allowedEmails = stringSet(auth.allowedEmails || auth.emails, { lower: true })
 
   return {
-    required: allowedUserIds.size > 0 || allowedEmails.size > 0,
+    required: allowedUserIds.size > 0,
     allowedUserIds,
-    allowedEmails,
   }
 }
 
@@ -345,7 +343,6 @@ function userLabel(user) {
   if (!user) return 'unknown'
   return [
     user.uid ? `uid=${user.uid}` : '',
-    user.email ? `email=${user.email}` : '',
     user.name ? `name=${user.name}` : '',
   ].filter(Boolean).join(' ') || 'unknown'
 }
@@ -355,12 +352,11 @@ function normalizeUser(value) {
 
   const user = {
     uid: stringValue(value.uid ?? value.userId ?? value.id),
-    email: stringValue(value.email ?? value.mail).toLowerCase(),
     name: stringValue(value.name ?? value.userName),
     country: stringValue(value.country),
   }
 
-  return user.uid || user.email || user.name || user.country ? user : null
+  return user.uid || user.name || user.country ? user : null
 }
 
 function stringValue(value) {
@@ -372,7 +368,6 @@ function isAllowedUser(user, auth) {
   if (!auth.required) return true
   if (!user) return false
   if (user.uid && auth.allowedUserIds.has(user.uid)) return true
-  if (user.email && auth.allowedEmails.has(user.email)) return true
   return false
 }
 
@@ -394,7 +389,6 @@ function persistScannedUser(user, status) {
     const seenAt = new Date().toISOString()
     const savedUser = compactObject({
       uid: user.uid,
-      email: user.email,
       name: user.name,
       country: user.country,
       status,
@@ -422,15 +416,11 @@ function persistScannedUser(user, status) {
 }
 
 function upsertScannedUser(users, user) {
-  const key = user.uid ? `uid:${user.uid}` : user.email ? `email:${user.email}` : ''
+  const key = user.uid ? `uid:${user.uid}` : ''
   if (!key) return [...users, user]
 
   const filtered = users.filter(existing => {
-    const existingKey = existing?.uid
-      ? `uid:${String(existing.uid)}`
-      : existing?.email
-        ? `email:${String(existing.email).toLowerCase()}`
-        : ''
+    const existingKey = existing?.uid ? `uid:${String(existing.uid)}` : ''
     return existingKey !== key
   })
   return [...filtered, user]
@@ -775,7 +765,7 @@ wss.on('connection', (socket, req) => {
         console.log(`[auth] accepted Even user: ${userLabel(evenUser)}`)
         persistScannedUser(evenUser, 'accepted')
         if (!auth.required) {
-          console.log('[auth] no user allowlist configured; add auth.allowedUserIds or auth.allowedEmails in config.json to restrict users')
+          console.log('[auth] no user allowlist configured; add auth.allowedUserIds in config.json to restrict users')
         }
         sendSocketJson(socket, {
           type: 'auth_status',
