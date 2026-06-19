@@ -63,7 +63,7 @@ Useful port overrides:
 
 ```bash
 EVEN_AUDIO_PIPE_APP_PORT=5173 \
-EVEN_AUDIO_PIPE_RECEIVER_PORT=8787 \
+EVEN_AUDIO_PIPE_RECEIVER_PORT=8788 \
 EVEN_AUDIO_PIPE_ASR_PORT=8790 \
 npm start
 ```
@@ -94,6 +94,21 @@ Default config:
     "audioDir": "data/audio",
     "transcriptDir": "data/transcripts",
     "transcriptsLog": "data/transcripts/transcripts.log"
+  },
+  "workbench": {
+    "enabled": false,
+    "url": "http://127.0.0.1:8787",
+    "token": "",
+    "agent": "",
+    "agents": [
+      "Flux",
+      "Brock",
+      "Pike",
+      "Wolf"
+    ],
+    "timeoutMs": 15000,
+    "summaryPath": "/workbench/summary",
+    "summaryToken": ""
   },
   "transcriptCleanup": {
     "enabled": false,
@@ -151,7 +166,7 @@ the receiver. The app copies the launch token into the WebSocket URL:
 
 ```text
 QR URL:  http://YOUR_COMPUTER_IP:5173?t=TOKEN
-Audio:   ws://YOUR_COMPUTER_IP:8787/audio?t=TOKEN
+Audio:   ws://YOUR_COMPUTER_IP:8788/audio?t=TOKEN
 ```
 
 The receiver rejects `/audio` WebSocket connections without the matching token.
@@ -381,6 +396,43 @@ ASR_COMMAND='your-asr --input {wav}' npm start
 ```
 
 The command must print the final transcript to stdout.
+
+## Speech Agent Workbench
+
+Final transcripts can be routed into
+[`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench)
+through its local `POST /messages` API. Agent summaries can be posted back to
+this receiver and displayed on the glasses.
+
+Example `config.json`:
+
+```json
+{
+  "workbench": {
+    "enabled": true,
+    "url": "http://127.0.0.1:8787",
+    "token": "",
+    "agents": ["Flux", "Brock", "Pike", "Wolf"],
+    "summaryPath": "/workbench/summary",
+    "summaryToken": "summary-secret"
+  }
+}
+```
+
+`npm start` prints the exact workbench values to use. With the default receiver
+port, start the workbench with:
+
+```bash
+VOICE_API_ENABLED=1 \
+VOICE_API_PORT=8787 \
+VOICE_TMUX_SUMMARY_WEBHOOK_URL=http://127.0.0.1:8788/workbench/summary \
+VOICE_TMUX_SUMMARY_WEBHOOK_TOKEN=summary-secret \
+./run-auto.sh
+```
+
+The receiver sends cleaned final transcript chunks to `/messages`. The webhook
+body is expected to include `summary` or `text`; the receiver forwards that
+content to connected glasses as an agent summary.
 
 ## even-terminal Forwarding
 

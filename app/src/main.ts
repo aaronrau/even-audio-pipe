@@ -189,6 +189,40 @@ function handleReceiverMessage(raw: string) {
     return
   }
 
+  if (payload.type === 'agent_summary' && typeof payload.text === 'string') {
+    const agent = typeof payload.agent === 'string' && payload.agent
+      ? `${payload.agent}: `
+      : ''
+    appendTranscript(`${agent}${payload.text}`)
+    setUiStatus('Agent summary received')
+    return
+  }
+
+  if (payload.type === 'agent_status' && payload.status === 'sending') {
+    setUiStatus('Sending to workbench...')
+    return
+  }
+
+  if (payload.type === 'agent_status' && payload.status === 'sent') {
+    setUiStatus('Waiting for agent summary...')
+    return
+  }
+
+  if (payload.type === 'agent_status' && payload.status === 'agent_armed') {
+    const agent = typeof payload.agent === 'string' && payload.agent
+      ? payload.agent
+      : 'agent'
+    setUiStatus(`${agent} selected`)
+    return
+  }
+
+  if (payload.type === 'agent_error') {
+    const error = typeof payload.error === 'string' ? payload.error : 'Workbench error'
+    appendTranscript(error)
+    setUiStatus('Workbench error')
+    return
+  }
+
   if (payload.type === 'asr_status' && payload.status === 'transcribing') {
     setUiStatus('Transcribing speech...')
     return

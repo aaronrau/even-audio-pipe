@@ -11,6 +11,21 @@
     "transcriptDir": "data/transcripts",
     "transcriptsLog": "data/transcripts/transcripts.log"
   },
+  "workbench": {
+    "enabled": false,
+    "url": "http://127.0.0.1:8787",
+    "token": "",
+    "agent": "",
+    "agents": [
+      "Flux",
+      "Brock",
+      "Pike",
+      "Wolf"
+    ],
+    "timeoutMs": 15000,
+    "summaryPath": "/workbench/summary",
+    "summaryToken": ""
+  },
   "transcriptCleanup": {
     "enabled": false,
     "url": "http://127.0.0.1:8080/v1/chat/completions",

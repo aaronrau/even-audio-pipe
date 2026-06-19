@@ -4,7 +4,7 @@ import { appendFileSync, createWriteStream, mkdirSync, readFileSync, statSync, w
 import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 
-const port = Number(process.env.PORT || 8787)
+const port = Number(process.env.PORT || 8788)
 const audioDir = process.env.AUDIO_DIR || process.env.OUT_DIR || 'recordings'
 const audioDirPath = resolve(audioDir)
 const transcriptDir = process.env.TRANSCRIPT_DIR || audioDirPath
@@ -15,6 +15,16 @@ const terminalUrl = process.env.EVEN_TERMINAL_URL || ''
 const terminalToken = process.env.EVEN_TERMINAL_TOKEN || ''
 const terminalProvider = process.env.EVEN_TERMINAL_PROVIDER || 'codex'
 const terminalSessionId = process.env.EVEN_TERMINAL_SESSION_ID || ''
+const workbenchConfig = {
+  enabled: !isDisabled(process.env.SPEECH_WORKBENCH_ENABLED || '0'),
+  url: process.env.SPEECH_WORKBENCH_URL || 'http://127.0.0.1:8787',
+  token: process.env.SPEECH_WORKBENCH_TOKEN || '',
+  agent: process.env.SPEECH_WORKBENCH_AGENT || '',
+  agents: stringList(process.env.SPEECH_WORKBENCH_AGENTS || ''),
+  timeoutMs: Number(process.env.SPEECH_WORKBENCH_TIMEOUT_MS || 15_000),
+  summaryToken: process.env.SPEECH_WORKBENCH_SUMMARY_TOKEN || '',
+  summaryPath: normalizeHttpPath(process.env.SPEECH_WORKBENCH_SUMMARY_PATH || '/workbench/summary'),
+}
 const minAsrBytes = Number(process.env.MIN_ASR_BYTES || 6400)
 const segmentSeconds = Number(process.env.ASR_SEGMENT_SECONDS || 20)
 const bytesPerSecond = 16_000 * 2
@@ -49,16 +59,32 @@ let runtimeConfigCache = {
   config: {},
   warned: false,
 }
+const audioSockets = new Set()
+const pendingWorkbenchAgents = new WeakMap()
 
 const server = createServer((req, res) => {
-  if (req.url === '/health') {
+  const url = new URL(req.url || '/', 'http://localhost')
+
+  if (req.method === 'GET' && url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ ok: true }))
     return
   }
 
+  if (req.method === 'POST' && url.pathname === workbenchConfig.summaryPath) {
+    handleWorkbenchSummary(req, res).catch(err => {
+      console.error(`[workbench] summary webhook failed: ${err.message}`)
+      if (!res.headersSent) {
+        sendHttpJson(res, err.statusCode || 500, { ok: false, error: err.code || 'summary_failed' })
+      } else {
+        res.end()
+      }
+    })
+    return
+  }
+
   res.writeHead(200, { 'content-type': 'text/plain' })
-  res.end('Even Audio Pipe receiver. WebSocket path: /audio\n')
+  res.end(`Even Audio Pipe receiver. WebSocket path: /audio. Workbench summary path: ${workbenchConfig.summaryPath}\n`)
 })
 
 const wss = new WebSocketServer({ noServer: true })
@@ -177,6 +203,23 @@ function sendSocketJson(socket, payload) {
   }
 }
 
+function broadcastSocketJson(payload) {
+  let sent = 0
+  for (const socket of audioSockets) {
+    if (sendSocketJson(socket, payload)) sent += 1
+  }
+  return sent
+}
+
+function sendHttpJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload)
+  res.writeHead(statusCode, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+  })
+  res.end(body)
+}
+
 function normalizeTranscript(text) {
   return text
     .replace(/\r/g, '\n')
@@ -184,6 +227,14 @@ function normalizeTranscript(text) {
     .map(line => line.trim())
     .filter(Boolean)
     .join('\n')
+    .trim()
+}
+
+function normalizeCommandText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim()
 }
 
@@ -213,14 +264,94 @@ function isDisabled(value) {
   return /^(|0|false|none|off|no)$/i.test(String(value).trim())
 }
 
+function normalizeHttpPath(value) {
+  const path = String(value || '').trim() || '/'
+  return path.startsWith('/') ? path : `/${path}`
+}
+
+function stringList(value) {
+  if (Array.isArray(value)) return value.map(item => String(item).trim()).filter(Boolean)
+  return String(value || '').split(/[,\n]/).map(item => item.trim()).filter(Boolean)
+}
+
 function isAuthorizedAudioRequest(url) {
   if (!accessToken) return true
   return url.searchParams.get('t') === accessToken || url.searchParams.get('token') === accessToken
 }
 
+function isAuthorizedBearerRequest(req, token) {
+  if (!token) return true
+  const auth = req.headers.authorization || ''
+  return auth === `Bearer ${token}` || req.headers['x-workbench-summary-token'] === token
+}
+
 function rejectUpgrade(socket, statusCode, statusText) {
   socket.write(`HTTP/1.1 ${statusCode} ${statusText}\r\nConnection: close\r\n\r\n`)
   socket.destroy()
+}
+
+async function readJsonRequest(req, limitBytes = 65_536) {
+  const chunks = []
+  let bytes = 0
+
+  for await (const chunk of req) {
+    const buffer = toBuffer(chunk)
+    bytes += buffer.byteLength
+    if (bytes > limitBytes) {
+      const err = new Error('request body too large')
+      err.statusCode = 413
+      err.code = 'invalid_body_size'
+      throw err
+    }
+    chunks.push(buffer)
+  }
+
+  const text = Buffer.concat(chunks).toString('utf8').trim()
+  if (!text) {
+    const err = new Error('empty request body')
+    err.statusCode = 400
+    err.code = 'empty_body'
+    throw err
+  }
+
+  try {
+    return JSON.parse(text)
+  } catch (parseErr) {
+    const err = new Error(`invalid JSON: ${parseErr.message}`)
+    err.statusCode = 400
+    err.code = 'invalid_json'
+    throw err
+  }
+}
+
+async function handleWorkbenchSummary(req, res) {
+  if (!isAuthorizedBearerRequest(req, workbenchConfig.summaryToken)) {
+    sendHttpJson(res, 401, { ok: false, error: 'unauthorized' })
+    return
+  }
+
+  const payload = await readJsonRequest(req)
+  const summary = normalizeTranscript(payload.summary || payload.text || payload.message || '')
+  if (!summary) {
+    sendHttpJson(res, 400, { ok: false, error: 'missing_summary' })
+    return
+  }
+
+  const agent = stringValue(payload.agent)
+  const command = stringValue(payload.command)
+  const timestamp = payload.timestamp ?? Date.now() / 1000
+  const delivered = broadcastSocketJson({
+    type: 'agent_summary',
+    text: summary,
+    summary,
+    agent,
+    command,
+    timestamp,
+    createdAt: new Date().toISOString(),
+  })
+
+  console.log(`[workbench] summary received${agent ? ` from ${agent}` : ''}: ${summary}`)
+  sendHttpJson(res, 200, { ok: true, delivered })
 }
 
 async function maybePostToTerminal(text) {
@@ -248,6 +379,188 @@ async function maybePostToTerminal(text) {
   }
 
   console.log(`[terminal] posted transcript to ${terminalUrl}`)
+}
+
+async function maybePostToWorkbench(text, targetSocket, context = {}) {
+  if (!workbenchConfig.enabled || !text) return
+
+  const baseUrl = workbenchConfig.url.replace(/\/$/, '')
+  if (!baseUrl) {
+    console.warn('[workbench] enabled but SPEECH_WORKBENCH_URL is empty')
+    return
+  }
+
+  const route = routeWorkbenchTranscript(text, targetSocket)
+  if (route.skip) {
+    console.log(`[workbench] skipped transcript: ${route.reason}`)
+    if (route.agent) {
+      sendSocketJson(targetSocket, {
+        type: 'agent_status',
+        status: route.reason,
+        agent: route.agent,
+        jobId: context.jobId,
+      })
+    }
+    return
+  }
+
+  const body = route.agent
+    ? { agent: route.agent, message: route.message }
+    : { message: route.message }
+  const headers = { 'content-type': 'application/json' }
+  if (workbenchConfig.token) headers.authorization = `Bearer ${workbenchConfig.token}`
+
+  sendSocketJson(targetSocket, {
+    type: 'agent_status',
+    status: 'sending',
+    agent: route.agent || workbenchConfig.agent,
+    jobId: context.jobId,
+  })
+
+  const controller = new AbortController()
+  const timeoutMs = Number.isFinite(workbenchConfig.timeoutMs) ? workbenchConfig.timeoutMs : 15_000
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  timeout.unref?.()
+
+  try {
+    const res = await fetch(`${baseUrl}/messages`, {
+      method: 'POST',
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify(body),
+    })
+    const bodyText = await res.text()
+    let responseBody = {}
+    try {
+      responseBody = bodyText ? JSON.parse(bodyText) : {}
+    } catch {
+      responseBody = { error: bodyText }
+    }
+
+    if (!res.ok || responseBody?.ok === false) {
+      const detail = responseBody?.error || bodyText || `HTTP ${res.status}`
+      throw new Error(`workbench POST failed: ${detail}`)
+    }
+
+    console.log(`[workbench] posted transcript to ${baseUrl}/messages`)
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: 'sent',
+      agent: responseBody.agent || workbenchConfig.agent || '',
+      message: responseBody.message || route.message,
+      jobId: context.jobId,
+    })
+  } catch (err) {
+    const error = err?.name === 'AbortError'
+      ? `workbench POST timed out after ${timeoutMs}ms`
+      : err?.message || String(err)
+    console.error(`[workbench] ${error}`)
+    sendSocketJson(targetSocket, {
+      type: 'agent_error',
+      error,
+      agent: route.agent || workbenchConfig.agent,
+      jobId: context.jobId,
+    })
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function routeWorkbenchTranscript(text, targetSocket) {
+  const cleaned = normalizeTranscript(text)
+  if (!cleaned) return { skip: true, reason: 'empty_transcript' }
+
+  if (workbenchConfig.agent) {
+    return {
+      agent: workbenchConfig.agent,
+      message: cleaned,
+    }
+  }
+
+  const parsed = parseWorkbenchAgentPrefix(cleaned)
+  if (parsed?.agent && parsed.message) {
+    if (targetSocket) pendingWorkbenchAgents.delete(targetSocket)
+    return parsed
+  }
+
+  if (parsed?.agent && !parsed.message) {
+    if (targetSocket) pendingWorkbenchAgents.set(targetSocket, parsed.agent)
+    console.log(`[workbench] armed agent ${parsed.agent}; waiting for next transcript chunk`)
+    return {
+      skip: true,
+      reason: 'agent_armed',
+      agent: parsed.agent,
+    }
+  }
+
+  const pendingAgent = targetSocket ? pendingWorkbenchAgents.get(targetSocket) : ''
+  if (pendingAgent) {
+    pendingWorkbenchAgents.delete(targetSocket)
+    return {
+      agent: pendingAgent,
+      message: cleaned,
+    }
+  }
+
+  return {
+    skip: true,
+    reason: 'missing_agent_prefix',
+  }
+}
+
+function parseWorkbenchAgentPrefix(text) {
+  const candidates = workbenchAgentCandidates()
+  if (!candidates.length) return null
+
+  const normalizedText = normalizeCommandText(text)
+  if (!normalizedText) return null
+
+  let best = null
+  for (const candidate of candidates) {
+    const normalizedAlias = normalizeCommandText(candidate.alias)
+    if (!normalizedAlias) continue
+    if (normalizedText !== normalizedAlias && !normalizedText.startsWith(`${normalizedAlias} `)) continue
+    if (!best || normalizedAlias.length > best.normalizedAlias.length) {
+      best = { ...candidate, normalizedAlias }
+    }
+  }
+  if (!best) return null
+
+  const wordsToRemove = best.normalizedAlias.split(' ').length
+  const originalWords = String(text || '').trim().split(/\s+/)
+  const message = originalWords
+    .slice(wordsToRemove)
+    .join(' ')
+    .replace(/^[\s.,:;+\-]+/, '')
+    .trim()
+
+  return {
+    agent: best.agent,
+    message,
+  }
+}
+
+function workbenchAgentCandidates() {
+  const agents = workbenchConfig.agents.length
+    ? workbenchConfig.agents
+    : ['Flux', 'Brock', 'Pike', 'Wolf']
+  const aliases = []
+  for (const agent of agents) {
+    aliases.push({ agent, alias: agent })
+    for (const alias of defaultAgentAliases(agent)) {
+      aliases.push({ agent, alias })
+    }
+  }
+  return aliases
+}
+
+function defaultAgentAliases(agent) {
+  const normalized = normalizeCommandText(agent)
+  if (normalized === 'flux') return ['flex']
+  if (normalized === 'brock') return ['brook', 'block', 'rock']
+  if (normalized === 'pike') return ['pipe']
+  if (normalized === 'wolf') return ['wolfe']
+  return []
 }
 
 async function transcribeWithWorker(wavPath) {
@@ -592,6 +905,7 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
       cleanFile: basename(paths.cleanTxt),
       createdAt: new Date().toISOString(),
     })
+    await maybePostToWorkbench(cleanedTranscript, targetSocket, { jobId, user })
     await maybePostToTerminal(cleanedTranscript)
   } else {
     console.log('[asr] no transcript returned')
@@ -704,6 +1018,7 @@ function pushPreRoll(preRoll, chunk, maxBytes) {
 }
 
 wss.on('connection', (socket, req) => {
+  audioSockets.add(socket)
   const connectionStamp = stamp()
   let currentSegment = null
   let segmentIndex = 0
@@ -804,6 +1119,7 @@ wss.on('connection', (socket, req) => {
   })
 
   socket.on('close', () => {
+    audioSockets.delete(socket)
     clearInterval(meter)
     closeCurrentSegment('socket close')
     console.log(`[audio] closed: ${chunks} chunks, ${bytes} bytes total`)
@@ -913,6 +1229,11 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Transcript directory: ${transcriptDirPath}`)
   console.log(`[server] Transcript log: ${transcriptsLog}`)
   console.log(`[server] Audio auth: ${accessToken ? 'enabled' : 'disabled'}`)
+  console.log(
+    `[server] Workbench forwarding: ${workbenchConfig.enabled ? `${workbenchConfig.url.replace(/\/$/, '')}/messages` : 'disabled'}`,
+  )
+  console.log(`[server] Workbench summary webhook: http://0.0.0.0:${port}${workbenchConfig.summaryPath}`)
+  console.log(`[server] Workbench summary auth: ${workbenchConfig.summaryToken ? 'enabled' : 'disabled'}`)
   console.log(`[server] Even user allowlist: ${startupUserAuthConfig.required ? 'enabled' : 'disabled'}`)
   console.log(`[server] Chunk mode: ${useVad ? 'vad' : 'fixed'}`)
   console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)

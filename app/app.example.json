@@ -15,8 +15,8 @@
       "name": "network",
       "desc": "Stream microphone PCM audio to your local receiver.",
       "whitelist": [
-        "ws://192.168.1.100:8787",
-        "http://192.168.1.100:8787"
+        "ws://192.168.1.100:8788",
+        "http://192.168.1.100:8788"
       ]
     }
   ],

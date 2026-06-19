@@ -17,10 +17,11 @@ const configPath = resolve(rootDir, process.env.EVEN_AUDIO_PIPE_CONFIG || 'confi
 const config = loadConfig(configPath)
 const storageConfig = resolveStorageConfig(config.storage)
 const transcriptCleanupConfig = resolveTranscriptCleanupConfig(config.transcriptCleanup)
+const workbenchConfig = resolveWorkbenchConfig(config.workbench)
 
 const hostIp = process.env.EVEN_AUDIO_PIPE_HOST || detectHostIp()
 const appPort = Number(process.env.EVEN_AUDIO_PIPE_APP_PORT || 5173)
-const receiverPort = Number(process.env.EVEN_AUDIO_PIPE_RECEIVER_PORT || 8787)
+const receiverPort = Number(process.env.EVEN_AUDIO_PIPE_RECEIVER_PORT || 8788)
 const asrPort = Number(process.env.EVEN_AUDIO_PIPE_ASR_PORT || 8790)
 const asrEnabled = !isDisabled(process.env.EVEN_AUDIO_PIPE_ASR ?? '1')
 const asrWorkerUrl = process.env.ASR_WORKER_URL || `http://127.0.0.1:${asrPort}`
@@ -31,6 +32,8 @@ const qrUrl = authConfig.enabled ? withQueryParam(appUrl, 't', authConfig.token)
 const wsUrl = `ws://${hostIp}:${receiverPort}/audio`
 const receiverHttpOrigin = `http://${hostIp}:${receiverPort}`
 const receiverWsOrigin = `ws://${hostIp}:${receiverPort}`
+const workbenchSummaryWebhookUrl = `${receiverHttpOrigin}${workbenchConfig.summaryPath}`
+const workbenchSummaryWebhookLocalUrl = `http://127.0.0.1:${receiverPort}${workbenchConfig.summaryPath}`
 
 const children = new Set()
 let shuttingDown = false
@@ -87,6 +90,15 @@ console.log(`  Audio dir:      ${displayPath(storageConfig.audioDir)}`)
 console.log(`  Transcript dir: ${displayPath(storageConfig.transcriptDir)}`)
 console.log(`  Transcript log: ${displayPath(storageConfig.transcriptsLog)}`)
 console.log(`  Cleanup:        ${transcriptCleanupConfig.enabled ? `${transcriptCleanupConfig.model} at ${transcriptCleanupConfig.url}` : 'disabled'}`)
+console.log(`  Workbench API:  ${workbenchConfig.enabled ? `${workbenchConfig.url}/messages` : 'disabled'}`)
+console.log(`  Workbench hook: ${workbenchSummaryWebhookLocalUrl}`)
+console.log(`  LAN hook:       ${workbenchSummaryWebhookUrl}`)
+console.log('')
+console.log('Speech Agent Workbench settings:')
+console.log(`  VOICE_API_ENABLED=1`)
+console.log(`  VOICE_API_PORT=${portFromUrl(workbenchConfig.url) || 8787}`)
+console.log(`  VOICE_TMUX_SUMMARY_WEBHOOK_URL=${workbenchSummaryWebhookLocalUrl}`)
+console.log(`  VOICE_TMUX_SUMMARY_WEBHOOK_TOKEN=${workbenchConfig.summaryToken ? '<same as workbench.summaryToken>' : ''}`)
 console.log('')
 
 spawnManaged('receiver', 'npm', ['start'], {
@@ -105,6 +117,14 @@ spawnManaged('receiver', 'npm', ['start'], {
     TRANSCRIPT_CLEANUP_TIMEOUT_MS: String(transcriptCleanupConfig.timeoutMs),
     TRANSCRIPT_CLEANUP_PROMPT: transcriptCleanupConfig.prompt,
     TRANSCRIPT_CLEANUP_API_KEY: transcriptCleanupConfig.apiKey,
+    SPEECH_WORKBENCH_ENABLED: workbenchConfig.enabled ? '1' : '0',
+    SPEECH_WORKBENCH_URL: workbenchConfig.url,
+    SPEECH_WORKBENCH_TOKEN: workbenchConfig.token,
+    SPEECH_WORKBENCH_AGENT: workbenchConfig.agent,
+    SPEECH_WORKBENCH_AGENTS: workbenchConfig.agents.join(','),
+    SPEECH_WORKBENCH_TIMEOUT_MS: String(workbenchConfig.timeoutMs),
+    SPEECH_WORKBENCH_SUMMARY_TOKEN: workbenchConfig.summaryToken,
+    SPEECH_WORKBENCH_SUMMARY_PATH: workbenchConfig.summaryPath,
     EVEN_AUDIO_PIPE_CONFIG_PATH: configPath,
     EVEN_AUDIO_PIPE_TOKEN: authConfig.enabled ? authConfig.token : '',
   },
@@ -207,6 +227,73 @@ function resolveAuthConfig(auth = {}) {
   return {
     enabled,
     token: enabled ? token || randomBytes(18).toString('base64url') : '',
+  }
+}
+
+function resolveWorkbenchConfig(workbench = {}) {
+  const enabled = !isDisabled(
+    process.env.SPEECH_WORKBENCH_ENABLED ??
+    workbench.enabled ??
+    '0',
+  )
+  const url = String(
+    process.env.SPEECH_WORKBENCH_URL ||
+    workbench.url ||
+    'http://127.0.0.1:8787',
+  ).trim().replace(/\/+$/, '')
+  const token = String(
+    process.env.SPEECH_WORKBENCH_TOKEN ||
+    workbench.token ||
+    '',
+  )
+  const agent = String(
+    process.env.SPEECH_WORKBENCH_AGENT ||
+    workbench.agent ||
+    '',
+  ).trim()
+  const agents = stringArray(
+    process.env.SPEECH_WORKBENCH_AGENTS,
+    workbench.agents || ['Flux', 'Brock', 'Pike', 'Wolf'],
+  )
+  const timeoutMs = Number(
+    process.env.SPEECH_WORKBENCH_TIMEOUT_MS ??
+    workbench.timeoutMs ??
+    15_000,
+  )
+  const summaryToken = String(
+    process.env.SPEECH_WORKBENCH_SUMMARY_TOKEN ||
+    workbench.summaryToken ||
+    '',
+  )
+  const summaryPath = normalizeHttpPath(
+    process.env.SPEECH_WORKBENCH_SUMMARY_PATH ||
+    workbench.summaryPath ||
+    '/workbench/summary',
+  )
+
+  return {
+    enabled,
+    url,
+    token,
+    agent,
+    agents,
+    timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15_000,
+    summaryToken,
+    summaryPath,
+  }
+}
+
+function normalizeHttpPath(value) {
+  const path = String(value || '').trim() || '/'
+  return path.startsWith('/') ? path : `/${path}`
+}
+
+function portFromUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.port || (parsed.protocol === 'https:' ? '443' : '80')
+  } catch {
+    return ''
   }
 }
 
