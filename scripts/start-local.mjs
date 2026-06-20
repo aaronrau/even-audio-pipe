@@ -16,6 +16,7 @@ const localAsrPython = process.platform === 'win32'
 const configPath = resolve(rootDir, process.env.EVEN_AUDIO_PIPE_CONFIG || 'config.json')
 const config = loadConfig(configPath)
 const storageConfig = resolveStorageConfig(config.storage)
+const transcriptQueueConfig = resolveTranscriptQueueConfig(config.transcriptQueue)
 const transcriptCleanupConfig = resolveTranscriptCleanupConfig(config.transcriptCleanup)
 const workbenchConfig = resolveWorkbenchConfig(config.workbench)
 
@@ -89,6 +90,7 @@ console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
 console.log(`  Audio dir:      ${displayPath(storageConfig.audioDir)}`)
 console.log(`  Transcript dir: ${displayPath(storageConfig.transcriptDir)}`)
 console.log(`  Transcript log: ${displayPath(storageConfig.transcriptsLog)}`)
+console.log(`  Transcript wait: ${(transcriptQueueConfig.idleMs / 1000).toFixed(1)}s`)
 console.log(`  Cleanup:        ${transcriptCleanupConfig.enabled ? `${transcriptCleanupConfig.model} at ${transcriptCleanupConfig.url}` : 'disabled'}`)
 console.log(`  Workbench API:  ${workbenchConfig.enabled ? `${workbenchConfig.url}/messages` : 'disabled'}`)
 console.log(`  Workbench hook: ${workbenchSummaryWebhookLocalUrl}`)
@@ -110,6 +112,7 @@ spawnManaged('receiver', 'npm', ['start'], {
     AUDIO_DIR: storageConfig.audioDir,
     TRANSCRIPT_DIR: storageConfig.transcriptDir,
     TRANSCRIPTS_LOG: storageConfig.transcriptsLog,
+    TRANSCRIPT_QUEUE_IDLE_MS: String(transcriptQueueConfig.idleMs),
     TRANSCRIPT_CLEANUP_ENABLED: transcriptCleanupConfig.enabled ? '1' : '0',
     TRANSCRIPT_CLEANUP_URL: transcriptCleanupConfig.url,
     TRANSCRIPT_CLEANUP_MODEL: transcriptCleanupConfig.model,
@@ -227,6 +230,18 @@ function resolveAuthConfig(auth = {}) {
   return {
     enabled,
     token: enabled ? token || randomBytes(18).toString('base64url') : '',
+  }
+}
+
+function resolveTranscriptQueueConfig(queue = {}) {
+  const idleMs = Number(
+    process.env.TRANSCRIPT_QUEUE_IDLE_MS ??
+    queue.idleMs ??
+    5_000,
+  )
+
+  return {
+    idleMs: Number.isFinite(idleMs) ? idleMs : 5_000,
   }
 }
 

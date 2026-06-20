@@ -110,6 +110,9 @@ Default config:
     "summaryPath": "/workbench/summary",
     "summaryToken": ""
   },
+  "transcriptQueue": {
+    "idleMs": 5000
+  },
   "transcriptCleanup": {
     "enabled": false,
     "url": "http://127.0.0.1:8080/v1/chat/completions",
@@ -250,6 +253,11 @@ npm start
 ```
 
 ## Transcript Cleanup
+
+Final ASR chunks are queued as raw transcript text before cleanup. Each new
+non-empty ASR result resets `transcriptQueue.idleMs`; when no new words arrive
+for 5 seconds by default, the queued raw text is combined, sent through
+transcript cleanup once, then forwarded to the workbench.
 
 Transcript cleanup is an optional post-ASR stage. It sends each final ASR
 segment to an OpenAI-compatible chat completions endpoint, writes both the raw

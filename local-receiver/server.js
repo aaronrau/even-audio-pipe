@@ -36,6 +36,7 @@ const vadSilenceMs = Number(process.env.VAD_SILENCE_MS || 700)
 const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
+const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 5_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
@@ -61,6 +62,7 @@ let runtimeConfigCache = {
 }
 const audioSockets = new Set()
 const pendingWorkbenchAgents = new WeakMap()
+const transcriptQueues = new WeakMap()
 
 const server = createServer((req, res) => {
   const url = new URL(req.url || '/', 'http://localhost')
@@ -869,44 +871,14 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
   }
 
   if (rawTranscript) {
-    const cleanupConfig = currentTranscriptCleanupConfig()
-    if (cleanupConfig.enabled) {
-      sendSocketJson(targetSocket, {
-        type: 'asr_status',
-        status: 'cleaning',
-        jobId,
-        file: basename(paths.wav),
-      })
-    }
-
-    const cleanup = await cleanTranscript(rawTranscript, cleanupConfig)
-    const cleanedTranscript = cleanup.text
-
-    writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, user)
-    appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user)
     console.log(`[transcript:raw] ${rawTranscript}`)
-    console.log(`[transcript:clean] ${cleanedTranscript}`)
-    console.log(`[asr] transcript saved: ${paths.txt}`)
-    sendSocketJson(targetSocket, {
-      type: 'transcript',
-      text: cleanedTranscript,
-      rawText: rawTranscript,
-      cleanedText: cleanedTranscript,
-      cleanup: {
-        enabled: cleanup.enabled,
-        ok: cleanup.ok,
-        model: cleanup.model,
-        error: cleanup.error,
-      },
-      user,
+    enqueueRawTranscript({
+      rawTranscript,
+      paths,
+      targetSocket,
       jobId,
-      file: basename(paths.txt),
-      rawFile: basename(paths.rawTxt),
-      cleanFile: basename(paths.cleanTxt),
-      createdAt: new Date().toISOString(),
+      user,
     })
-    await maybePostToWorkbench(cleanedTranscript, targetSocket, { jobId, user })
-    await maybePostToTerminal(cleanedTranscript)
   } else {
     console.log('[asr] no transcript returned')
     sendSocketJson(targetSocket, {
@@ -918,6 +890,141 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
   }
 }
 
+function getTranscriptQueue(targetSocket) {
+  if (!targetSocket || typeof targetSocket !== 'object') return null
+
+  let queue = transcriptQueues.get(targetSocket)
+  if (!queue) {
+    queue = {
+      items: [],
+      timer: null,
+      flushPromise: Promise.resolve(),
+    }
+    transcriptQueues.set(targetSocket, queue)
+  }
+  return queue
+}
+
+function enqueueRawTranscript(item) {
+  const queue = getTranscriptQueue(item.targetSocket)
+  if (!queue) {
+    flushRawTranscriptBatch([item]).catch(err => {
+      console.error(`[transcript-queue] failed to flush fallback batch: ${err.message}`)
+    })
+    return
+  }
+
+  queue.items.push(item)
+  if (queue.timer) clearTimeout(queue.timer)
+  queue.timer = setTimeout(() => {
+    queue.timer = null
+    queue.flushPromise = queue.flushPromise
+      .catch(() => {})
+      .then(() => flushTranscriptQueue(item.targetSocket))
+  }, transcriptQueueIdleMs)
+  queue.timer.unref?.()
+
+  sendSocketJson(item.targetSocket, {
+    type: 'asr_status',
+    status: 'queued',
+    jobId: item.jobId,
+    queuedSegments: queue.items.length,
+    debounceMs: transcriptQueueIdleMs,
+    file: basename(item.paths.wav),
+  })
+  console.log(
+    `[transcript-queue] queued job ${item.jobId}; waiting ${(transcriptQueueIdleMs / 1000).toFixed(1)}s for more words`,
+  )
+}
+
+async function flushTranscriptQueue(targetSocket) {
+  const queue = getTranscriptQueue(targetSocket)
+  if (!queue || !queue.items.length) return
+
+  const items = queue.items
+  queue.items = []
+  await flushRawTranscriptBatch(items)
+}
+
+async function flushRawTranscriptBatch(items) {
+  const batch = items.filter(item => normalizeTranscript(item.rawTranscript))
+  if (!batch.length) return
+
+  const lastItem = batch[batch.length - 1]
+  const targetSocket = lastItem.targetSocket
+  const user = lastItem.user
+  const jobIds = batch.map(item => item.jobId)
+  const paths = lastItem.paths
+  const rawTranscript = combineQueuedTranscripts(batch.map(item => item.rawTranscript))
+  const cleanupConfig = currentTranscriptCleanupConfig()
+
+  console.log(`[transcript-queue] flushing ${batch.length} segment(s): jobs=${jobIds.join(',')}`)
+  if (cleanupConfig.enabled) {
+    sendSocketJson(targetSocket, {
+      type: 'asr_status',
+      status: 'cleaning',
+      jobId: lastItem.jobId,
+      jobIds,
+      queuedSegments: batch.length,
+      file: basename(paths.wav),
+    })
+  }
+
+  const cleanup = await cleanTranscript(rawTranscript, cleanupConfig)
+  const cleanedTranscript = cleanup.text
+
+  writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, user, {
+    queuedSegments: batch.map(batchItem => queuedSegmentMetadata(batchItem)),
+  })
+  appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user, {
+    queuedSegments: batch.map(batchItem => queuedSegmentMetadata(batchItem)),
+  })
+  console.log(`[transcript:clean] ${cleanedTranscript}`)
+  console.log(`[asr] queued transcript saved: ${paths.txt}`)
+  sendSocketJson(targetSocket, {
+    type: 'transcript',
+    text: cleanedTranscript,
+    rawText: rawTranscript,
+    cleanedText: cleanedTranscript,
+    cleanup: {
+      enabled: cleanup.enabled,
+      ok: cleanup.ok,
+      model: cleanup.model,
+      error: cleanup.error,
+    },
+    user,
+    jobId: lastItem.jobId,
+    jobIds,
+    queuedSegments: batch.length,
+    file: basename(paths.txt),
+    rawFile: basename(paths.rawTxt),
+    cleanFile: basename(paths.cleanTxt),
+    createdAt: new Date().toISOString(),
+  })
+  await maybePostToWorkbench(cleanedTranscript, targetSocket, { jobId: lastItem.jobId, user })
+  await maybePostToTerminal(cleanedTranscript)
+}
+
+function combineQueuedTranscripts(transcripts) {
+  return normalizeTranscript(transcripts.join('\n'))
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function queuedSegmentMetadata(item) {
+  return {
+    jobId: item.jobId,
+    raw: item.rawTranscript,
+    files: {
+      audio: item.paths.wav,
+      rawTranscript: item.paths.rawTxt,
+      cleanedTranscript: item.paths.cleanTxt,
+      displayTranscript: item.paths.txt,
+    },
+  }
+}
+
 function writeTextFile(path, content) {
   writeFileSync(path, content)
 }
@@ -926,7 +1033,7 @@ function writeJsonFile(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
 }
 
-function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, user) {
+function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, user, extra = {}) {
   writeTextFile(paths.rawTxt, `${rawTranscript}\n`)
   writeTextFile(paths.cleanTxt, `${cleanedTranscript}\n`)
   writeTextFile(paths.txt, `${cleanedTranscript}\n`)
@@ -936,6 +1043,7 @@ function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, 
     cleaned: cleanedTranscript,
     cleanup,
     user,
+    ...extra,
     files: {
       audio: paths.wav,
       rawTranscript: paths.rawTxt,
@@ -945,13 +1053,14 @@ function writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, 
   })
 }
 
-function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user) {
+function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user, extra = {}) {
   const line = JSON.stringify({
     createdAt: new Date().toISOString(),
     raw: rawTranscript,
     cleaned: cleanedTranscript,
     cleanup,
     user,
+    ...extra,
     files: {
       audio: paths.wav,
       rawTranscript: paths.rawTxt,
@@ -1237,6 +1346,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Even user allowlist: ${startupUserAuthConfig.required ? 'enabled' : 'disabled'}`)
   console.log(`[server] Chunk mode: ${useVad ? 'vad' : 'fixed'}`)
   console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)
+  console.log(`[server] Transcript queue idle: ${(transcriptQueueIdleMs / 1000).toFixed(1)}s`)
   console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)
   console.log(`[server] ASR command fallback: ${asrCommand ? 'configured' : 'not configured'}`)
   console.log(

@@ -228,6 +228,11 @@ function handleReceiverMessage(raw: string) {
     return
   }
 
+  if (payload.type === 'asr_status' && payload.status === 'queued') {
+    setUiStatus('Waiting for more speech...')
+    return
+  }
+
   if (payload.type === 'asr_status' && payload.status === 'no_transcript') {
     setUiStatus('Listening for speech...')
     return
