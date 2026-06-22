@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { cpus, networkInterfaces } from 'node:os'
+import { createServer as createNetServer } from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -45,6 +46,7 @@ if (!hostIp) {
   process.exit(1)
 }
 
+await ensureRequiredPortsAvailable()
 await ensureDependencies(receiverDir)
 await ensureDependencies(appDir)
 writeLocalEnv()
@@ -96,6 +98,8 @@ console.log(`  Transcript log: ${displayPath(storageConfig.transcriptsLog)}`)
 console.log(`  Transcript wait: ${(transcriptQueueConfig.idleMs / 1000).toFixed(1)}s`)
 console.log(`  Cleanup:        ${transcriptCleanupConfig.enabled ? `${transcriptCleanupConfig.model} at ${transcriptCleanupConfig.url}` : 'disabled'}`)
 console.log(`  Workbench API:  ${workbenchConfig.enabled ? `${workbenchConfig.url}/messages` : 'disabled'}`)
+console.log(`  Workbench agents: ${workbenchConfig.agents.join(', ') || 'none configured'}`)
+console.log(`  Workbench route: ${workbenchRouteDescription(workbenchConfig)}`)
 console.log(`  Workbench hook: ${workbenchSummaryWebhookLocalUrl}`)
 console.log(`  LAN hook:       ${workbenchSummaryWebhookUrl}`)
 console.log('')
@@ -128,6 +132,9 @@ spawnManaged('receiver', 'npm', ['start'], {
     SPEECH_WORKBENCH_TOKEN: workbenchConfig.token,
     SPEECH_WORKBENCH_AGENT: workbenchConfig.agent,
     SPEECH_WORKBENCH_AGENTS: workbenchConfig.agents.join(','),
+    SPEECH_WORKBENCH_REQUIRE_AGENT_PREFIX: workbenchConfig.requireAgentPrefix ? '1' : '0',
+    SPEECH_WORKBENCH_AGENT_PREFIX_WORD_LIMIT: String(workbenchConfig.agentPrefixWordLimit),
+    SPEECH_WORKBENCH_AGENT_ARM_TIMEOUT_MS: String(workbenchConfig.agentArmTimeoutMs),
     SPEECH_WORKBENCH_TIMEOUT_MS: String(workbenchConfig.timeoutMs),
     SPEECH_WORKBENCH_SUMMARY_TOKEN: workbenchConfig.summaryToken,
     SPEECH_WORKBENCH_SUMMARY_PATH: workbenchConfig.summaryPath,
@@ -276,11 +283,11 @@ function resolveTranscriptQueueConfig(queue = {}) {
   const idleMs = Number(
     process.env.TRANSCRIPT_QUEUE_IDLE_MS ??
     queue.idleMs ??
-    7_000,
+    5_000,
   )
 
   return {
-    idleMs: Number.isFinite(idleMs) ? idleMs : 7_000,
+    idleMs: Number.isFinite(idleMs) ? idleMs : 5_000,
   }
 }
 
@@ -309,6 +316,21 @@ function resolveWorkbenchConfig(workbench = {}) {
     process.env.SPEECH_WORKBENCH_AGENTS,
     workbench.agents || ['Flux', 'Brock', 'Pike', 'Wolf'],
   )
+  const requireAgentPrefix = !isDisabled(
+    process.env.SPEECH_WORKBENCH_REQUIRE_AGENT_PREFIX ??
+    workbench.requireAgentPrefix ??
+    '1',
+  )
+  const agentPrefixWordLimit = Number(
+    process.env.SPEECH_WORKBENCH_AGENT_PREFIX_WORD_LIMIT ??
+    workbench.agentPrefixWordLimit ??
+    3,
+  )
+  const agentArmTimeoutMs = Number(
+    process.env.SPEECH_WORKBENCH_AGENT_ARM_TIMEOUT_MS ??
+    workbench.agentArmTimeoutMs ??
+    30_000,
+  )
   const timeoutMs = Number(
     process.env.SPEECH_WORKBENCH_TIMEOUT_MS ??
     workbench.timeoutMs ??
@@ -331,10 +353,20 @@ function resolveWorkbenchConfig(workbench = {}) {
     token,
     agent,
     agents,
+    requireAgentPrefix,
+    agentPrefixWordLimit: Number.isFinite(agentPrefixWordLimit) ? Math.max(1, Math.floor(agentPrefixWordLimit)) : 3,
+    agentArmTimeoutMs: Number.isFinite(agentArmTimeoutMs) ? Math.max(0, Math.floor(agentArmTimeoutMs)) : 30_000,
     timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15_000,
     summaryToken,
     summaryPath,
   }
+}
+
+function workbenchRouteDescription(workbenchConfig) {
+  if (!workbenchConfig.requireAgentPrefix) return 'default/pending agent allowed'
+
+  const armSeconds = (workbenchConfig.agentArmTimeoutMs / 1000).toFixed(1)
+  return `agent in first ${workbenchConfig.agentPrefixWordLimit} words required; agent-only arms next transcript for ${armSeconds}s`
 }
 
 function normalizeHttpPath(value) {
@@ -887,6 +919,82 @@ function updateAppManifest() {
 
   manifest.permissions = permissions
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+}
+
+async function ensureRequiredPortsAvailable() {
+  const checks = [
+    {
+      label: 'Vite app',
+      port: appPort,
+      host: '0.0.0.0',
+      env: 'EVEN_AUDIO_PIPE_APP_PORT',
+    },
+    {
+      label: 'receiver',
+      port: receiverPort,
+      host: '0.0.0.0',
+      env: 'EVEN_AUDIO_PIPE_RECEIVER_PORT',
+    },
+  ]
+
+  if (asrEnabled && !process.env.ASR_WORKER_URL) {
+    checks.push({
+      label: 'ASR worker',
+      port: asrPort,
+      host: '127.0.0.1',
+      env: 'EVEN_AUDIO_PIPE_ASR_PORT',
+    })
+  }
+
+  const seenPorts = new Map()
+  const duplicatePorts = []
+  for (const check of checks) {
+    const key = `${check.host}:${check.port}`
+    const previous = seenPorts.get(key)
+    if (previous) {
+      duplicatePorts.push(`${previous.label} and ${check.label} both use ${key}`)
+    }
+    seenPorts.set(key, check)
+  }
+
+  if (duplicatePorts.length) {
+    console.error('Cannot start Even Audio Pipe because required ports overlap:')
+    for (const duplicate of duplicatePorts) console.error(`  ${duplicate}`)
+    process.exit(1)
+  }
+
+  const unavailable = []
+  for (const check of checks) {
+    const available = await isPortAvailable(check.port, check.host)
+    if (!available) unavailable.push(check)
+  }
+
+  if (!unavailable.length) return
+
+  console.error('Cannot start Even Audio Pipe because required port(s) are already in use:')
+  for (const check of unavailable) {
+    console.error(`  ${check.label}: ${check.host}:${check.port}`)
+  }
+  console.error('')
+  console.error('Stop the existing Even Audio Pipe process, or use alternate ports, for example:')
+  console.error(`  ${unavailable.map(check => `${check.env}=<free-port>`).join(' ')} npm start`)
+  console.error('')
+  console.error('To inspect current owners:')
+  console.error(`  ss -ltnp | rg ':(${unavailable.map(check => check.port).join('|')})\\\\b'`)
+  process.exit(1)
+}
+
+function isPortAvailable(port, host) {
+  return new Promise((resolvePromise) => {
+    const server = createNetServer()
+    server.once('error', () => {
+      resolvePromise(false)
+    })
+    server.once('listening', () => {
+      server.close(() => resolvePromise(true))
+    })
+    server.listen(port, host)
+  })
 }
 
 function spawnManaged(label, command, args, options) {

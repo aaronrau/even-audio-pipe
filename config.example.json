@@ -24,12 +24,15 @@
       "Pike",
       "Wolf"
     ],
+    "requireAgentPrefix": true,
+    "agentPrefixWordLimit": 3,
+    "agentArmTimeoutMs": 30000,
     "timeoutMs": 15000,
     "summaryPath": "/workbench/summary",
     "summaryToken": ""
   },
   "transcriptQueue": {
-    "idleMs": 7000
+    "idleMs": 5000
   },
   "transcriptCleanup": {
     "enabled": false,

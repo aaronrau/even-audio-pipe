@@ -21,6 +21,9 @@ const workbenchConfig = {
   token: process.env.SPEECH_WORKBENCH_TOKEN || '',
   agent: process.env.SPEECH_WORKBENCH_AGENT || '',
   agents: stringList(process.env.SPEECH_WORKBENCH_AGENTS || ''),
+  requireAgentPrefix: !isDisabled(process.env.SPEECH_WORKBENCH_REQUIRE_AGENT_PREFIX || '1'),
+  agentPrefixWordLimit: Number(process.env.SPEECH_WORKBENCH_AGENT_PREFIX_WORD_LIMIT || 3),
+  agentArmTimeoutMs: Number(process.env.SPEECH_WORKBENCH_AGENT_ARM_TIMEOUT_MS || 30_000),
   timeoutMs: Number(process.env.SPEECH_WORKBENCH_TIMEOUT_MS || 15_000),
   summaryToken: process.env.SPEECH_WORKBENCH_SUMMARY_TOKEN || '',
   summaryPath: normalizeHttpPath(process.env.SPEECH_WORKBENCH_SUMMARY_PATH || '/workbench/summary'),
@@ -36,7 +39,7 @@ const vadSilenceMs = Number(process.env.VAD_SILENCE_MS || 700)
 const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
-const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 7_000)
+const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 5_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
@@ -445,6 +448,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     }
 
     console.log(`[workbench] posted transcript to ${baseUrl}/messages`)
+    if (route.clearPendingAgentOnSent) clearPendingWorkbenchAgent(targetSocket, route.agent)
     sendSocketJson(targetSocket, {
       type: 'agent_status',
       status: 'sent',
@@ -472,6 +476,40 @@ function routeWorkbenchTranscript(text, targetSocket) {
   const cleaned = normalizeTranscript(text)
   if (!cleaned) return { skip: true, reason: 'empty_transcript' }
 
+  const parsed = parseWorkbenchAgentPrefix(cleaned, {
+    includeAliases: !workbenchConfig.requireAgentPrefix,
+  })
+
+  if (workbenchConfig.requireAgentPrefix) {
+    if (parsed?.agent && parsed.message) {
+      clearPendingWorkbenchAgent(targetSocket)
+      return parsed
+    }
+
+    if (parsed?.agent && !parsed.message) {
+      armPendingWorkbenchAgent(targetSocket, parsed.agent)
+      return {
+        skip: true,
+        reason: 'agent_armed',
+        agent: parsed.agent,
+      }
+    }
+
+    const pendingAgent = getPendingWorkbenchAgent(targetSocket)
+    if (pendingAgent) {
+      return {
+        agent: pendingAgent,
+        message: cleaned,
+        clearPendingAgentOnSent: true,
+      }
+    }
+
+    return {
+      skip: true,
+      reason: 'missing_agent_prefix',
+    }
+  }
+
   if (workbenchConfig.agent) {
     return {
       agent: workbenchConfig.agent,
@@ -479,15 +517,13 @@ function routeWorkbenchTranscript(text, targetSocket) {
     }
   }
 
-  const parsed = parseWorkbenchAgentPrefix(cleaned)
   if (parsed?.agent && parsed.message) {
-    if (targetSocket) pendingWorkbenchAgents.delete(targetSocket)
+    clearPendingWorkbenchAgent(targetSocket)
     return parsed
   }
 
   if (parsed?.agent && !parsed.message) {
-    if (targetSocket) pendingWorkbenchAgents.set(targetSocket, parsed.agent)
-    console.log(`[workbench] armed agent ${parsed.agent}; waiting for next transcript chunk`)
+    armPendingWorkbenchAgent(targetSocket, parsed.agent)
     return {
       skip: true,
       reason: 'agent_armed',
@@ -495,12 +531,12 @@ function routeWorkbenchTranscript(text, targetSocket) {
     }
   }
 
-  const pendingAgent = targetSocket ? pendingWorkbenchAgents.get(targetSocket) : ''
+  const pendingAgent = getPendingWorkbenchAgent(targetSocket)
   if (pendingAgent) {
-    pendingWorkbenchAgents.delete(targetSocket)
     return {
       agent: pendingAgent,
       message: cleaned,
+      clearPendingAgentOnSent: true,
     }
   }
 
@@ -510,28 +546,100 @@ function routeWorkbenchTranscript(text, targetSocket) {
   }
 }
 
-function parseWorkbenchAgentPrefix(text) {
-  const candidates = workbenchAgentCandidates()
+function armPendingWorkbenchAgent(targetSocket, agent) {
+  if (!targetSocket || !agent) return
+
+  const timeoutMs = workbenchAgentArmTimeoutMs()
+  pendingWorkbenchAgents.set(targetSocket, {
+    agent,
+    expiresAt: timeoutMs > 0 ? Date.now() + timeoutMs : 0,
+  })
+
+  const waitDescription = timeoutMs > 0
+    ? `up to ${(timeoutMs / 1000).toFixed(1)}s`
+    : 'until the next transcript chunk'
+  console.log(`[workbench] armed agent ${agent}; waiting ${waitDescription}`)
+}
+
+function getPendingWorkbenchAgent(targetSocket) {
+  if (!targetSocket) return ''
+
+  const pending = pendingWorkbenchAgents.get(targetSocket)
+  if (!pending) return ''
+
+  const agent = typeof pending === 'string' ? pending : pending.agent
+  const expiresAt = typeof pending === 'string' ? 0 : pending.expiresAt
+
+  if (expiresAt > 0 && expiresAt <= Date.now()) {
+    pendingWorkbenchAgents.delete(targetSocket)
+    console.log(`[workbench] armed agent ${agent} expired before next transcript chunk`)
+    return ''
+  }
+
+  return agent || ''
+}
+
+function clearPendingWorkbenchAgent(targetSocket, agent = '') {
+  if (!targetSocket) return
+
+  if (!agent) {
+    pendingWorkbenchAgents.delete(targetSocket)
+    return
+  }
+
+  const pendingAgent = getPendingWorkbenchAgent(targetSocket)
+  if (pendingAgent === agent) pendingWorkbenchAgents.delete(targetSocket)
+}
+
+function workbenchAgentArmTimeoutMs() {
+  return Number.isFinite(workbenchConfig.agentArmTimeoutMs)
+    ? Math.max(0, workbenchConfig.agentArmTimeoutMs)
+    : 30_000
+}
+
+function workbenchRouteDescription() {
+  if (!workbenchConfig.enabled) return 'disabled'
+  if (!workbenchConfig.requireAgentPrefix) return 'default/pending agent allowed'
+
+  return `agent in first ${workbenchAgentPrefixWordLimit()} words required; agent-only arms next transcript for ${(workbenchAgentArmTimeoutMs() / 1000).toFixed(1)}s`
+}
+
+function parseWorkbenchAgentPrefix(text, options = {}) {
+  const candidates = workbenchAgentCandidates(options)
   if (!candidates.length) return null
 
-  const normalizedText = normalizeCommandText(text)
-  if (!normalizedText) return null
+  const originalWords = String(text || '').trim().split(/\s+/).filter(Boolean)
+  if (!originalWords.length) return null
+
+  const normalizedWords = originalWords.map(word => normalizeCommandText(word))
+  if (!normalizedWords.some(Boolean)) return null
 
   let best = null
+  const wordLimit = workbenchAgentPrefixWordLimit()
   for (const candidate of candidates) {
     const normalizedAlias = normalizeCommandText(candidate.alias)
     if (!normalizedAlias) continue
-    if (normalizedText !== normalizedAlias && !normalizedText.startsWith(`${normalizedAlias} `)) continue
-    if (!best || normalizedAlias.length > best.normalizedAlias.length) {
-      best = { ...candidate, normalizedAlias }
+    const aliasWords = normalizedAlias.split(' ').filter(Boolean)
+    if (!aliasWords.length) continue
+
+    const maxStartIndex = Math.min(wordLimit, normalizedWords.length) - 1
+    for (let startIndex = 0; startIndex <= maxStartIndex; startIndex += 1) {
+      const words = normalizedWords.slice(startIndex, startIndex + aliasWords.length)
+      if (words.length !== aliasWords.length) continue
+      if (words.join(' ') !== normalizedAlias) continue
+      if (
+        !best ||
+        startIndex < best.startIndex ||
+        (startIndex === best.startIndex && normalizedAlias.length > best.normalizedAlias.length)
+      ) {
+        best = { ...candidate, normalizedAlias, startIndex, aliasWordCount: aliasWords.length }
+      }
     }
   }
   if (!best) return null
 
-  const wordsToRemove = best.normalizedAlias.split(' ').length
-  const originalWords = String(text || '').trim().split(/\s+/)
   const message = originalWords
-    .slice(wordsToRemove)
+    .slice(best.startIndex + best.aliasWordCount)
     .join(' ')
     .replace(/^[\s.,:;+\-]+/, '')
     .trim()
@@ -542,13 +650,21 @@ function parseWorkbenchAgentPrefix(text) {
   }
 }
 
-function workbenchAgentCandidates() {
+function workbenchAgentPrefixWordLimit() {
+  return Number.isFinite(workbenchConfig.agentPrefixWordLimit)
+    ? Math.max(1, Math.floor(workbenchConfig.agentPrefixWordLimit))
+    : 3
+}
+
+function workbenchAgentCandidates(options = {}) {
+  const includeAliases = options.includeAliases !== false
   const agents = workbenchConfig.agents.length
     ? workbenchConfig.agents
     : ['Flux', 'Brock', 'Pike', 'Wolf']
   const aliases = []
   for (const agent of agents) {
     aliases.push({ agent, alias: agent })
+    if (!includeAliases) continue
     for (const alias of defaultAgentAliases(agent)) {
       aliases.push({ agent, alias })
     }
@@ -902,10 +1018,19 @@ function getTranscriptQueue(targetSocket) {
       activeSegments: 0,
       pendingAsrJobs: 0,
       lastTranscriptAt: 0,
+      lastActivityAt: 0,
     }
     transcriptQueues.set(targetSocket, queue)
   }
   return queue
+}
+
+function markTranscriptQueueActivity(targetSocket) {
+  const queue = targetSocket ? transcriptQueues.get(targetSocket) : null
+  if (!queue || !queue.items.length) return
+
+  queue.lastActivityAt = Date.now()
+  scheduleTranscriptQueueFlush(targetSocket)
 }
 
 function markAudioSegmentStarted(targetSocket) {
@@ -945,6 +1070,7 @@ function enqueueRawTranscript(item) {
 
   queue.items.push(item)
   queue.lastTranscriptAt = Date.now()
+  queue.lastActivityAt = queue.lastTranscriptAt
   scheduleTranscriptQueueFlush(item.targetSocket)
 
   sendSocketJson(item.targetSocket, {
@@ -958,7 +1084,7 @@ function enqueueRawTranscript(item) {
     file: basename(item.paths.wav),
   })
   console.log(
-    `[transcript-queue] queued job ${item.jobId}; waiting ${(transcriptQueueIdleMs / 1000).toFixed(1)}s for more words and audio idle`,
+    `[transcript-queue] queued job ${item.jobId}; waiting ${(transcriptQueueIdleMs / 1000).toFixed(1)}s after last translated text/VAD speech and audio idle`,
   )
 }
 
@@ -967,7 +1093,8 @@ function scheduleTranscriptQueueFlush(targetSocket, retryMs = null) {
   if (!queue || !queue.items.length) return
 
   if (queue.timer) clearTimeout(queue.timer)
-  const elapsedMs = queue.lastTranscriptAt ? Date.now() - queue.lastTranscriptAt : transcriptQueueIdleMs
+  const lastActivityAt = queue.lastActivityAt || queue.lastTranscriptAt
+  const elapsedMs = lastActivityAt ? Date.now() - lastActivityAt : transcriptQueueIdleMs
   const waitMs = retryMs === null
     ? Math.max(0, transcriptQueueIdleMs - elapsedMs)
     : retryMs
@@ -984,7 +1111,8 @@ async function flushTranscriptQueue(targetSocket) {
   const queue = getTranscriptQueue(targetSocket)
   if (!queue || !queue.items.length) return
 
-  const elapsedMs = Date.now() - queue.lastTranscriptAt
+  const lastActivityAt = queue.lastActivityAt || queue.lastTranscriptAt
+  const elapsedMs = Date.now() - lastActivityAt
   if (elapsedMs < transcriptQueueIdleMs) {
     scheduleTranscriptQueueFlush(targetSocket)
     return
@@ -1345,6 +1473,7 @@ wss.on('connection', (socket, req) => {
     }
 
     if (isSpeech) {
+      markTranscriptQueueActivity(socket)
       segment.speechMs += durationMs
       segment.silenceMs = 0
       segment.hasSpeech = true
@@ -1404,6 +1533,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(
     `[server] Workbench forwarding: ${workbenchConfig.enabled ? `${workbenchConfig.url.replace(/\/$/, '')}/messages` : 'disabled'}`,
   )
+  console.log(`[server] Workbench route: ${workbenchRouteDescription()}`)
   console.log(`[server] Workbench summary webhook: http://0.0.0.0:${port}${workbenchConfig.summaryPath}`)
   console.log(`[server] Workbench summary auth: ${workbenchConfig.summaryToken ? 'enabled' : 'disabled'}`)
   console.log(`[server] Even user allowlist: ${startupUserAuthConfig.required ? 'enabled' : 'disabled'}`)

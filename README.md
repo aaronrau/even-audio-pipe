@@ -21,6 +21,78 @@ The glasses display intentionally behaves like live captions:
 - Clears after 5 seconds without new transcript text.
 - Shows a small idle dot animation (`.`, `..`, `...`, `..`) while waiting.
 
+## Runtime Flow
+
+The receiver has two separate queues that are easy to mix up:
+
+- The STT batch queue combines raw transcript segments for cleanup, file
+  writes, and glasses display.
+- The workbench command queue decides when a command has been sent to
+  `speech-agent-workbench` and can be consumed.
+
+The current flow is:
+
+```text
+G2 mic audio
+  -> WebSocket receiver
+  -> VAD audio segment closes
+  -> ASR worker returns final text for that segment
+  -> non-empty STT text is appended to the STT batch queue
+  -> 5 seconds with no newer STT text or VAD speech
+  -> no active audio segment and no pending ASR job
+  -> queued raw text is combined
+  -> transcript cleanup runs once for the combined text
+  -> transcript files and transcripts.log are written
+  -> cleaned text is sent to the glasses
+  -> cleaned text is evaluated by the workbench command queue
+```
+
+The 5 second wait is based on the last non-empty STT result or later VAD speech
+activity. VAD silence and background audio below the speech threshold do not
+reset the timer. That wait only makes the queued text eligible to flush. The
+receiver still holds the queue if the same glasses connection has an open audio
+segment or an ASR job waiting/running, so a command is not sent while the user
+is still speaking into a segment that has not produced its transcript yet.
+
+Workbench routing then behaves like this when `requireAgentPrefix` is enabled:
+
+```text
+Cleaned transcript starts with agent + message
+  -> POST /messages with { agent, message }
+  -> when the POST succeeds, flush/consume the workbench command state
+
+Cleaned transcript is exactly an agent name, for example "Pike"
+  -> do not POST yet
+  -> keep that agent armed in the workbench command queue
+
+Next flushed transcript arrives while an agent is armed
+  -> POST /messages with the armed agent and the new transcript as message
+  -> when the POST succeeds, flush/consume the armed agent
+
+Cleaned transcript has no agent and no armed agent
+  -> save/display transcript only
+  -> skip workbench POST
+
+Armed agent expires before a command is sent
+  -> clear the armed agent after agentArmTimeoutMs
+```
+
+This means `Pike update the heading` posts after the 5 second STT/VAD idle flush.
+`Pike` followed by `update the heading` also posts, but only if the second
+flushed transcript arrives before `agentArmTimeoutMs` expires. In both command
+cases, the workbench command queue is flushed when `/messages` succeeds. Ambient
+speech without an agent prefix is still saved and shown on the glasses, but it
+is not sent to the workbench.
+
+Workbench responses return on the separate summary webhook:
+
+```text
+speech-agent-workbench
+  -> POST /workbench/summary
+  -> receiver validates summaryToken when configured
+  -> summary/text is sent to connected glasses
+```
+
 ## Requirements
 
 - Node.js 20 or newer.
@@ -108,12 +180,15 @@ Default config:
       "Pike",
       "Wolf"
     ],
+    "requireAgentPrefix": true,
+    "agentPrefixWordLimit": 3,
+    "agentArmTimeoutMs": 30000,
     "timeoutMs": 15000,
     "summaryPath": "/workbench/summary",
     "summaryToken": ""
   },
   "transcriptQueue": {
-    "idleMs": 7000
+    "idleMs": 5000
   },
   "transcriptCleanup": {
     "enabled": false,
@@ -277,9 +352,10 @@ npm start
 ## Transcript Cleanup
 
 Final ASR chunks are queued as raw transcript text before cleanup. Each new
-non-empty ASR result resets `transcriptQueue.idleMs`; when no new words arrive
-for 7 seconds by default, the queued raw text is combined, sent through
-transcript cleanup once, then forwarded to the workbench.
+non-empty ASR result or later VAD speech activity resets `transcriptQueue.idleMs`;
+when no new STT transcript text or VAD speech arrives for 5 seconds by default
+and no audio segment or ASR job is still active, the queued raw text is
+combined, sent through transcript cleanup once, then forwarded to the workbench.
 
 Transcript cleanup is an optional post-ASR stage. It sends each final ASR
 segment to an OpenAI-compatible chat completions endpoint, writes both the raw
@@ -443,6 +519,9 @@ Example `config.json`:
     "url": "http://127.0.0.1:8787",
     "token": "",
     "agents": ["Flux", "Brock", "Pike", "Wolf"],
+    "requireAgentPrefix": true,
+    "agentPrefixWordLimit": 3,
+    "agentArmTimeoutMs": 30000,
     "summaryPath": "/workbench/summary",
     "summaryToken": "summary-secret"
   }
@@ -460,9 +539,16 @@ VOICE_TMUX_SUMMARY_WEBHOOK_TOKEN=summary-secret \
 ./run-auto.sh
 ```
 
-The receiver sends cleaned final transcript chunks to `/messages`. The webhook
-body is expected to include `summary` or `text`; the receiver forwards that
-content to connected glasses as an agent summary.
+The receiver saves every cleaned transcript, but sends a transcript to
+`/messages` only when the cleaned text contains an exact configured agent name
+in the first `agentPrefixWordLimit` words. With the default config,
+`Flux pull latest`, `Hey Brock check status`, and `Pike push changes` route to
+the workbench; ambient speech without an agent prefix is skipped. A transcript
+that is exactly an agent name, such as `Pike`, arms the next flushed transcript
+for `agentArmTimeoutMs` milliseconds. Aliases such as "flex" or "brook" should
+be normalized by transcript cleanup before routing. The webhook body is expected
+to include `summary` or `text`; the receiver forwards that content to connected
+glasses as an agent summary.
 
 ## even-terminal Forwarding
 
