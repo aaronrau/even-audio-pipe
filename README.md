@@ -86,6 +86,8 @@ Default config:
   "auth": {
     "enabled": true,
     "token": "",
+    "tokenSecret": "",
+    "tokenUserId": "",
     "allowedUserIds": [],
     "lastUser": null,
     "scannedUsers": []
@@ -111,7 +113,7 @@ Default config:
     "summaryToken": ""
   },
   "transcriptQueue": {
-    "idleMs": 5000
+    "idleMs": 7000
   },
   "transcriptCleanup": {
     "enabled": false,
@@ -163,9 +165,9 @@ npm start
 
 ## Local QR Auth
 
-The launcher enables local access-token auth by default. On each `npm start`,
-it generates a random token, puts it in the QR URL, and passes the same token to
-the receiver. The app copies the launch token into the WebSocket URL:
+The launcher enables local access-token auth by default. It puts a token in the
+QR URL and passes the same token to the receiver. The app copies the launch
+token into the WebSocket URL:
 
 ```text
 QR URL:  http://YOUR_COMPUTER_IP:5173?t=TOKEN
@@ -174,6 +176,26 @@ Audio:   ws://YOUR_COMPUTER_IP:8788/audio?t=TOKEN
 
 The receiver rejects `/audio` WebSocket connections without the matching token.
 This is local LAN protection; anyone who can see the QR URL can use the token.
+
+Use a local UID hash token:
+
+```json
+{
+  "auth": {
+    "enabled": true,
+    "tokenSecret": "local-secret-value",
+    "tokenUserId": "12345",
+    "allowedUserIds": ["12345"]
+  }
+}
+```
+
+When `auth.tokenSecret` and a UID are configured, the launcher uses
+`HMAC-SHA256(uid, tokenSecret)` as the QR/audio token. You can also pass the
+secret with `EVEN_AUDIO_PIPE_TOKEN_SECRET`. The UID is read from
+`EVEN_AUDIO_PIPE_AUTH_UID`, `auth.tokenUserId`, the first `auth.allowedUserIds`
+entry, or `auth.lastUser.uid`. This hash token takes precedence over
+`auth.token`.
 
 Use a stable token:
 
@@ -256,7 +278,7 @@ npm start
 
 Final ASR chunks are queued as raw transcript text before cleanup. Each new
 non-empty ASR result resets `transcriptQueue.idleMs`; when no new words arrive
-for 5 seconds by default, the queued raw text is combined, sent through
+for 7 seconds by default, the queued raw text is combined, sent through
 transcript cleanup once, then forwarded to the workbench.
 
 Transcript cleanup is an optional post-ASR stage. It sends each final ASR

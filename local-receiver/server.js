@@ -36,7 +36,7 @@ const vadSilenceMs = Number(process.env.VAD_SILENCE_MS || 700)
 const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
-const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 5_000)
+const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 7_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
@@ -899,10 +899,39 @@ function getTranscriptQueue(targetSocket) {
       items: [],
       timer: null,
       flushPromise: Promise.resolve(),
+      activeSegments: 0,
+      pendingAsrJobs: 0,
+      lastTranscriptAt: 0,
     }
     transcriptQueues.set(targetSocket, queue)
   }
   return queue
+}
+
+function markAudioSegmentStarted(targetSocket) {
+  const queue = getTranscriptQueue(targetSocket)
+  if (queue) queue.activeSegments += 1
+}
+
+function markAudioSegmentFinished(targetSocket) {
+  const queue = getTranscriptQueue(targetSocket)
+  if (!queue) return
+
+  queue.activeSegments = Math.max(0, queue.activeSegments - 1)
+  scheduleTranscriptQueueFlush(targetSocket)
+}
+
+function markAsrJobQueued(targetSocket) {
+  const queue = getTranscriptQueue(targetSocket)
+  if (queue) queue.pendingAsrJobs += 1
+}
+
+function markAsrJobFinished(targetSocket) {
+  const queue = getTranscriptQueue(targetSocket)
+  if (!queue) return
+
+  queue.pendingAsrJobs = Math.max(0, queue.pendingAsrJobs - 1)
+  scheduleTranscriptQueueFlush(targetSocket)
 }
 
 function enqueueRawTranscript(item) {
@@ -915,14 +944,8 @@ function enqueueRawTranscript(item) {
   }
 
   queue.items.push(item)
-  if (queue.timer) clearTimeout(queue.timer)
-  queue.timer = setTimeout(() => {
-    queue.timer = null
-    queue.flushPromise = queue.flushPromise
-      .catch(() => {})
-      .then(() => flushTranscriptQueue(item.targetSocket))
-  }, transcriptQueueIdleMs)
-  queue.timer.unref?.()
+  queue.lastTranscriptAt = Date.now()
+  scheduleTranscriptQueueFlush(item.targetSocket)
 
   sendSocketJson(item.targetSocket, {
     type: 'asr_status',
@@ -930,16 +953,50 @@ function enqueueRawTranscript(item) {
     jobId: item.jobId,
     queuedSegments: queue.items.length,
     debounceMs: transcriptQueueIdleMs,
+    activeSegments: queue.activeSegments,
+    pendingAsrJobs: queue.pendingAsrJobs,
     file: basename(item.paths.wav),
   })
   console.log(
-    `[transcript-queue] queued job ${item.jobId}; waiting ${(transcriptQueueIdleMs / 1000).toFixed(1)}s for more words`,
+    `[transcript-queue] queued job ${item.jobId}; waiting ${(transcriptQueueIdleMs / 1000).toFixed(1)}s for more words and audio idle`,
   )
+}
+
+function scheduleTranscriptQueueFlush(targetSocket, retryMs = null) {
+  const queue = getTranscriptQueue(targetSocket)
+  if (!queue || !queue.items.length) return
+
+  if (queue.timer) clearTimeout(queue.timer)
+  const elapsedMs = queue.lastTranscriptAt ? Date.now() - queue.lastTranscriptAt : transcriptQueueIdleMs
+  const waitMs = retryMs === null
+    ? Math.max(0, transcriptQueueIdleMs - elapsedMs)
+    : retryMs
+  queue.timer = setTimeout(() => {
+    queue.timer = null
+    queue.flushPromise = queue.flushPromise
+      .catch(() => {})
+      .then(() => flushTranscriptQueue(targetSocket))
+  }, waitMs)
+  queue.timer.unref?.()
 }
 
 async function flushTranscriptQueue(targetSocket) {
   const queue = getTranscriptQueue(targetSocket)
   if (!queue || !queue.items.length) return
+
+  const elapsedMs = Date.now() - queue.lastTranscriptAt
+  if (elapsedMs < transcriptQueueIdleMs) {
+    scheduleTranscriptQueueFlush(targetSocket)
+    return
+  }
+
+  if (queue.activeSegments > 0 || queue.pendingAsrJobs > 0) {
+    console.log(
+      `[transcript-queue] flush delayed; activeSegments=${queue.activeSegments} pendingAsrJobs=${queue.pendingAsrJobs}`,
+    )
+    scheduleTranscriptQueueFlush(targetSocket, Math.min(1_000, transcriptQueueIdleMs))
+    return
+  }
 
   const items = queue.items
   queue.items = []
@@ -1073,6 +1130,7 @@ function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user
 
 function enqueueRecording(paths, bytes, reason, targetSocket, user) {
   const jobId = ++asrJobId
+  markAsrJobQueued(targetSocket)
 
   asrQueue = asrQueue
     .catch(() => {})
@@ -1083,6 +1141,9 @@ function enqueueRecording(paths, bytes, reason, targetSocket, user) {
     })
     .catch(err => {
       console.error(`[asr] job ${jobId} failed: ${err.message}`)
+    })
+    .finally(() => {
+      markAsrJobFinished(targetSocket)
     })
 }
 
@@ -1253,6 +1314,7 @@ wss.on('connection', (socket, req) => {
       durationMs: 0,
       hasSpeech: false,
     }
+    markAudioSegmentStarted(socket)
     console.log(`[audio] writing raw PCM to ${paths.pcm}`)
     return currentSegment
   }
@@ -1324,6 +1386,7 @@ wss.on('connection', (socket, req) => {
         `[audio] segment closed (${reason}): ${segment.chunks} chunks, ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, file=${segment.paths.pcm}`,
       )
       enqueueRecording(segment.paths, segment.bytes, reason, socket, evenUser)
+      markAudioSegmentFinished(socket)
     })
   }
 })

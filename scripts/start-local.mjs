@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHmac, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -84,6 +84,9 @@ console.log('')
 console.log('Even Audio Pipe')
 console.log(`  App URL:        ${appUrl}`)
 console.log(`  QR auth:        ${authConfig.enabled ? 'enabled' : 'disabled'}`)
+if (authConfig.enabled) {
+  console.log(`  QR auth mode:   ${authConfig.source}`)
+}
 console.log(`  Audio WS URL:   ${wsUrl}`)
 console.log(`  Receiver health http://127.0.0.1:${receiverPort}/health`)
 console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
@@ -221,27 +224,63 @@ function resolveAuthConfig(auth = {}) {
     auth.enabled ??
     '1',
   )
-  const token = String(
+  const configuredToken = String(
     process.env.EVEN_AUDIO_PIPE_TOKEN ||
     auth.token ||
     '',
   ).trim()
+  const tokenSecret = String(
+    process.env.EVEN_AUDIO_PIPE_TOKEN_SECRET ||
+    auth.tokenSecret ||
+    auth.secret ||
+    '',
+  ).trim()
+  const tokenUserId = resolveAuthTokenUserId(auth)
+  const derivedToken = tokenSecret && tokenUserId
+    ? createHmac('sha256', tokenSecret).update(tokenUserId).digest('base64url')
+    : ''
+  const randomToken = () => randomBytes(18).toString('base64url')
 
   return {
     enabled,
-    token: enabled ? token || randomBytes(18).toString('base64url') : '',
+    token: enabled ? derivedToken || configuredToken || randomToken() : '',
+    source: authTokenSource({ derivedToken, configuredToken, tokenSecret, tokenUserId }),
+    tokenUserId,
   }
+}
+
+function resolveAuthTokenUserId(auth = {}) {
+  const allowedUserIds = stringArray('', auth.allowedUserIds || auth.userIds || auth.uids)
+  const candidates = [
+    process.env.EVEN_AUDIO_PIPE_AUTH_UID,
+    process.env.EVEN_AUDIO_PIPE_TOKEN_USER_ID,
+    auth.tokenUserId,
+    auth.uid,
+    allowedUserIds[0],
+    auth.lastUser?.uid,
+    auth.lastUser?.userId,
+    auth.lastUser?.id,
+  ]
+
+  return candidates.map(value => String(value || '').trim()).find(Boolean) || ''
+}
+
+function authTokenSource({ derivedToken, configuredToken, tokenSecret, tokenUserId }) {
+  if (derivedToken) return `uid-hmac (${tokenUserId})`
+  if (tokenSecret) return 'uid-hmac unavailable: missing uid'
+  if (configuredToken) return 'configured token'
+  return 'random token'
 }
 
 function resolveTranscriptQueueConfig(queue = {}) {
   const idleMs = Number(
     process.env.TRANSCRIPT_QUEUE_IDLE_MS ??
     queue.idleMs ??
-    5_000,
+    7_000,
   )
 
   return {
-    idleMs: Number.isFinite(idleMs) ? idleMs : 5_000,
+    idleMs: Number.isFinite(idleMs) ? idleMs : 7_000,
   }
 }
 

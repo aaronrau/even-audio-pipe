@@ -2,6 +2,8 @@
   "auth": {
     "enabled": true,
     "token": "",
+    "tokenSecret": "",
+    "tokenUserId": "",
     "allowedUserIds": [],
     "lastUser": null,
     "scannedUsers": []
@@ -27,7 +29,7 @@
     "summaryToken": ""
   },
   "transcriptQueue": {
-    "idleMs": 5000
+    "idleMs": 7000
   },
   "transcriptCleanup": {
     "enabled": false,
