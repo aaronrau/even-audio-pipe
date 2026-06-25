@@ -40,6 +40,7 @@ const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
 const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 5_000)
+const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
@@ -1028,6 +1029,7 @@ function getTranscriptQueue(targetSocket) {
 function markTranscriptQueueActivity(targetSocket) {
   const queue = targetSocket ? transcriptQueues.get(targetSocket) : null
   if (!queue || !queue.items.length) return
+  if (transcriptQueueMaxHoldReached(queue)) return
 
   queue.lastActivityAt = Date.now()
   scheduleTranscriptQueueFlush(targetSocket)
@@ -1111,14 +1113,15 @@ async function flushTranscriptQueue(targetSocket) {
   const queue = getTranscriptQueue(targetSocket)
   if (!queue || !queue.items.length) return
 
+  const maxHoldReached = transcriptQueueMaxHoldReached(queue)
   const lastActivityAt = queue.lastActivityAt || queue.lastTranscriptAt
   const elapsedMs = Date.now() - lastActivityAt
-  if (elapsedMs < transcriptQueueIdleMs) {
+  if (!maxHoldReached && elapsedMs < transcriptQueueIdleMs) {
     scheduleTranscriptQueueFlush(targetSocket)
     return
   }
 
-  if (queue.activeSegments > 0 || queue.pendingAsrJobs > 0) {
+  if ((queue.activeSegments > 0 || queue.pendingAsrJobs > 0) && !maxHoldReached) {
     console.log(
       `[transcript-queue] flush delayed; activeSegments=${queue.activeSegments} pendingAsrJobs=${queue.pendingAsrJobs}`,
     )
@@ -1126,9 +1129,22 @@ async function flushTranscriptQueue(targetSocket) {
     return
   }
 
+  if (maxHoldReached && (queue.activeSegments > 0 || queue.pendingAsrJobs > 0)) {
+    console.log(
+      `[transcript-queue] max hold reached; flushing despite activeSegments=${queue.activeSegments} pendingAsrJobs=${queue.pendingAsrJobs}`,
+    )
+  }
+
   const items = queue.items
   queue.items = []
   await flushRawTranscriptBatch(items)
+}
+
+function transcriptQueueMaxHoldReached(queue) {
+  if (!Number.isFinite(transcriptQueueMaxHoldMs) || transcriptQueueMaxHoldMs <= 0) return false
+  if (!queue?.lastTranscriptAt) return false
+
+  return Date.now() - queue.lastTranscriptAt >= transcriptQueueMaxHoldMs
 }
 
 async function flushRawTranscriptBatch(items) {
@@ -1540,6 +1556,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Chunk mode: ${useVad ? 'vad' : 'fixed'}`)
   console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)
   console.log(`[server] Transcript queue idle: ${(transcriptQueueIdleMs / 1000).toFixed(1)}s`)
+  console.log(`[server] Transcript queue max hold: ${transcriptQueueMaxHoldMs > 0 ? `${(transcriptQueueMaxHoldMs / 1000).toFixed(1)}s` : 'disabled'}`)
   console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)
   console.log(`[server] ASR command fallback: ${asrCommand ? 'configured' : 'not configured'}`)
   console.log(

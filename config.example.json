@@ -32,7 +32,8 @@
     "summaryToken": ""
   },
   "transcriptQueue": {
-    "idleMs": 5000
+    "idleMs": 5000,
+    "maxHoldMs": 10000
   },
   "transcriptCleanup": {
     "enabled": false,

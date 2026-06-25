@@ -40,6 +40,7 @@ G2 mic audio
   -> non-empty STT text is appended to the STT batch queue
   -> 5 seconds with no newer STT text or VAD speech
   -> no active audio segment and no pending ASR job
+  -> or transcriptQueue.maxHoldMs is reached
   -> queued raw text is combined
   -> transcript cleanup runs once for the combined text
   -> transcript files and transcripts.log are written
@@ -52,7 +53,10 @@ activity. VAD silence and background audio below the speech threshold do not
 reset the timer. That wait only makes the queued text eligible to flush. The
 receiver still holds the queue if the same glasses connection has an open audio
 segment or an ASR job waiting/running, so a command is not sent while the user
-is still speaking into a segment that has not produced its transcript yet.
+is still speaking into a segment that has not produced its transcript yet. To
+avoid getting stuck on noisy background audio, `transcriptQueue.maxHoldMs`
+caps how long VAD speech, active audio, or pending ASR can hold already queued
+transcript text.
 
 Workbench routing then behaves like this when `requireAgentPrefix` is enabled:
 
@@ -188,7 +192,8 @@ Default config:
     "summaryToken": ""
   },
   "transcriptQueue": {
-    "idleMs": 5000
+    "idleMs": 5000,
+    "maxHoldMs": 10000
   },
   "transcriptCleanup": {
     "enabled": false,
@@ -356,6 +361,8 @@ non-empty ASR result or later VAD speech activity resets `transcriptQueue.idleMs
 when no new STT transcript text or VAD speech arrives for 5 seconds by default
 and no audio segment or ASR job is still active, the queued raw text is
 combined, sent through transcript cleanup once, then forwarded to the workbench.
+If noisy background keeps VAD active, `transcriptQueue.maxHoldMs` defaults to
+10000 milliseconds and forces the queued text to flush after that cap.
 
 Transcript cleanup is an optional post-ASR stage. It sends each final ASR
 segment to an OpenAI-compatible chat completions endpoint, writes both the raw

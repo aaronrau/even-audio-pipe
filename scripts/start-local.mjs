@@ -96,6 +96,7 @@ console.log(`  Audio dir:      ${displayPath(storageConfig.audioDir)}`)
 console.log(`  Transcript dir: ${displayPath(storageConfig.transcriptDir)}`)
 console.log(`  Transcript log: ${displayPath(storageConfig.transcriptsLog)}`)
 console.log(`  Transcript wait: ${(transcriptQueueConfig.idleMs / 1000).toFixed(1)}s`)
+console.log(`  Transcript max hold: ${transcriptQueueConfig.maxHoldMs > 0 ? `${(transcriptQueueConfig.maxHoldMs / 1000).toFixed(1)}s` : 'disabled'}`)
 console.log(`  Cleanup:        ${transcriptCleanupConfig.enabled ? `${transcriptCleanupConfig.model} at ${transcriptCleanupConfig.url}` : 'disabled'}`)
 console.log(`  Workbench API:  ${workbenchConfig.enabled ? `${workbenchConfig.url}/messages` : 'disabled'}`)
 console.log(`  Workbench agents: ${workbenchConfig.agents.join(', ') || 'none configured'}`)
@@ -120,6 +121,7 @@ spawnManaged('receiver', 'npm', ['start'], {
     TRANSCRIPT_DIR: storageConfig.transcriptDir,
     TRANSCRIPTS_LOG: storageConfig.transcriptsLog,
     TRANSCRIPT_QUEUE_IDLE_MS: String(transcriptQueueConfig.idleMs),
+    TRANSCRIPT_QUEUE_MAX_HOLD_MS: String(transcriptQueueConfig.maxHoldMs),
     TRANSCRIPT_CLEANUP_ENABLED: transcriptCleanupConfig.enabled ? '1' : '0',
     TRANSCRIPT_CLEANUP_URL: transcriptCleanupConfig.url,
     TRANSCRIPT_CLEANUP_MODEL: transcriptCleanupConfig.model,
@@ -285,9 +287,15 @@ function resolveTranscriptQueueConfig(queue = {}) {
     queue.idleMs ??
     5_000,
   )
+  const maxHoldMs = Number(
+    process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS ??
+    queue.maxHoldMs ??
+    10_000,
+  )
 
   return {
     idleMs: Number.isFinite(idleMs) ? idleMs : 5_000,
+    maxHoldMs: Number.isFinite(maxHoldMs) ? Math.max(0, maxHoldMs) : 10_000,
   }
 }
 
@@ -1001,6 +1009,7 @@ function spawnManaged(label, command, args, options) {
   const child = spawn(command, args, {
     ...options,
     stdio: 'inherit',
+    detached: process.platform !== 'win32',
     shell: process.platform === 'win32',
   })
   children.add(child)
@@ -1077,15 +1086,43 @@ function shutdown(code = 0) {
   shuttingDown = true
 
   for (const child of children) {
-    child.kill('SIGINT')
+    signalChildTree(child, 'SIGINT')
   }
 
   setTimeout(() => {
     for (const child of children) {
-      if (!child.killed) child.kill('SIGTERM')
+      signalChildTree(child, 'SIGTERM')
+    }
+  }, 1_500).unref()
+
+  setTimeout(() => {
+    for (const child of children) {
+      signalChildTree(child, 'SIGKILL')
     }
     process.exit(code)
-  }, 800).unref()
+  }, 3_000).unref()
+}
+
+function signalChildTree(child, signal) {
+  if (!child?.pid) return
+
+  try {
+    if (process.platform !== 'win32') {
+      process.kill(-child.pid, signal)
+    } else {
+      child.kill(signal)
+    }
+  } catch (err) {
+    if (err?.code === 'ESRCH') return
+
+    try {
+      child.kill(signal)
+    } catch (fallbackErr) {
+      if (fallbackErr?.code !== 'ESRCH') {
+        console.warn(`Failed to send ${signal} to child ${child.pid}: ${fallbackErr.message}`)
+      }
+    }
+  }
 }
 
 process.on('SIGINT', () => shutdown(130))
