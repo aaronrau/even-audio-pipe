@@ -28,6 +28,7 @@ type GlassesMode = 'live' | 'history'
 type HistoryEntry = {
   label: string
   text: string
+  detail?: string
   receivedAt: number
 }
 
@@ -57,8 +58,8 @@ const TRANSCRIPT_CLEAR_MS = 5_000
 const SPINNER_FRAMES = ['.', '..', '...', '..']
 const SPINNER_INTERVAL_MS = 650
 const HISTORY_LIMIT = 24
-const HISTORY_ENTRY_TEXT_LIMIT = 420
-const HISTORY_TEXT_LIMIT = 980
+const HISTORY_ENTRY_TEXT_LIMIT = 930
+const HISTORY_TEXT_LIMIT = 1000
 const HISTORY_TOGGLE_DEBOUNCE_MS = 700
 // Some host builds normalize ring clicks into source-less text events.
 const ALLOW_UNSOURCED_HISTORY_TOGGLE = true
@@ -149,15 +150,18 @@ function sanitizeHistoryEntry(value: unknown): HistoryEntry | null {
   if (!value || typeof value !== 'object') return null
 
   const record = value as Record<string, unknown>
-  const text = stringValue(record.text).replace(/\s+/g, ' ').trim()
+  const detail = stringValue(record.detail).replace(/\s+/g, ' ').trim()
+  const text = stringValue(record.text || record.summary || detail).replace(/\s+/g, ' ').trim()
   const receivedAt = Number(record.receivedAt)
   if (!text || !Number.isFinite(receivedAt)) return null
 
-  return {
+  const entry: HistoryEntry = {
     label: stringValue(record.label) || 'Message',
     text: trimWithEllipsis(text, HISTORY_ENTRY_TEXT_LIMIT),
     receivedAt,
   }
+  if (detail) entry.detail = trimWithEllipsis(detail, HISTORY_ENTRY_TEXT_LIMIT)
+  return entry
 }
 
 function replaceHistory(entries: HistoryEntry[]) {
@@ -168,15 +172,21 @@ function replaceHistory(entries: HistoryEntry[]) {
   )
 }
 
-function pushHistory(label: string, text: string) {
+function pushHistory(label: string, text: string, detail = '') {
   const normalized = text.replace(/\s+/g, ' ').trim()
   if (!normalized) return
 
-  messageHistory.push({
+  const entry: HistoryEntry = {
     label,
     text: trimWithEllipsis(normalized, HISTORY_ENTRY_TEXT_LIMIT),
     receivedAt: Date.now(),
-  })
+  }
+  const normalizedDetail = detail.replace(/\s+/g, ' ').trim()
+  if (normalizedDetail) {
+    entry.detail = trimWithEllipsis(normalizedDetail, HISTORY_ENTRY_TEXT_LIMIT)
+  }
+
+  messageHistory.push(entry)
 
   if (messageHistory.length > HISTORY_LIMIT) {
     messageHistory.splice(0, messageHistory.length - HISTORY_LIMIT)
@@ -199,7 +209,7 @@ function formatHistoryContent() {
   rows.push(...messageHistory
     .slice()
     .reverse()
-    .map(entry => `${formatHistoryTime(entry.receivedAt)} ${entry.text}`)
+    .map(entry => `${formatHistoryTime(entry.receivedAt)} ${entry.detail || entry.text}`)
   )
 
   return trimWithEllipsis(rows.join('\n'), HISTORY_TEXT_LIMIT)
@@ -219,8 +229,8 @@ function makeStatusContainer(content: string, isHistory: boolean) {
     height: 288,
     borderWidth: isHistory ? 1 : 0,
     borderColor: 15,
-    borderRadius: isHistory ? 6 : 0,
-    paddingLength: isHistory ? 6 : 0,
+    borderRadius: 0,
+    paddingLength: 0,
     containerID: 1,
     containerName: 'audio_status',
     content,
@@ -326,12 +336,12 @@ async function toggleHistoryWindow() {
   }
 }
 
-function appendTranscript(text: string, label = 'Message') {
+function appendTranscript(text: string, label = 'Message', detail = '') {
   const normalized = text.replace(/\s+/g, ' ').trim()
   if (!normalized) return
 
   queuedTranscriptText = ''
-  pushHistory(label, normalized)
+  pushHistory(label, normalized, detail)
   transcriptText = takeTail(normalized, GLASSES_TEXT_LIMIT)
   transcriptEl.textContent = transcriptText
   scheduleTranscriptClear()
@@ -418,7 +428,8 @@ function handleReceiverMessage(raw: string) {
     const agent = typeof payload.agent === 'string' && payload.agent
       ? payload.agent
       : 'Agent'
-    appendTranscript(payload.text, agent)
+    const detail = typeof payload.detail === 'string' ? payload.detail : ''
+    appendTranscript(payload.text, agent, detail)
     setUiStatus('Agent summary received')
     return
   }

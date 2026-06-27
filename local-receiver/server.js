@@ -223,7 +223,8 @@ function broadcastSocketJson(payload) {
 function sanitizeMessageHistoryEntry(value) {
   if (!value || typeof value !== 'object') return null
 
-  const text = normalizeTranscript(value.text || value.message || '')
+  const detail = normalizeTranscript(value.detail || value.details || '')
+  const text = normalizeTranscript(value.text || value.summary || value.message || detail)
   if (!text) return null
 
   const receivedAt = Number(value.receivedAt)
@@ -234,12 +235,14 @@ function sanitizeMessageHistoryEntry(value) {
       ? Date.parse(createdAt)
       : Date.now()
 
-  return {
+  const entry = {
     label: stringValue(value.label || value.agent || value.source || 'Message') || 'Message',
     text,
     receivedAt: Number.isFinite(timestamp) ? timestamp : Date.now(),
     createdAt: new Date(Number.isFinite(timestamp) ? timestamp : Date.now()).toISOString(),
   }
+  if (detail) entry.detail = detail
+  return entry
 }
 
 function historyDateStamp(value = Date.now()) {
@@ -441,7 +444,8 @@ async function handleWorkbenchSummary(req, res) {
   }
 
   const payload = await readJsonRequest(req)
-  const summary = normalizeTranscript(payload.summary || payload.text || payload.message || '')
+  const detail = normalizeTranscript(payload.detail || payload.details || '')
+  const summary = normalizeTranscript(payload.summary || payload.text || payload.message || detail)
   if (!summary) {
     sendHttpJson(res, 400, { ok: false, error: 'missing_summary' })
     return
@@ -454,12 +458,14 @@ async function handleWorkbenchSummary(req, res) {
   appendMessageHistory({
     label: agent || 'Agent',
     text: summary,
+    detail,
     createdAt,
   })
   const delivered = broadcastSocketJson({
     type: 'agent_summary',
     text: summary,
     summary,
+    detail,
     agent,
     command,
     timestamp,
