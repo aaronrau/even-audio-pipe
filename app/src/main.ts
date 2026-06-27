@@ -4,6 +4,9 @@ import {
   CreateStartUpPageContainer,
   TextContainerUpgrade,
   OsEventTypeList,
+  RebuildPageContainer,
+  EventSourceType,
+  type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk'
 
 const BASE_AUDIO_WS_URL = import.meta.env.VITE_AUDIO_WS_URL as string | undefined
@@ -20,10 +23,23 @@ type UserPayload = {
   country?: string
 }
 
+type GlassesMode = 'live' | 'history'
+
+type HistoryEntry = {
+  label: string
+  text: string
+  receivedAt: number
+}
+
 let sentChunks = 0
 let sentBytes = 0
 let droppedChunks = 0
 let transcriptText = ''
+let queuedTranscriptText = ''
+let glassesMode: GlassesMode = 'live'
+let historyTransitioning = false
+let historyUpdateInFlight = false
+let historyUpdatePending = false
 let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
@@ -40,6 +56,14 @@ const GLASSES_TEXT_LIMIT = GLASSES_LINE_WIDTH * GLASSES_MAX_LINES
 const TRANSCRIPT_CLEAR_MS = 5_000
 const SPINNER_FRAMES = ['.', '..', '...', '..']
 const SPINNER_INTERVAL_MS = 650
+const HISTORY_LIMIT = 24
+const HISTORY_ENTRY_TEXT_LIMIT = 420
+const HISTORY_TEXT_LIMIT = 980
+const HISTORY_TOGGLE_DEBOUNCE_MS = 700
+// Some host builds normalize ring clicks into source-less text events.
+const ALLOW_UNSOURCED_HISTORY_TOGGLE = true
+const messageHistory: HistoryEntry[] = []
+let lastHistoryToggleInputAt = 0
 
 function setUiStatus(text: string) {
   statusEl.textContent = text
@@ -116,14 +140,206 @@ function takeTail(text: string, limit: number) {
   return text.slice(-limit).replace(/^\S*\s?/, '').trimStart()
 }
 
-function appendTranscript(text: string) {
+function trimWithEllipsis(text: string, limit: number) {
+  if (text.length <= limit) return text
+  return `${text.slice(0, Math.max(0, limit - 3)).trimEnd()}...`
+}
+
+function sanitizeHistoryEntry(value: unknown): HistoryEntry | null {
+  if (!value || typeof value !== 'object') return null
+
+  const record = value as Record<string, unknown>
+  const text = stringValue(record.text).replace(/\s+/g, ' ').trim()
+  const receivedAt = Number(record.receivedAt)
+  if (!text || !Number.isFinite(receivedAt)) return null
+
+  return {
+    label: stringValue(record.label) || 'Message',
+    text: trimWithEllipsis(text, HISTORY_ENTRY_TEXT_LIMIT),
+    receivedAt,
+  }
+}
+
+function replaceHistory(entries: HistoryEntry[]) {
+  messageHistory.splice(
+    0,
+    messageHistory.length,
+    ...entries.slice(-HISTORY_LIMIT),
+  )
+}
+
+function pushHistory(label: string, text: string) {
   const normalized = text.replace(/\s+/g, ' ').trim()
   if (!normalized) return
 
+  messageHistory.push({
+    label,
+    text: trimWithEllipsis(normalized, HISTORY_ENTRY_TEXT_LIMIT),
+    receivedAt: Date.now(),
+  })
+
+  if (messageHistory.length > HISTORY_LIMIT) {
+    messageHistory.splice(0, messageHistory.length - HISTORY_LIMIT)
+  }
+}
+
+function formatHistoryTime(receivedAt: number) {
+  const date = new Date(receivedAt)
+  const hours = String(date.getHours()).padStart(2, '0')
+  const minutes = String(date.getMinutes()).padStart(2, '0')
+  return `${hours}:${minutes}`
+}
+
+function formatHistoryContent() {
+  const rows: string[] = []
+  if (queuedTranscriptText) {
+    rows.push(`Queued: ${trimWithEllipsis(queuedTranscriptText, HISTORY_ENTRY_TEXT_LIMIT)}`)
+  }
+
+  rows.push(...messageHistory
+    .slice()
+    .reverse()
+    .map(entry => `${formatHistoryTime(entry.receivedAt)} ${entry.text}`)
+  )
+
+  return trimWithEllipsis(rows.join('\n'), HISTORY_TEXT_LIMIT)
+}
+
+function currentLiveGlassesContent() {
+  return transcriptText
+    ? formatGlassesTranscript(transcriptText)
+    : SPINNER_FRAMES[spinnerIndex]
+}
+
+function makeStatusContainer(content: string, isHistory: boolean) {
+  return new TextContainerProperty({
+    xPosition: 0,
+    yPosition: 0,
+    width: 576,
+    height: 288,
+    borderWidth: isHistory ? 1 : 0,
+    borderColor: 15,
+    borderRadius: isHistory ? 6 : 0,
+    paddingLength: isHistory ? 6 : 0,
+    containerID: 1,
+    containerName: 'audio_status',
+    content,
+    isEventCapture: 1,
+  })
+}
+
+function requestHistoryWindowUpdate() {
+  if (glassesMode !== 'history') return
+  historyUpdatePending = true
+  void flushHistoryWindowUpdate()
+}
+
+async function flushHistoryWindowUpdate() {
+  if (
+    historyUpdateInFlight ||
+    historyTransitioning ||
+    !historyUpdatePending ||
+    glassesMode !== 'history'
+  ) {
+    return
+  }
+
+  historyUpdateInFlight = true
+
+  try {
+    while (historyUpdatePending && glassesMode === 'history' && !historyTransitioning) {
+      historyUpdatePending = false
+      await bridge.textContainerUpgrade(
+        new TextContainerUpgrade({
+          containerID: 1,
+          containerName: 'audio_status',
+          content: formatHistoryContent(),
+        }),
+      )
+    }
+  } finally {
+    historyUpdateInFlight = false
+    if (historyUpdatePending && glassesMode === 'history' && !historyTransitioning) {
+      void flushHistoryWindowUpdate()
+    }
+  }
+}
+
+async function showHistoryWindow() {
+  const previousMode = glassesMode
+  glassesMode = 'history'
+
+  const rebuilt = await bridge.rebuildPageContainer(
+    new RebuildPageContainer({
+      containerTotalNum: 1,
+      textObject: [makeStatusContainer(formatHistoryContent(), true)],
+    }),
+  )
+
+  if (rebuilt) {
+    requestHistoryWindowUpdate()
+    return
+  }
+
+  glassesMode = previousMode
+  setUiStatus('History view failed')
+}
+
+async function closeHistoryWindow() {
+  const previousMode = glassesMode
+  glassesMode = 'live'
+
+  const rebuilt = await bridge.rebuildPageContainer(
+    new RebuildPageContainer({
+      containerTotalNum: 1,
+      textObject: [makeStatusContainer(currentLiveGlassesContent(), false)],
+    }),
+  )
+
+  if (rebuilt) {
+    return
+  }
+
+  glassesMode = previousMode
+  requestHistoryWindowUpdate()
+  console.warn('Failed to close history view')
+}
+
+async function toggleHistoryWindow() {
+  if (historyTransitioning) return
+  historyTransitioning = true
+
+  try {
+    if (glassesMode === 'history') {
+      await closeHistoryWindow()
+    } else {
+      await showHistoryWindow()
+    }
+  } catch (err) {
+    console.error('History view toggle failed', err)
+    setUiStatus('History view failed')
+  } finally {
+    historyTransitioning = false
+    if (glassesMode === 'history') {
+      void flushHistoryWindowUpdate()
+    }
+  }
+}
+
+function appendTranscript(text: string, label = 'Message') {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  if (!normalized) return
+
+  queuedTranscriptText = ''
+  pushHistory(label, normalized)
   transcriptText = takeTail(normalized, GLASSES_TEXT_LIMIT)
   transcriptEl.textContent = transcriptText
   scheduleTranscriptClear()
-  void renderGlassesStatus()
+  if (glassesMode === 'history') {
+    requestHistoryWindowUpdate()
+  } else {
+    void renderGlassesStatus()
+  }
 }
 
 function formatGlassesTranscript(text: string) {
@@ -183,17 +399,26 @@ function handleReceiverMessage(raw: string) {
   if (!message || typeof message !== 'object') return
   const payload = message as Record<string, unknown>
 
+  if (payload.type === 'message_history' && Array.isArray(payload.entries)) {
+    const entries = payload.entries
+      .map(sanitizeHistoryEntry)
+      .filter((entry): entry is HistoryEntry => entry !== null)
+    replaceHistory(entries)
+    requestHistoryWindowUpdate()
+    return
+  }
+
   if (payload.type === 'transcript' && typeof payload.text === 'string') {
-    appendTranscript(payload.text)
+    appendTranscript(payload.text, 'You')
     setUiStatus('Streaming G2 mic audio')
     return
   }
 
   if (payload.type === 'agent_summary' && typeof payload.text === 'string') {
     const agent = typeof payload.agent === 'string' && payload.agent
-      ? `${payload.agent}: `
-      : ''
-    appendTranscript(`${agent}${payload.text}`)
+      ? payload.agent
+      : 'Agent'
+    appendTranscript(payload.text, agent)
     setUiStatus('Agent summary received')
     return
   }
@@ -218,7 +443,7 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'agent_error') {
     const error = typeof payload.error === 'string' ? payload.error : 'Workbench error'
-    appendTranscript(error)
+    appendTranscript(error, 'Error')
     setUiStatus('Workbench error')
     return
   }
@@ -229,11 +454,32 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'asr_status' && payload.status === 'queued') {
+    const queuedText = typeof payload.queuedText === 'string'
+      ? payload.queuedText
+      : typeof payload.text === 'string'
+        ? payload.text
+        : ''
+    queuedTranscriptText = queuedText.replace(/\s+/g, ' ').trim()
+    requestHistoryWindowUpdate()
     setUiStatus('Waiting for more speech...')
     return
   }
 
+  if (payload.type === 'asr_status' && payload.status === 'cleaning') {
+    const queuedText = typeof payload.queuedText === 'string'
+      ? payload.queuedText
+      : typeof payload.text === 'string'
+        ? payload.text
+        : queuedTranscriptText
+    queuedTranscriptText = queuedText.replace(/\s+/g, ' ').trim()
+    requestHistoryWindowUpdate()
+    setUiStatus('Cleaning transcript...')
+    return
+  }
+
   if (payload.type === 'asr_status' && payload.status === 'no_transcript') {
+    queuedTranscriptText = ''
+    requestHistoryWindowUpdate()
     setUiStatus('Listening for speech...')
     return
   }
@@ -250,22 +496,153 @@ function normalizePcm(value: unknown): Uint8Array | null {
   return null
 }
 
+function getEventType(event: EvenHubEvent) {
+  return event.sysEvent?.eventType
+    ?? event.textEvent?.eventType
+    ?? event.listEvent?.eventType
+}
+
+function eventSourceFromValue(value: unknown): EventSourceType | null {
+  if (value === null || value === undefined) return null
+
+  const parsed = EventSourceType.fromJson(value)
+  if (parsed !== undefined) return parsed
+
+  if (typeof value !== 'string') return null
+
+  const normalized = value.trim().toLowerCase()
+  if (!normalized) return null
+  if (normalized === '2' || normalized.includes('ring')) {
+    return EventSourceType.TOUCH_EVENT_FROM_RING
+  }
+
+  return null
+}
+
+function rawEventSource(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return undefined
+
+  const record = value as Record<string, unknown>
+  return record.eventSource
+    ?? record.EventSource
+    ?? record.Event_Source
+    ?? record.source
+    ?? record.Source
+}
+
+function getEventSource(event: EvenHubEvent): EventSourceType | null {
+  const jsonData = event.jsonData as Record<string, unknown> | undefined
+  const nestedData = jsonData?.data ?? jsonData?.jsonData
+  const candidates = [
+    event.sysEvent?.eventSource,
+    rawEventSource(jsonData),
+    rawEventSource(nestedData),
+  ]
+
+  for (const candidate of candidates) {
+    const source = eventSourceFromValue(candidate)
+    if (source !== null) return source
+  }
+
+  return null
+}
+
+function isSinglePress(event: EvenHubEvent) {
+  const type = getEventType(event)
+  if (type === OsEventTypeList.CLICK_EVENT) return true
+
+  if (type !== undefined) return false
+
+  const source = getEventSource(event)
+  if (source === EventSourceType.TOUCH_EVENT_FROM_RING) return true
+
+  return !!event.textEvent
+}
+
+function isHistoryToggleInput(event: EvenHubEvent) {
+  if (!isSinglePress(event)) return false
+
+  const source = getEventSource(event)
+  if (source === EventSourceType.TOUCH_EVENT_FROM_RING) return true
+
+  return source === null && ALLOW_UNSOURCED_HISTORY_TOGGLE
+}
+
+function shouldHandleHistoryToggle(event: EvenHubEvent) {
+  if (!isHistoryToggleInput(event)) return false
+
+  const now = Date.now()
+  if (now - lastHistoryToggleInputAt < HISTORY_TOGGLE_DEBOUNCE_MS) return false
+
+  lastHistoryToggleInputAt = now
+  return true
+}
+
+function osEventTypeName(type: OsEventTypeList | undefined) {
+  if (type === undefined) return 'undefined'
+  return OsEventTypeList[type] ?? String(type)
+}
+
+function eventSourceName(source: EventSourceType | null) {
+  if (source === null) return 'unknown'
+  return EventSourceType[source] ?? String(source)
+}
+
+function logInputEvent(event: EvenHubEvent) {
+  if (!event.textEvent && !event.listEvent && !event.sysEvent) return
+
+  const inputType = getEventType(event)
+  const source = getEventSource(event)
+  const summary = {
+    type: 'input_debug',
+    eventType: inputType ?? 'undefined',
+    eventTypeName: osEventTypeName(inputType),
+    eventSource: source ?? 'unknown',
+    eventSourceName: eventSourceName(source),
+    isSinglePress: isSinglePress(event),
+    isHistoryToggle: isHistoryToggleInput(event),
+    mode: glassesMode,
+    textEvent: event.textEvent
+      ? {
+          containerID: event.textEvent.containerID,
+          containerName: event.textEvent.containerName,
+          eventType: event.textEvent.eventType ?? 'undefined',
+          eventTypeName: osEventTypeName(event.textEvent.eventType),
+        }
+      : null,
+    listEvent: event.listEvent
+      ? {
+          containerID: event.listEvent.containerID,
+          containerName: event.listEvent.containerName,
+          currentSelectItemIndex: event.listEvent.currentSelectItemIndex,
+          currentSelectItemName: event.listEvent.currentSelectItemName,
+          eventType: event.listEvent.eventType ?? 'undefined',
+          eventTypeName: osEventTypeName(event.listEvent.eventType),
+        }
+      : null,
+    sysEvent: event.sysEvent
+      ? {
+          eventType: event.sysEvent.eventType ?? 'undefined',
+          eventTypeName: osEventTypeName(event.sysEvent.eventType),
+          eventSource: event.sysEvent.eventSource ?? 'unknown',
+          eventSourceName: eventSourceName(event.sysEvent.eventSource ?? null),
+          systemExitReasonCode: event.sysEvent.systemExitReasonCode,
+        }
+      : null,
+    jsonData: event.jsonData ?? null,
+  }
+
+  console.log('[even-input]', summary)
+
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(summary))
+  }
+}
+
 const bridge = await waitForEvenAppBridge()
 evenUserInfo = await loadUserInfo()
 
-const statusContainer = new TextContainerProperty({
-  xPosition: 0,
-  yPosition: 0,
-  width: 576,
-  height: 288,
-  borderWidth: 0,
-  borderColor: 15,
-  paddingLength: 0,
-  containerID: 1,
-  containerName: 'audio_status',
-  content: 'Starting audio pipe...',
-  isEventCapture: 1,
-})
+const statusContainer = makeStatusContainer('Starting audio pipe...', false)
 
 const created = await bridge.createStartUpPageContainer(
   new CreateStartUpPageContainer({
@@ -280,15 +657,13 @@ if (created !== 0) {
 }
 
 async function renderGlassesStatus() {
-  const content = transcriptText
-    ? formatGlassesTranscript(transcriptText)
-    : SPINNER_FRAMES[spinnerIndex]
+  if (glassesMode !== 'live') return
 
   await bridge.textContainerUpgrade(
     new TextContainerUpgrade({
       containerID: 1,
       containerName: 'audio_status',
-      content,
+      content: currentLiveGlassesContent(),
     }),
   )
 }
@@ -396,21 +771,24 @@ unsubscribe = bridge.onEvenHubEvent(event => {
     }
   }
 
-  const sysType = event.sysEvent?.eventType ?? null
-  const textType = event.textEvent?.eventType ?? null
+  const inputType = getEventType(event)
+  logInputEvent(event)
 
-  if (
-    sysType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
-    textType === OsEventTypeList.DOUBLE_CLICK_EVENT
-  ) {
+  if (inputType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
     void bridge.shutDownPageContainer(1)
     return
   }
 
-  if (
-    sysType === OsEventTypeList.SYSTEM_EXIT_EVENT ||
-    sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT
-  ) {
+  if (shouldHandleHistoryToggle(event)) {
+    void toggleHistoryWindow()
+    return
+  }
+
+  if (inputType === OsEventTypeList.SYSTEM_EXIT_EVENT) {
+    return
+  }
+
+  if (inputType === OsEventTypeList.ABNORMAL_EXIT_EVENT) {
     cleanup()
   }
 })

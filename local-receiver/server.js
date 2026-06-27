@@ -1,6 +1,6 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { appendFileSync, createWriteStream, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, createWriteStream, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 
@@ -42,6 +42,8 @@ const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
 const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 5_000)
 const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
+const messageHistoryDirPath = resolve(process.env.MESSAGE_HISTORY_DIR || join(transcriptDirPath, 'message-history'))
+const messageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || 50)
 const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
 const transcriptCleanupEnv = {
@@ -56,6 +58,7 @@ const transcriptCleanupEnv = {
 
 mkdirSync(audioDirPath, { recursive: true })
 mkdirSync(transcriptDirPath, { recursive: true })
+mkdirSync(messageHistoryDirPath, { recursive: true })
 
 let asrQueue = Promise.resolve()
 let asrJobId = 0
@@ -217,6 +220,107 @@ function broadcastSocketJson(payload) {
   return sent
 }
 
+function sanitizeMessageHistoryEntry(value) {
+  if (!value || typeof value !== 'object') return null
+
+  const text = normalizeTranscript(value.text || value.message || '')
+  if (!text) return null
+
+  const receivedAt = Number(value.receivedAt)
+  const createdAt = stringValue(value.createdAt)
+  const timestamp = Number.isFinite(receivedAt)
+    ? receivedAt
+    : createdAt
+      ? Date.parse(createdAt)
+      : Date.now()
+
+  return {
+    label: stringValue(value.label || value.agent || value.source || 'Message') || 'Message',
+    text,
+    receivedAt: Number.isFinite(timestamp) ? timestamp : Date.now(),
+    createdAt: new Date(Number.isFinite(timestamp) ? timestamp : Date.now()).toISOString(),
+  }
+}
+
+function historyDateStamp(value = Date.now()) {
+  const date = new Date(value)
+  const pad = number => String(number).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+function messageHistoryPathForTimestamp(timestamp) {
+  return join(messageHistoryDirPath, `${historyDateStamp(timestamp)}.jsonl`)
+}
+
+function messageHistoryFiles() {
+  try {
+    return readdirSync(messageHistoryDirPath)
+      .filter(name => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
+      .sort()
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.warn(`[history] failed to list ${messageHistoryDirPath}: ${err.message}`)
+    }
+    return []
+  }
+}
+
+function readMessageHistoryFile(fileName) {
+  const path = join(messageHistoryDirPath, fileName)
+
+  try {
+    return readFileSync(path, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => {
+        try {
+          return sanitizeMessageHistoryEntry(JSON.parse(line))
+        } catch (err) {
+          console.warn(`[history] failed to parse ${fileName}: ${err.message}`)
+          return null
+        }
+      })
+      .filter(Boolean)
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.warn(`[history] failed to read ${path}: ${err.message}`)
+    }
+    return []
+  }
+}
+
+function readMessageHistory(limit = messageHistoryLimit) {
+  const entries = []
+  const files = messageHistoryFiles()
+
+  for (let index = files.length - 1; index >= 0 && entries.length < limit; index -= 1) {
+    entries.push(...readMessageHistoryFile(files[index]))
+  }
+
+  return entries
+    .sort((a, b) => a.receivedAt - b.receivedAt)
+    .slice(-limit)
+}
+
+function appendMessageHistory(entry) {
+  const normalized = sanitizeMessageHistoryEntry(entry)
+  if (!normalized) return
+
+  const path = messageHistoryPathForTimestamp(normalized.receivedAt)
+  try {
+    appendFileSync(path, `${JSON.stringify(normalized)}\n`)
+  } catch (err) {
+    console.warn(`[history] failed to append ${path}: ${err.message}`)
+  }
+}
+
+function sendMessageHistory(socket) {
+  sendSocketJson(socket, {
+    type: 'message_history',
+    entries: readMessageHistory(),
+  })
+}
+
 function sendHttpJson(res, statusCode, payload) {
   const body = JSON.stringify(payload)
   res.writeHead(statusCode, {
@@ -346,6 +450,12 @@ async function handleWorkbenchSummary(req, res) {
   const agent = stringValue(payload.agent)
   const command = stringValue(payload.command)
   const timestamp = payload.timestamp ?? Date.now() / 1000
+  const createdAt = new Date().toISOString()
+  appendMessageHistory({
+    label: agent || 'Agent',
+    text: summary,
+    createdAt,
+  })
   const delivered = broadcastSocketJson({
     type: 'agent_summary',
     text: summary,
@@ -353,7 +463,7 @@ async function handleWorkbenchSummary(req, res) {
     agent,
     command,
     timestamp,
-    createdAt: new Date().toISOString(),
+    createdAt,
   })
 
   console.log(`[workbench] summary received${agent ? ` from ${agent}` : ''}: ${summary}`)
@@ -462,6 +572,11 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
       ? `workbench POST timed out after ${timeoutMs}ms`
       : err?.message || String(err)
     console.error(`[workbench] ${error}`)
+    appendMessageHistory({
+      label: 'Error',
+      text: error,
+      createdAt: new Date().toISOString(),
+    })
     sendSocketJson(targetSocket, {
       type: 'agent_error',
       error,
@@ -1074,12 +1189,15 @@ function enqueueRawTranscript(item) {
   queue.lastTranscriptAt = Date.now()
   queue.lastActivityAt = queue.lastTranscriptAt
   scheduleTranscriptQueueFlush(item.targetSocket)
+  const queuedText = combineQueuedTranscripts(queue.items.map(queueItem => queueItem.rawTranscript))
 
   sendSocketJson(item.targetSocket, {
     type: 'asr_status',
     status: 'queued',
     jobId: item.jobId,
     queuedSegments: queue.items.length,
+    queuedText,
+    text: queuedText,
     debounceMs: transcriptQueueIdleMs,
     activeSegments: queue.activeSegments,
     pendingAsrJobs: queue.pendingAsrJobs,
@@ -1167,6 +1285,8 @@ async function flushRawTranscriptBatch(items) {
       jobId: lastItem.jobId,
       jobIds,
       queuedSegments: batch.length,
+      queuedText: rawTranscript,
+      text: rawTranscript,
       file: basename(paths.wav),
     })
   }
@@ -1179,6 +1299,12 @@ async function flushRawTranscriptBatch(items) {
   })
   appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user, {
     queuedSegments: batch.map(batchItem => queuedSegmentMetadata(batchItem)),
+  })
+  const createdAt = new Date().toISOString()
+  appendMessageHistory({
+    label: 'You',
+    text: cleanedTranscript,
+    createdAt,
   })
   console.log(`[transcript:clean] ${cleanedTranscript}`)
   console.log(`[asr] queued transcript saved: ${paths.txt}`)
@@ -1200,7 +1326,7 @@ async function flushRawTranscriptBatch(items) {
     file: basename(paths.txt),
     rawFile: basename(paths.rawTxt),
     cleanFile: basename(paths.cleanTxt),
-    createdAt: new Date().toISOString(),
+    createdAt,
   })
   await maybePostToWorkbench(cleanedTranscript, targetSocket, { jobId: lastItem.jobId, user })
   await maybePostToTerminal(cleanedTranscript)
@@ -1402,6 +1528,7 @@ wss.on('connection', (socket, req) => {
           user: evenUser,
           restricted: auth.required,
         })
+        sendMessageHistory(socket)
       }
       return
     }
@@ -1545,6 +1672,7 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Audio directory: ${audioDirPath}`)
   console.log(`[server] Transcript directory: ${transcriptDirPath}`)
   console.log(`[server] Transcript log: ${transcriptsLog}`)
+  console.log(`[server] Message history directory: ${messageHistoryDirPath}`)
   console.log(`[server] Audio auth: ${accessToken ? 'enabled' : 'disabled'}`)
   console.log(
     `[server] Workbench forwarding: ${workbenchConfig.enabled ? `${workbenchConfig.url.replace(/\/$/, '')}/messages` : 'disabled'}`,
