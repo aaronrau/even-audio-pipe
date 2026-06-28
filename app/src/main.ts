@@ -71,7 +71,7 @@ const CANVAS_HEIGHT = 288
 const CANVAS_PADDING = 0
 const CANVAS_BORDER_WIDTH = 0
 const HISTORY_VISIBLE_LINES = positiveNumber(import.meta.env.VITE_HISTORY_VISIBLE_LINES, 9)
-const HISTORY_WRAP_WIDTH = positiveNumber(import.meta.env.VITE_HISTORY_WRAP_WIDTH, CANVAS_WIDTH + 80)
+const HISTORY_WRAP_WIDTH = positiveNumber(import.meta.env.VITE_HISTORY_WRAP_WIDTH, CANVAS_WIDTH)
 const TEXT_UPGRADE_LIMIT = 2000
 // Some host builds normalize ring clicks into source-less text events.
 const ALLOW_UNSOURCED_HISTORY_TOGGLE = true

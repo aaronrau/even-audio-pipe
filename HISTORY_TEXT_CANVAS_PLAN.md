@@ -155,13 +155,13 @@ const LINE_HEIGHT = 27
 const visibleLineCount = Number(import.meta.env.VITE_HISTORY_VISIBLE_LINES || 9)
 ```
 
-The wrapping width is also configurable because the observed hardware appears slightly wider than the conservative SDK canvas width. The app keeps the SDK container at `576 x 288`, but measures history lines with:
+The wrapping width is configurable, but the default should match the SDK container width so the firmware does not add its own unexpected wraps. The app keeps the SDK container at `576 x 288` and measures history lines with:
 
 ```ts
-const wrapWidth = Number(import.meta.env.VITE_HISTORY_WRAP_WIDTH || 656)
+const wrapWidth = Number(import.meta.env.VITE_HISTORY_WRAP_WIDTH || 576)
 ```
 
-If the device shows native wrapping or clipping, lower `VITE_HISTORY_WRAP_WIDTH` first, then lower `VITE_HISTORY_VISIBLE_LINES`.
+If the device still shows native wrapping or clipping, lower `VITE_HISTORY_WRAP_WIDTH` first, then lower `VITE_HISTORY_VISIBLE_LINES`.
 
 Build `visualLines` by wrapping each logical line using firmware-compatible width measurements:
 

@@ -29,6 +29,16 @@ type HistoryCanvasOptions = {
   maxContentLength?: number
 }
 
+type HistoryLogicalLine = {
+  content: string
+  contextPrefix: string
+}
+
+type HistoryVisualLine = {
+  content: string
+  contextPrefix: string
+}
+
 const DEFAULT_LINE_HEIGHT = 27
 const DEFAULT_MAX_CONTENT_LENGTH = 2000
 
@@ -46,8 +56,11 @@ export function normalizeHistoryBlock(text: string) {
     .replace(/[\u2500-\u257f]/g, ' ')
     .replace(/[^\x09\x0A\x20-\x7E]/g, ' ')
     .split('\n')
-    .map(line => line.replace(/[ \t]+/g, ' ').trim())
-    .filter(Boolean)
+    .map(line => line
+      .replace(/[ \t]+/g, ' ')
+      .replace(/M{2,}$/g, '')
+      .trim())
+    .filter(line => line && !line.startsWith(']0;') && !/^M+$/.test(line))
     .join('\n')
     .trim()
 }
@@ -63,12 +76,32 @@ function formatHistoryTime(receivedAt: number) {
   return `${hours}:${minutes}`
 }
 
-function formatHistoryRow(prefix: string, text: string) {
+function formatHistoryLines(time: string, label: string, text: string): HistoryLogicalLine[] {
   const displayText = normalizeHistoryBlock(text)
-  if (!displayText) return prefix
+  const prefix = label ? `${time} ${label}` : time
+  if (!displayText) return [{ content: prefix, contextPrefix: prefix }]
 
   const [firstLine, ...remainingLines] = displayText.split('\n')
-  return [`${prefix} ${firstLine}`, ...remainingLines].join('\n')
+  return [
+    { content: `${prefix} ${firstLine}`, contextPrefix: prefix },
+    ...remainingLines.map(line => ({ content: line, contextPrefix: prefix })),
+  ]
+}
+
+function splitLinePrefix(line: string) {
+  const match = line.match(/^((?:\d{2}:\d{2}\s+\S+|Queued:)\s+)(.*)$/)
+  if (!match) {
+    return { prefix: '', body: line }
+  }
+
+  return {
+    prefix: match[1],
+    body: match[2],
+  }
+}
+
+function hasRenderedPrefix(line: string, prefix: string) {
+  return !!prefix && (line === prefix || line.startsWith(`${prefix} `))
 }
 
 export class HistoryCanvas {
@@ -78,7 +111,7 @@ export class HistoryCanvas {
   private readonly maxContentLength: number
   private entries: HistoryEntry[] = []
   private pendingTranscript = ''
-  private visualLines: string[] = ['No messages']
+  private visualLines: HistoryVisualLine[] = [{ content: 'No messages', contextPrefix: '' }]
   private scrollTopLine = 0
   private pinnedToBottom = true
   private revision = 0
@@ -180,43 +213,69 @@ export class HistoryCanvas {
     const rows = this.entries
       .slice()
       .sort((a, b) => a.receivedAt - b.receivedAt)
-      .map(entry => formatHistoryRow(
+      .flatMap(entry => formatHistoryLines(
         formatHistoryTime(entry.receivedAt),
+        entry.label,
         entry.detail || entry.text,
       ))
 
     if (this.pendingTranscript) {
-      rows.push(formatHistoryRow('Queued:', this.pendingTranscript))
+      rows.push(...formatHistoryLines('Queued:', '', this.pendingTranscript))
     }
 
-    return rows.length ? rows : ['No messages']
+    return rows.length ? rows : [{ content: 'No messages', contextPrefix: '' }]
   }
 
   private buildVisualLines() {
     const lines = this.historyRows()
-      .flatMap(row => row
-        .split('\n')
-        .flatMap(line => this.wrapLine(line)))
+      .flatMap(line => this.wrapLine(line.content, line.contextPrefix))
 
-    return lines.length ? lines : ['No messages']
+    return lines.length ? lines : [{ content: 'No messages', contextPrefix: '' }]
   }
 
-  private wrapLine(line: string) {
+  private wrapLine(line: string, contextPrefix: string) {
     const normalized = line.replace(/[ \t]+/g, ' ').trim()
     if (!normalized) return []
 
-    const visualLines: string[] = []
+    const { prefix, body } = splitLinePrefix(normalized)
+    const content = body || normalized
+    const visualLines: HistoryVisualLine[] = []
     let current = ''
+    let firstLinePrefix = prefix
 
-    for (const word of normalized.split(' ')) {
+    for (const word of content.split(' ')) {
       if (!word) continue
 
       if (!current) {
+        if (firstLinePrefix) {
+          const prefixedWord = `${firstLinePrefix}${word}`
+          if (this.textFitsLine(prefixedWord)) {
+            current = prefixedWord
+            firstLinePrefix = ''
+            continue
+          }
+
+          const prefixLine = firstLinePrefix.trimEnd()
+          if (prefixLine) {
+            const prefixPieces = this.textFitsLine(prefixLine)
+              ? [prefixLine]
+              : this.splitLongWord(prefixLine)
+            visualLines.push(...prefixPieces.map(piece => ({
+              content: piece,
+              contextPrefix,
+            })))
+          }
+          firstLinePrefix = ''
+        }
+
         if (this.textFitsLine(word)) {
           current = word
         } else {
           const pieces = this.splitLongWord(word)
-          visualLines.push(...pieces.slice(0, -1))
+          visualLines.push(...pieces.slice(0, -1).map(piece => ({
+            content: piece,
+            contextPrefix,
+          })))
           current = pieces.at(-1) ?? ''
         }
         continue
@@ -228,17 +287,20 @@ export class HistoryCanvas {
         continue
       }
 
-      visualLines.push(current)
+      visualLines.push({ content: current, contextPrefix })
       if (this.textFitsLine(word)) {
         current = word
       } else {
         const pieces = this.splitLongWord(word)
-        visualLines.push(...pieces.slice(0, -1))
+        visualLines.push(...pieces.slice(0, -1).map(piece => ({
+          content: piece,
+          contextPrefix,
+        })))
         current = pieces.at(-1) ?? ''
       }
     }
 
-    if (current) visualLines.push(current)
+    if (current) visualLines.push({ content: current, contextPrefix })
     return visualLines
   }
 
@@ -278,10 +340,17 @@ export class HistoryCanvas {
     this.scrollTopLine = clamp(this.scrollTopLine, 0, this.maxScrollTop())
     this.pinnedToBottom = this.scrollTopLine >= this.maxScrollTop()
 
-    const lines = this.visualLines.slice(
+    const lineObjects = this.visualLines.slice(
       this.scrollTopLine,
       this.scrollTopLine + this.visibleLineCount,
     )
+    const lines = lineObjects.map((line, index) => {
+      if (index > 0 || hasRenderedPrefix(line.content, line.contextPrefix)) {
+        return line.content
+      }
+
+      return this.addPageContext(line.contextPrefix, line.content)
+    })
 
     while (lines.length > 1 && lines.join('\n').length > this.maxContentLength) {
       lines.pop()
@@ -292,6 +361,18 @@ export class HistoryCanvas {
     }
 
     return lines.length ? lines : ['No messages']
+  }
+
+  private addPageContext(prefix: string, content: string) {
+    if (!prefix) return content
+
+    const candidate = `${prefix} ${content}`
+    if (this.textFitsLine(candidate)) return candidate
+
+    const contextOnly = `${prefix} ...`
+    if (this.textFitsLine(contextOnly)) return contextOnly
+
+    return prefix
   }
 
   private maxScrollTop() {

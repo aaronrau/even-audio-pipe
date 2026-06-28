@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { measureTextWrap } from '@evenrealities/pretext'
 import { OsEventTypeList } from '@evenrealities/even_hub_sdk'
-import { HistoryCanvas, type HistoryEntry } from '../src/historyCanvas'
+import { HistoryCanvas, normalizeHistoryBlock, type HistoryEntry } from '../src/historyCanvas'
 import { historyScrollDirectionFromEventType } from '../src/historyInput'
 
 const CANVAS_WIDTH = 576
 const CANVAS_HEIGHT = 288
-const HISTORY_WRAP_WIDTH = CANVAS_WIDTH + 80
+const HISTORY_WRAP_WIDTH = CANVAS_WIDTH
 const VISIBLE_LINES = 9
 const MAX_CONTENT_LENGTH = 2000
 
@@ -95,6 +95,49 @@ const bottomDebug = canvas.debug(bottom)
 assertViewportSafe(canvas, bottom)
 assert.equal(bottomDebug.pinnedToBottom, true, 'history should open pinned to bottom')
 assert.match(bottom, /latest detail line eleven/, 'bottom viewport should show newest content')
+
+const prefixCanvas = new HistoryCanvas({
+  width: HISTORY_WRAP_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+prefixCanvas.replaceEntries([
+  entry(5, 'prefix check', [
+    'first detail line',
+    'second detail line',
+    'third detail line',
+  ].join('\n')),
+])
+const prefixLines = prefixCanvas.content().split('\n')
+assert.match(prefixLines[0], /^12:05 Agent first detail line/)
+assert.doesNotMatch(prefixLines[1], /^12:05 Agent/)
+assert.doesNotMatch(prefixLines[2], /^12:05 Agent/)
+
+const cleanedTerminalOutput = normalizeHistoryBlock([
+  ']0;terminal titleMMMMMMMMM',
+  'real output lineMM',
+  'MMMM',
+  'another real line',
+].join('\n'))
+assert.equal(cleanedTerminalOutput, 'real output line\nanother real line')
+
+const narrowWidth = 120
+const firstWordCanvas = new HistoryCanvas({
+  width: narrowWidth,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+firstWordCanvas.replaceEntries([
+  entry(6, 'long first word', 'Supercalifragilisticexpialidocious-first-token-with-no-breaks'),
+])
+for (const line of firstWordCanvas.content().split('\n')) {
+  assert.ok(
+    measureTextWrap(line, narrowWidth).lineCount <= 1,
+    `first-word wrapping emitted an over-wide line: ${line}`,
+  )
+}
 
 const older = simulateHistoryEvent(canvas, OsEventTypeList.SCROLL_TOP_EVENT)
 const olderDebug = canvas.debug(older.content)

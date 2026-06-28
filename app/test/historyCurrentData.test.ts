@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
+import { measureTextWrap } from '@evenrealities/pretext'
 import { HistoryCanvas, normalizeHistoryBlock, normalizeInlineText, type HistoryEntry } from '../src/historyCanvas'
 
 const CANVAS_WIDTH = 576
 const CANVAS_HEIGHT = 288
-const HISTORY_WRAP_WIDTH = CANVAS_WIDTH + 80
+const HISTORY_WRAP_WIDTH = CANVAS_WIDTH
 const VISIBLE_LINES = 9
 const MAX_CONTENT_LENGTH = 2000
 const DETAIL_TEXT_FIELDS = [
@@ -38,6 +39,32 @@ function textFromFields(record: Record<string, unknown>, fields: readonly string
     if (text) return text
   }
   return ''
+}
+
+function assertViewportSafe(content: string) {
+  assert.ok(content.split('\n').length <= VISIBLE_LINES, 'viewport should fit visible line count')
+  assert.ok(content.length <= MAX_CONTENT_LENGTH, 'viewport should fit update limit')
+
+  for (const line of content.split('\n')) {
+    assert.ok(
+      measureTextWrap(line, HISTORY_WRAP_WIDTH).lineCount <= 1,
+      `line would wrap against configured history width: ${line}`,
+    )
+  }
+}
+
+function assertAllPagesSafe(canvas: HistoryCanvas) {
+  const seenLineStarts = new Set<number>()
+
+  for (;;) {
+    const content = canvas.content()
+    const debug = canvas.debug(content)
+    assertViewportSafe(content)
+    if (seenLineStarts.has(debug.lineStart)) break
+    seenLineStarts.add(debug.lineStart)
+    if (debug.lineStart <= 1) break
+    canvas.scroll(-1)
+  }
 }
 
 function sanitizeEntry(value: unknown): HistoryEntry | null {
@@ -91,8 +118,10 @@ const newerDebug = canvas.debug(newer.content)
 
 assert.ok(entries.length > 0, 'expected current history entries')
 assert.equal(bottomDebug.pinnedToBottom, true, 'current history should open at bottom')
-assert.ok(bottomDebug.visibleLines <= VISIBLE_LINES, 'bottom viewport should fit visible line count')
-assert.ok(bottomDebug.contentLength <= MAX_CONTENT_LENGTH, 'bottom viewport should fit update limit')
+assertViewportSafe(bottom)
+assertViewportSafe(older.content)
+assertViewportSafe(newer.content)
+assertAllPagesSafe(canvas)
 assert.notEqual(older.content, bottom, 'older scroll should change current history viewport')
 assert.equal(newer.content, bottom, 'newer scroll should return to current history bottom')
 assert.equal(
