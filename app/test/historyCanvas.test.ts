@@ -175,6 +175,46 @@ const cleanedTerminalOutput = normalizeHistoryBlock([
 ].join('\n'))
 assert.equal(cleanedTerminalOutput, 'real output line\nanother real line')
 
+const cleanedSoftWrappedOutput = normalizeHistoryBlock([
+  '67 65 0a 0a',
+  'The Flutter repo is clean now, and the Markdown source file no longer exists locally. I\u2019m',
+  'checking the aggregate workspace status once more so the final note can distinguish this work',
+  'from unrelated existing files.',
+  'Ran git status --short',
+  'M dev-simcha-flutter',
+  '78 ]8;;https://linear.app/simcha-ai/issue/SIM-317/examplehttps://linear.app/simcha-ai/issue/SIM-317/example]8;;',
+  'I used the full contents of dev-simcha-flutter/docs/voice_turn_detection_vad_sdd.md as the]0;\u2826 dev-simcha-all',
+  'issue description, then deleted that Markdown file locally. dev-simcha-flutter has no working-',
+  'tree diff now.',
+].join('\n'))
+assert.doesNotMatch(cleanedSoftWrappedOutput, /67 65 0a 0a/)
+assert.match(cleanedSoftWrappedOutput, /locally\. I m checking the aggregate workspace status/)
+assert.doesNotMatch(cleanedSoftWrappedOutput, /I m\nchecking/)
+assert.match(cleanedSoftWrappedOutput, /^M dev-simcha-flutter$/m)
+assert.match(cleanedSoftWrappedOutput, /^https:\/\/linear\.app\/simcha-ai\/issue\/SIM-317\/example$/m)
+assert.doesNotMatch(cleanedSoftWrappedOutput, /\]8;;|\]0;/)
+assert.match(cleanedSoftWrappedOutput, /as the issue description/)
+assert.match(cleanedSoftWrappedOutput, /working-tree diff now/)
+
+const narrowContinuationCanvas = new HistoryCanvas({
+  width: 120,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: 3,
+  maxContentLength: MAX_CONTENT_LENGTH,
+  showPageContinuation: true,
+})
+narrowContinuationCanvas.replaceEntries([
+  entry(8, 'narrow continuation', [
+    'first',
+    'overlap',
+    'after',
+    'last',
+  ].join('\n')),
+])
+const narrowContinuationLines = narrowContinuationCanvas.content().split('\n')
+assert.match(narrowContinuationLines[0], /↑/)
+assert.equal(narrowContinuationLines[1], 'overlap')
+
 const narrowWidth = 120
 const firstWordCanvas = new HistoryCanvas({
   width: narrowWidth,

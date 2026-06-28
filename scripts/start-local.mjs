@@ -174,7 +174,6 @@ console.log('')
 await runQr()
 
 console.log('')
-console.log('Receiver and Vite are still running. Press Ctrl+C to stop both.')
 process.stdin.resume()
 
 function detectHostIp() {

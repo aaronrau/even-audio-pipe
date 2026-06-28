@@ -350,7 +350,6 @@ function appendMessageHistory(entry) {
 function sendMessageHistory(socket) {
   const date = historyDateStamp()
   const entries = readMessageHistory(messageHistoryLimit, date)
-  console.log(`[history] sending ${entries.length} entries for ${date}`)
   sendSocketJson(socket, {
     type: 'message_history',
     date,
@@ -1028,7 +1027,6 @@ function persistScannedUser(user, status) {
       config,
       warned: false,
     }
-    console.log(`[auth] saved Even user to config: ${userLabel(user)} status=${status}`)
   } catch (err) {
     console.warn(`[auth] failed to save Even user to config: ${err.message}`)
   }
@@ -1568,7 +1566,6 @@ async function getSileroVad() {
       negativeSpeechThreshold: sileroVadThreshold - 0.15,
     })
     sileroVad = nextVad
-    console.log('[audio] Silero VAD ready')
     return nextVad
   })().catch(err => {
     sileroVadUnavailable = true
@@ -1621,7 +1618,6 @@ wss.on('connection', (socket, req) => {
     })
     : null
 
-  console.log(`[audio] connected from ${req.socket.remoteAddress}`)
   sendSocketJson(socket, {
     type: 'receiver_status',
     status: 'connected',
@@ -1631,10 +1627,6 @@ wss.on('connection', (socket, req) => {
   })
 
   if (useVad) {
-    const backendDetail = vadBackend === 'silero'
-      ? `silero frameSamples=${vadFrameSamples} silence=${vadSilenceMs}ms minSpeech=${vadMinSpeechMs}ms`
-      : `rms start=${vadStartThreshold} release=${vadReleaseThreshold} silence=${vadSilenceMs}ms`
-    console.log(`[audio] VAD chunking backend=${backendDetail} max=${segmentSeconds}s`)
     if (vadBackend === 'silero') {
       audioQueue = audioQueue.then(() => resetSileroVadState())
     }
@@ -1647,13 +1639,11 @@ wss.on('connection', (socket, req) => {
   socket.on('message', (data, isBinary) => {
     if (!isBinary) {
       const text = data.toString()
-      console.log(`[audio] control ${text}`)
       const control = parseControlMessage(text)
       if (control?.type === 'start') {
         evenUser = normalizeUser(control.user)
         const auth = currentUserAuthConfig()
 
-        console.log(`[auth] even user received: ${userLabel(evenUser)}`)
         if (auth.required && !isAllowedUser(evenUser, auth)) {
           console.warn(`[auth] rejected Even user: ${userLabel(evenUser)}`)
           persistScannedUser(evenUser, 'rejected')
@@ -1667,11 +1657,7 @@ wss.on('connection', (socket, req) => {
         }
 
         userAuthenticated = true
-        console.log(`[auth] accepted Even user: ${userLabel(evenUser)}`)
         persistScannedUser(evenUser, 'accepted')
-        if (!auth.required) {
-          console.log('[auth] no user allowlist configured; add auth.allowedUserIds in config.json to restrict users')
-        }
         sendSocketJson(socket, {
           type: 'auth_status',
           status: 'accepted',

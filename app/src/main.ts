@@ -342,10 +342,7 @@ function requestMessageHistory(reason: string) {
 }
 
 function sendControlDebug(payload: Record<string, unknown>) {
-  console.log('[even-control]', payload)
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(payload))
-  }
+  void payload
 }
 
 function navigatorDebugPayload(debug: ReturnType<HistoryNavigator['debug']>) {
@@ -634,7 +631,6 @@ function handleReceiverMessage(raw: string) {
   try {
     message = JSON.parse(raw)
   } catch {
-    console.log('receiver:', raw)
     return
   }
 
@@ -898,65 +894,8 @@ function shouldHandleHistoryScroll(event: EvenHubEvent): HistoryScrollDirection 
   return direction
 }
 
-function osEventTypeName(type: OsEventTypeList | undefined) {
-  if (type === undefined) return 'undefined'
-  return OsEventTypeList[type] ?? String(type)
-}
-
-function eventSourceName(source: EventSourceType | null) {
-  if (source === null) return 'unknown'
-  return EventSourceType[source] ?? String(source)
-}
-
 function logInputEvent(event: EvenHubEvent) {
-  if (!event.textEvent && !event.listEvent && !event.sysEvent) return
-
-  const inputType = getEventType(event)
-  const source = getEventSource(event)
-  const summary = {
-    type: 'input_debug',
-    eventType: inputType ?? 'undefined',
-    eventTypeName: osEventTypeName(inputType),
-    eventSource: source ?? 'unknown',
-    eventSourceName: eventSourceName(source),
-    isSinglePress: isSinglePress(event),
-    isHistoryToggle: isHistoryToggleInput(event),
-    mode: glassesMode,
-    textEvent: event.textEvent
-      ? {
-          containerID: event.textEvent.containerID,
-          containerName: event.textEvent.containerName,
-          eventType: event.textEvent.eventType ?? 'undefined',
-          eventTypeName: osEventTypeName(event.textEvent.eventType),
-        }
-      : null,
-    listEvent: event.listEvent
-      ? {
-          containerID: event.listEvent.containerID,
-          containerName: event.listEvent.containerName,
-          currentSelectItemIndex: event.listEvent.currentSelectItemIndex,
-          currentSelectItemName: event.listEvent.currentSelectItemName,
-          eventType: event.listEvent.eventType ?? 'undefined',
-          eventTypeName: osEventTypeName(event.listEvent.eventType),
-        }
-      : null,
-    sysEvent: event.sysEvent
-      ? {
-          eventType: event.sysEvent.eventType ?? 'undefined',
-          eventTypeName: osEventTypeName(event.sysEvent.eventType),
-          eventSource: event.sysEvent.eventSource ?? 'unknown',
-          eventSourceName: eventSourceName(event.sysEvent.eventSource ?? null),
-          systemExitReasonCode: event.sysEvent.systemExitReasonCode,
-        }
-      : null,
-    jsonData: event.jsonData ?? null,
-  }
-
-  console.log('[even-input]', summary)
-
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(summary))
-  }
+  void event
 }
 
 const bridge = await waitForEvenAppBridge()
