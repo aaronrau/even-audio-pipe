@@ -61,6 +61,7 @@ const BACK_ROW_ID = null
 const SELECTED_MARKER = '> '
 const UNSELECTED_MARKER = '  '
 const ELLIPSIS = '...'
+const ELLIPSIS_GUARD_WIDTH = 24
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
@@ -422,21 +423,38 @@ export class HistoryNavigator {
     const chars = Array.from(body)
     let low = 0
     let high = chars.length
-    let best = marker.trimEnd()
+    let bestBody = ''
+    const previewWidth = Math.max(1, this.width - ELLIPSIS_GUARD_WIDTH)
 
     while (low <= high) {
       const mid = Math.floor((low + high) / 2)
-      const candidateBody = chars.slice(0, mid).join('').trimEnd()
+      const candidateBody = this.trimPreviewBody(chars.slice(0, mid).join(''))
       const candidate = `${marker}${candidateBody}${ELLIPSIS}`
-      if (this.textFitsLine(candidate)) {
-        best = candidate
+      if (candidateBody && this.textFitsLine(candidate, previewWidth)) {
+        bestBody = candidateBody
         low = mid + 1
       } else {
         high = mid - 1
       }
     }
 
-    return best
+    return bestBody
+      ? `${marker}${bestBody}${ELLIPSIS}`
+      : `${marker.trimEnd()}${ELLIPSIS}`
+  }
+
+  private trimPreviewBody(text: string) {
+    const trimmed = text
+      .replace(/[\s,.;:!?-]+$/g, '')
+      .trimEnd()
+    if (!trimmed) return ''
+
+    const lastSpace = trimmed.lastIndexOf(' ')
+    if (lastSpace > 0 && trimmed.length - lastSpace <= 12) {
+      return trimmed.slice(0, lastSpace)
+    }
+
+    return trimmed
   }
 
   private ensureSelectedVisible(rowCount = this.currentItems().length + 1) {
@@ -451,7 +469,7 @@ export class HistoryNavigator {
     this.listTopRow = clamp(this.listTopRow, 0, maxTopRow)
   }
 
-  private textFitsLine(text: string) {
-    return measureTextWrap(text, this.width).lineCount <= 1
+  private textFitsLine(text: string, width = this.width) {
+    return measureTextWrap(text, width).lineCount <= 1
   }
 }

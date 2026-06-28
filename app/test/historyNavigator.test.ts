@@ -7,6 +7,7 @@ const CANVAS_WIDTH = 576
 const CANVAS_HEIGHT = 288
 const VISIBLE_LINES = 9
 const MAX_CONTENT_LENGTH = 2000
+const ELLIPSIS_GUARD_WIDTH = 24
 
 function atMinute(minute: number) {
   return new Date(2026, 0, 1, 12, minute).getTime()
@@ -105,8 +106,15 @@ navigator.scroll(1)
 navigator.scroll(1)
 const transcriptSelected = navigator.content()
 assert.match(transcriptSelected, /^> 12:00 You .*\.{3}$/m)
+assert.doesNotMatch(transcriptSelected, /\s\.{3}/)
 assert.doesNotMatch(transcriptSelected, /available in full when the transcript item is opened as detail/)
 assertViewportSafe(transcriptSelected)
+for (const line of transcriptSelected.split('\n').filter(line => line.endsWith('...'))) {
+  assert.ok(
+    measureTextWrap(line, CANVAS_WIDTH - ELLIPSIS_GUARD_WIDTH).lineCount <= 1,
+    `truncated line should keep guard space before ellipsis: ${line}`,
+  )
+}
 
 const transcriptDetail = navigator.tap()
 assert.equal(transcriptDetail.mode, 'detail')

@@ -42,6 +42,7 @@ type HistoryVisualLine = {
 
 const DEFAULT_LINE_HEIGHT = 27
 const DEFAULT_MAX_CONTENT_LENGTH = 2000
+const ELLIPSIS = '...'
 
 export function normalizeInlineText(text: string) {
   return text.replace(/\s+/g, ' ').trim()
@@ -375,7 +376,7 @@ export class HistoryCanvas {
     const candidate = `${prefix} ${content}`
     if (this.textFitsLine(candidate)) return candidate
 
-    const contextOnly = `${prefix} ...`
+    const contextOnly = `${prefix}${ELLIPSIS}`
     if (this.textFitsLine(contextOnly)) return contextOnly
 
     return prefix

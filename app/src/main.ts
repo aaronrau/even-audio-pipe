@@ -46,6 +46,8 @@ let glassesMode: GlassesMode = 'live'
 let historyTransitioning = false
 let historyUpdateInFlight = false
 let historyUpdatePending = false
+let lastHistoryRequestedContent = ''
+let lastHistoryRenderedContent = ''
 let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
@@ -66,6 +68,8 @@ const HISTORY_TOGGLE_DEBOUNCE_MS = 700
 const HISTORY_SCROLL_DEBOUNCE_MS = 350
 const STATUS_CONTAINER_ID = 1
 const STATUS_CONTAINER_NAME = 'audio_status'
+const EVENT_CAPTURE_CONTAINER_ID = 2
+const EVENT_CAPTURE_CONTAINER_NAME = 'audio_capture'
 const CANVAS_WIDTH = 576
 const CANVAS_HEIGHT = 288
 const CANVAS_PADDING = 0
@@ -242,17 +246,28 @@ function pushHistory(label: string, text: string, detail = '') {
   historyNavigator.appendEntry(entry)
 }
 
-function scrollHistoryWindow(direction: HistoryScrollDirection) {
+async function scrollHistoryWindow(direction: HistoryScrollDirection) {
   const result = historyNavigator.scroll(direction)
   syncHistoryMode()
+  const displayContent = historyDisplayContent(result.content)
+  const skippedSameFrame = displayContent === lastHistoryRenderedContent
+  const rendered = skippedSameFrame
+    ? true
+    : await renderHistoryContent(result.content)
+
   sendControlDebug({
     type: 'history_debug',
     action: result.action,
     mode: glassesMode,
     direction: direction > 0 ? 'newer' : 'older',
+    skippedSameFrame,
+    rendered,
     ...navigatorDebugPayload(result.debug),
   })
-  requestHistoryWindowUpdate()
+
+  if (!rendered) {
+    requestHistoryWindowUpdate()
+  }
 }
 
 function currentLiveGlassesContent() {
@@ -274,6 +289,23 @@ function makeStatusContainer(content: string, _isHistory: boolean) {
     containerID: STATUS_CONTAINER_ID,
     containerName: STATUS_CONTAINER_NAME,
     content,
+    isEventCapture: 0,
+  })
+}
+
+function makeEventCaptureContainer() {
+  return new TextContainerProperty({
+    xPosition: 0,
+    yPosition: 0,
+    width: 1,
+    height: 1,
+    borderWidth: 0,
+    borderColor: 15,
+    borderRadius: 0,
+    paddingLength: 0,
+    containerID: EVENT_CAPTURE_CONTAINER_ID,
+    containerName: EVENT_CAPTURE_CONTAINER_NAME,
+    content: '',
     isEventCapture: 1,
   })
 }
@@ -305,6 +337,26 @@ function navigatorDebugPayload(debug: ReturnType<HistoryNavigator['debug']>) {
     navigatorMode: mode,
     ...rest,
   }
+}
+
+function historyDisplayContent(content = historyNavigator.content()) {
+  const lines = content ? content.split('\n') : ['']
+  while (lines.length < HISTORY_VISIBLE_LINES) {
+    lines.push('')
+  }
+  return lines.slice(0, HISTORY_VISIBLE_LINES).join('\n')
+}
+
+async function renderHistoryContent(content = historyNavigator.content()) {
+  const displayContent = historyDisplayContent(content)
+  lastHistoryRequestedContent = displayContent
+
+  const rendered = await upgradeStatusContainer(displayContent)
+  if (rendered && lastHistoryRequestedContent === displayContent) {
+    lastHistoryRenderedContent = displayContent
+  }
+
+  return rendered
 }
 
 function upgradeStatusContainer(content: string) {
@@ -344,7 +396,7 @@ async function flushHistoryWindowUpdate() {
   try {
     while (historyUpdatePending && isHistoryMode() && !historyTransitioning) {
       historyUpdatePending = false
-      await upgradeStatusContainer(historyNavigator.content())
+      await renderHistoryContent()
     }
   } finally {
     historyUpdateInFlight = false
@@ -359,7 +411,7 @@ async function showHistoryWindow() {
   const result = historyNavigator.open()
   syncHistoryMode()
   requestMessageHistory('open_history')
-  const rendered = await upgradeStatusContainer(result.content)
+  const rendered = await renderHistoryContent(result.content)
 
   if (rendered) {
     sendControlDebug({
@@ -368,7 +420,6 @@ async function showHistoryWindow() {
       mode: glassesMode,
       ...navigatorDebugPayload(result.debug),
     })
-    requestHistoryWindowUpdate()
     return
   }
 
@@ -395,6 +446,8 @@ async function closeHistoryWindow() {
       action: 'closed',
       mode: glassesMode,
     })
+    lastHistoryRequestedContent = ''
+    lastHistoryRenderedContent = ''
     return
   }
 
@@ -424,9 +477,15 @@ async function handleHistoryTap() {
     const content = isHistoryMode()
       ? result.content
       : currentLiveGlassesContent()
-    const rendered = await upgradeStatusContainer(content)
+    const rendered = isHistoryMode()
+      ? await renderHistoryContent(content)
+      : await upgradeStatusContainer(content)
 
     if (rendered) {
+      if (!isHistoryMode()) {
+        lastHistoryRequestedContent = ''
+        lastHistoryRenderedContent = ''
+      }
       sendControlDebug({
         type: 'history_debug',
         action: result.action,
@@ -825,11 +884,12 @@ const bridge = await waitForEvenAppBridge()
 evenUserInfo = await loadUserInfo()
 
 const statusContainer = makeStatusContainer('Starting audio pipe...', false)
+const eventCaptureContainer = makeEventCaptureContainer()
 
 const created = await bridge.createStartUpPageContainer(
   new CreateStartUpPageContainer({
-    containerTotalNum: 1,
-    textObject: [statusContainer],
+    containerTotalNum: 2,
+    textObject: [statusContainer, eventCaptureContainer],
   }),
 )
 
@@ -971,7 +1031,7 @@ unsubscribe = bridge.onEvenHubEvent(event => {
 
   const historyScroll = shouldHandleHistoryScroll(event)
   if (historyScroll !== null) {
-    scrollHistoryWindow(historyScroll)
+    void scrollHistoryWindow(historyScroll)
     return
   }
 

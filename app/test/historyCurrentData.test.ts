@@ -9,6 +9,7 @@ const CANVAS_HEIGHT = 288
 const HISTORY_WRAP_WIDTH = CANVAS_WIDTH
 const VISIBLE_LINES = 9
 const MAX_CONTENT_LENGTH = 2000
+const ELLIPSIS_GUARD_WIDTH = 24
 const DETAIL_TEXT_FIELDS = [
   'detail',
   'details',
@@ -51,6 +52,13 @@ function assertViewportSafe(content: string) {
       measureTextWrap(line, HISTORY_WRAP_WIDTH).lineCount <= 1,
       `line would wrap against configured history width: ${line}`,
     )
+    if (line.endsWith('...')) {
+      assert.doesNotMatch(line, /\s\.{3}/)
+      assert.ok(
+        measureTextWrap(line, HISTORY_WRAP_WIDTH - ELLIPSIS_GUARD_WIDTH).lineCount <= 1,
+        `truncated line should keep guard space before ellipsis: ${line}`,
+      )
+    }
   }
 }
 
