@@ -1,6 +1,7 @@
 import { measureTextWrap } from '@evenrealities/pretext'
 
 export type HistoryEntry = {
+  id?: string
   label: string
   text: string
   detail?: string
@@ -69,7 +70,7 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
 }
 
-function formatHistoryTime(receivedAt: number) {
+export function formatHistoryTime(receivedAt: number) {
   const date = new Date(receivedAt)
   const hours = String(date.getHours()).padStart(2, '0')
   const minutes = String(date.getMinutes()).padStart(2, '0')
@@ -154,6 +155,11 @@ export class HistoryCanvas {
   scrollToBottom() {
     this.scrollTopLine = this.maxScrollTop()
     this.pinnedToBottom = true
+  }
+
+  scrollToTop() {
+    this.scrollTopLine = 0
+    this.pinnedToBottom = this.scrollTopLine >= this.maxScrollTop()
   }
 
   scroll(direction: HistoryScrollDirection) {

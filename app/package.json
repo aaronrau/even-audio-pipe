@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "pack": "evenhub pack",
-    "test:history": "tsx test/historyCanvas.test.ts",
+    "test:history": "tsx test/historyCanvas.test.ts && tsx test/historyNavigator.test.ts",
     "test:history:current": "tsx test/historyCurrentData.test.ts",
     "simulate": "evenhub-simulator http://localhost:5173"
   },

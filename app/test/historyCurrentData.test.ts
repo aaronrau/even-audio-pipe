@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { measureTextWrap } from '@evenrealities/pretext'
 import { HistoryCanvas, normalizeHistoryBlock, normalizeInlineText, type HistoryEntry } from '../src/historyCanvas'
+import { HistoryNavigator } from '../src/historyNavigator'
 
 const CANVAS_WIDTH = 576
 const CANVAS_HEIGHT = 288
@@ -67,6 +68,26 @@ function assertAllPagesSafe(canvas: HistoryCanvas) {
   }
 }
 
+function assertNavigatorSafe(navigator: HistoryNavigator) {
+  let result = navigator.open()
+  assertViewportSafe(result.content)
+  assert.match(result.content.split('\n')[0], /^> Back$/)
+
+  for (let index = 0; index < entries.length; index += 1) {
+    result = navigator.scroll(1)
+    assertViewportSafe(result.content)
+
+    if (index < 5) {
+      const detail = navigator.tap()
+      assert.equal(detail.mode, 'detail')
+      assertViewportSafe(detail.content)
+      const list = navigator.tap()
+      assert.equal(list.mode, 'list')
+      assertViewportSafe(list.content)
+    }
+  }
+}
+
 function sanitizeEntry(value: unknown): HistoryEntry | null {
   if (!value || typeof value !== 'object') return null
 
@@ -108,6 +129,14 @@ const canvas = new HistoryCanvas({
   maxContentLength: MAX_CONTENT_LENGTH,
 })
 canvas.replaceEntries(entries)
+const navigator = new HistoryNavigator({
+  width: HISTORY_WRAP_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  scrollOverlapLines: 1,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+navigator.replaceEntries(entries)
 
 const bottom = canvas.content()
 const bottomDebug = canvas.debug(bottom)
@@ -122,6 +151,7 @@ assertViewportSafe(bottom)
 assertViewportSafe(older.content)
 assertViewportSafe(newer.content)
 assertAllPagesSafe(canvas)
+assertNavigatorSafe(navigator)
 assert.notEqual(older.content, bottom, 'older scroll should change current history viewport')
 assert.equal(newer.content, bottom, 'newer scroll should return to current history bottom')
 assert.equal(

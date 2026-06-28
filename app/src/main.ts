@@ -8,13 +8,13 @@ import {
   type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk'
 import {
-  HistoryCanvas,
   normalizeHistoryBlock,
   normalizeInlineText,
   type HistoryEntry,
   type HistoryScrollDirection,
 } from './historyCanvas'
 import { historyScrollDirectionFromEventType } from './historyInput'
+import { HistoryNavigator } from './historyNavigator'
 
 const BASE_AUDIO_WS_URL = import.meta.env.VITE_AUDIO_WS_URL as string | undefined
 const AUDIO_WS_URL = withLaunchToken(BASE_AUDIO_WS_URL)
@@ -35,7 +35,7 @@ type UserPayload = {
   country?: string
 }
 
-type GlassesMode = 'live' | 'history'
+type GlassesMode = 'live' | 'history_list' | 'history_detail'
 
 let sentChunks = 0
 let sentBytes = 0
@@ -93,13 +93,26 @@ let lastHistoryToggleInputAt = 0
 let lastHistoryScrollInputAt = 0
 let statusRenderRevision = 0
 let statusRenderQueue: Promise<boolean> = Promise.resolve(true)
-const historyCanvas = new HistoryCanvas({
+const historyNavigator = new HistoryNavigator({
   width: HISTORY_WRAP_WIDTH,
   height: CANVAS_HEIGHT,
   visibleLineCount: HISTORY_VISIBLE_LINES,
   scrollOverlapLines: 1,
   maxContentLength: TEXT_UPGRADE_LIMIT,
 })
+
+function isHistoryMode() {
+  return glassesMode !== 'live'
+}
+
+function syncHistoryMode() {
+  const mode = historyNavigator.currentMode()
+  glassesMode = mode === 'detail'
+    ? 'history_detail'
+    : mode === 'list'
+      ? 'history_list'
+      : 'live'
+}
 
 function setUiStatus(text: string) {
   statusEl.textContent = text
@@ -208,7 +221,7 @@ function replaceHistory(entries: HistoryEntry[]) {
     messageHistory.length,
     ...entries,
   )
-  historyCanvas.replaceEntries(messageHistory, true)
+  historyNavigator.replaceEntries(messageHistory)
 }
 
 function pushHistory(label: string, text: string, detail = '') {
@@ -226,19 +239,18 @@ function pushHistory(label: string, text: string, detail = '') {
   }
 
   messageHistory.push(entry)
-  historyCanvas.appendEntry(entry, true)
+  historyNavigator.appendEntry(entry)
 }
 
 function scrollHistoryWindow(direction: HistoryScrollDirection) {
-  const result = historyCanvas.scroll(direction)
+  const result = historyNavigator.scroll(direction)
+  syncHistoryMode()
   sendControlDebug({
     type: 'history_debug',
-    action: 'scrolled',
+    action: result.action,
     mode: glassesMode,
     direction: direction > 0 ? 'newer' : 'older',
-    fromLineStart: result.previousTopLine + 1,
-    toLineStart: result.currentTopLine + 1,
-    ...historyCanvas.debug(result.content),
+    ...navigatorDebugPayload(result.debug),
   })
   requestHistoryWindowUpdate()
 }
@@ -267,7 +279,7 @@ function makeStatusContainer(content: string, _isHistory: boolean) {
 }
 
 function requestHistoryWindowUpdate() {
-  if (glassesMode !== 'history') return
+  if (!isHistoryMode()) return
   historyUpdatePending = true
   void flushHistoryWindowUpdate()
 }
@@ -284,6 +296,14 @@ function sendControlDebug(payload: Record<string, unknown>) {
   console.log('[even-control]', payload)
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload))
+  }
+}
+
+function navigatorDebugPayload(debug: ReturnType<HistoryNavigator['debug']>) {
+  const { mode, ...rest } = debug
+  return {
+    navigatorMode: mode,
+    ...rest,
   }
 }
 
@@ -314,7 +334,7 @@ async function flushHistoryWindowUpdate() {
     historyUpdateInFlight ||
     historyTransitioning ||
     !historyUpdatePending ||
-    glassesMode !== 'history'
+    !isHistoryMode()
   ) {
     return
   }
@@ -322,13 +342,13 @@ async function flushHistoryWindowUpdate() {
   historyUpdateInFlight = true
 
   try {
-    while (historyUpdatePending && glassesMode === 'history' && !historyTransitioning) {
+    while (historyUpdatePending && isHistoryMode() && !historyTransitioning) {
       historyUpdatePending = false
-      await upgradeStatusContainer(historyCanvas.content())
+      await upgradeStatusContainer(historyNavigator.content())
     }
   } finally {
     historyUpdateInFlight = false
-    if (historyUpdatePending && glassesMode === 'history' && !historyTransitioning) {
+    if (historyUpdatePending && isHistoryMode() && !historyTransitioning) {
       void flushHistoryWindowUpdate()
     }
   }
@@ -336,24 +356,24 @@ async function flushHistoryWindowUpdate() {
 
 async function showHistoryWindow() {
   const previousMode = glassesMode
-  glassesMode = 'history'
+  const result = historyNavigator.open()
+  syncHistoryMode()
   requestMessageHistory('open_history')
-  historyCanvas.scrollToBottom()
-  const content = historyCanvas.content()
-  const rendered = await upgradeStatusContainer(content)
+  const rendered = await upgradeStatusContainer(result.content)
 
   if (rendered) {
     sendControlDebug({
       type: 'history_debug',
-      action: 'opened',
+      action: result.action,
       mode: glassesMode,
-      ...historyCanvas.debug(content),
+      ...navigatorDebugPayload(result.debug),
     })
     requestHistoryWindowUpdate()
     return
   }
 
   glassesMode = previousMode
+  historyNavigator.close()
   sendControlDebug({
     type: 'history_debug',
     action: 'open_failed',
@@ -364,6 +384,7 @@ async function showHistoryWindow() {
 
 async function closeHistoryWindow() {
   const previousMode = glassesMode
+  historyNavigator.close()
   glassesMode = 'live'
 
   const rendered = await upgradeStatusContainer(currentLiveGlassesContent())
@@ -378,6 +399,7 @@ async function closeHistoryWindow() {
   }
 
   glassesMode = previousMode
+  syncHistoryMode()
   requestHistoryWindowUpdate()
   sendControlDebug({
     type: 'history_debug',
@@ -387,22 +409,45 @@ async function closeHistoryWindow() {
   console.warn('Failed to close history view')
 }
 
-async function toggleHistoryWindow() {
+async function handleHistoryTap() {
   if (historyTransitioning) return
   historyTransitioning = true
 
   try {
-    if (glassesMode === 'history') {
-      await closeHistoryWindow()
-    } else {
+    if (!isHistoryMode()) {
       await showHistoryWindow()
+      return
+    }
+
+    const result = historyNavigator.tap()
+    syncHistoryMode()
+    const content = isHistoryMode()
+      ? result.content
+      : currentLiveGlassesContent()
+    const rendered = await upgradeStatusContainer(content)
+
+    if (rendered) {
+      sendControlDebug({
+        type: 'history_debug',
+        action: result.action,
+        mode: glassesMode,
+        ...navigatorDebugPayload(result.debug),
+      })
+    } else {
+      sendControlDebug({
+        type: 'history_debug',
+        action: 'tap_render_failed',
+        mode: glassesMode,
+        ...navigatorDebugPayload(result.debug),
+      })
+      setUiStatus('History view failed')
     }
   } catch (err) {
-    console.error('History view toggle failed', err)
+    console.error('History view tap failed', err)
     setUiStatus('History view failed')
   } finally {
     historyTransitioning = false
-    if (glassesMode === 'history') {
+    if (isHistoryMode()) {
       void flushHistoryWindowUpdate()
     }
   }
@@ -413,12 +458,12 @@ function appendTranscript(text: string, label = 'Message', detail = '') {
   if (!normalized) return
 
   queuedTranscriptText = ''
-  historyCanvas.clearPendingTranscript(false)
+  historyNavigator.clearPendingTranscript()
   pushHistory(label, normalized, detail)
   transcriptText = takeTail(normalized, GLASSES_TEXT_LIMIT)
   transcriptEl.textContent = transcriptText
   scheduleTranscriptClear()
-  if (glassesMode === 'history') {
+  if (isHistoryMode()) {
     requestHistoryWindowUpdate()
   } else {
     void renderGlassesStatus()
@@ -553,7 +598,7 @@ function handleReceiverMessage(raw: string) {
         ? payload.text
         : ''
     queuedTranscriptText = normalizeInlineText(queuedText)
-    historyCanvas.setPendingTranscript(queuedTranscriptText, true)
+    historyNavigator.setPendingTranscript(queuedTranscriptText)
     requestHistoryWindowUpdate()
     setUiStatus('Waiting for more speech...')
     return
@@ -566,7 +611,7 @@ function handleReceiverMessage(raw: string) {
         ? payload.text
         : queuedTranscriptText
     queuedTranscriptText = normalizeInlineText(queuedText)
-    historyCanvas.setPendingTranscript(queuedTranscriptText, true)
+    historyNavigator.setPendingTranscript(queuedTranscriptText)
     requestHistoryWindowUpdate()
     setUiStatus('Cleaning transcript...')
     return
@@ -574,7 +619,7 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'asr_status' && payload.status === 'no_transcript') {
     queuedTranscriptText = ''
-    historyCanvas.clearPendingTranscript(true)
+    historyNavigator.clearPendingTranscript()
     requestHistoryWindowUpdate()
     setUiStatus('Listening for speech...')
     return
@@ -689,7 +734,7 @@ function shouldHandleHistoryToggle(event: EvenHubEvent) {
 }
 
 function historyScrollDirection(event: EvenHubEvent): HistoryScrollDirection | null {
-  if (glassesMode !== 'history') return null
+  if (!isHistoryMode()) return null
   if (isHistoryToggleInput(event)) return null
 
   return historyScrollDirectionFromEventType(getEventType(event))
@@ -910,7 +955,7 @@ unsubscribe = bridge.onEvenHubEvent(event => {
   logInputEvent(event)
 
   if (inputType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
-    if (glassesMode === 'history') {
+    if (isHistoryMode()) {
       void closeHistoryWindow()
       return
     }
@@ -920,7 +965,7 @@ unsubscribe = bridge.onEvenHubEvent(event => {
   }
 
   if (shouldHandleHistoryToggle(event)) {
-    void toggleHistoryWindow()
+    void handleHistoryTap()
     return
   }
 
