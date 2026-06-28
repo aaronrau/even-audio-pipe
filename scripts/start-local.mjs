@@ -20,6 +20,7 @@ const storageConfig = resolveStorageConfig(config.storage)
 const transcriptQueueConfig = resolveTranscriptQueueConfig(config.transcriptQueue)
 const transcriptCleanupConfig = resolveTranscriptCleanupConfig(config.transcriptCleanup)
 const workbenchConfig = resolveWorkbenchConfig(config.workbench)
+const vadConfig = resolveVadConfig(config.vad)
 
 const hostIp = process.env.EVEN_AUDIO_PIPE_HOST || detectHostIp()
 const appPort = Number(process.env.EVEN_AUDIO_PIPE_APP_PORT || 5173)
@@ -92,6 +93,7 @@ if (authConfig.enabled) {
 console.log(`  Audio WS URL:   ${wsUrl}`)
 console.log(`  Receiver health http://127.0.0.1:${receiverPort}/health`)
 console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
+console.log(`  VAD:            ${vadConfig.backend}`)
 console.log(`  Audio dir:      ${displayPath(storageConfig.audioDir)}`)
 console.log(`  Transcript dir: ${displayPath(storageConfig.transcriptDir)}`)
 console.log(`  Transcript log: ${displayPath(storageConfig.transcriptsLog)}`)
@@ -142,6 +144,15 @@ spawnManaged('receiver', 'npm', ['start'], {
     SPEECH_WORKBENCH_SUMMARY_PATH: workbenchConfig.summaryPath,
     EVEN_AUDIO_PIPE_CONFIG_PATH: configPath,
     EVEN_AUDIO_PIPE_TOKEN: authConfig.enabled ? authConfig.token : '',
+    VAD_BACKEND: vadConfig.backend,
+    VAD_FRAME_MS: String(vadConfig.frameMs),
+    VAD_SILENCE_MS: String(vadConfig.silenceMs),
+    VAD_MIN_SPEECH_MS: String(vadConfig.speechMs),
+    VAD_PRE_ROLL_MS: String(vadConfig.preRollMs),
+    VAD_MIN_UTTERANCE_MS: String(vadConfig.minUtteranceMs),
+    SILERO_VAD_THRESHOLD: String(vadConfig.threshold),
+    SILERO_VAD_FRAME_SAMPLES: String(vadConfig.frameSamples),
+    SILERO_VAD_MODEL: vadConfig.model,
   },
 })
 
@@ -285,7 +296,7 @@ function resolveTranscriptQueueConfig(queue = {}) {
   const idleMs = Number(
     process.env.TRANSCRIPT_QUEUE_IDLE_MS ??
     queue.idleMs ??
-    5_000,
+    3_000,
   )
   const maxHoldMs = Number(
     process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS ??
@@ -294,9 +305,41 @@ function resolveTranscriptQueueConfig(queue = {}) {
   )
 
   return {
-    idleMs: Number.isFinite(idleMs) ? idleMs : 5_000,
+    idleMs: Number.isFinite(idleMs) ? idleMs : 3_000,
     maxHoldMs: Number.isFinite(maxHoldMs) ? Math.max(0, maxHoldMs) : 10_000,
   }
+}
+
+function resolveVadConfig(vad = {}) {
+  const backend = String(
+    process.env.VAD_BACKEND ||
+    vad.backend ||
+    'silero',
+  ).trim().toLowerCase()
+  const frameMs = Number(process.env.VAD_FRAME_MS ?? vad.frameMs ?? 30)
+  const frameSamples = Number(process.env.SILERO_VAD_FRAME_SAMPLES ?? vad.frameSamples ?? 512)
+  const silenceMs = Number(process.env.VAD_SILENCE_MS ?? vad.silenceMs ?? 240)
+  const speechMs = Number(process.env.VAD_MIN_SPEECH_MS ?? vad.speechMs ?? 60)
+  const preRollMs = Number(process.env.VAD_PRE_ROLL_MS ?? vad.preRollMs ?? 500)
+  const minUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS ?? vad.minUtteranceMs ?? 250)
+  const threshold = Number(process.env.SILERO_VAD_THRESHOLD ?? vad.threshold ?? 0.5)
+
+  return {
+    backend: backend === 'rms' ? 'rms' : 'silero',
+    model: process.env.SILERO_VAD_MODEL || vad.model ? resolveConfigPath(process.env.SILERO_VAD_MODEL || vad.model) : '',
+    frameMs: Number.isFinite(frameMs) ? Math.max(10, Math.floor(frameMs)) : 30,
+    frameSamples: normalizeSileroFrameSamples(frameSamples),
+    silenceMs: Number.isFinite(silenceMs) ? Math.max(0, Math.floor(silenceMs)) : 240,
+    speechMs: Number.isFinite(speechMs) ? Math.max(0, Math.floor(speechMs)) : 60,
+    preRollMs: Number.isFinite(preRollMs) ? Math.max(0, Math.floor(preRollMs)) : 500,
+    minUtteranceMs: Number.isFinite(minUtteranceMs) ? Math.max(0, Math.floor(minUtteranceMs)) : 250,
+    threshold: Number.isFinite(threshold) ? threshold : 0.5,
+  }
+}
+
+function normalizeSileroFrameSamples(value) {
+  const frameSamples = Number(value)
+  return [512, 1024, 1536].includes(frameSamples) ? frameSamples : 512
 }
 
 function resolveWorkbenchConfig(workbench = {}) {

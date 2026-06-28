@@ -134,7 +134,7 @@ function stripLeadingLabel(text: string, label: string) {
 }
 
 function isTranscriptLike(item: HistoryItem) {
-  return item.kind === 'transcript' || item.kind === 'queued'
+  return item.kind === 'transcript'
 }
 
 function uniqueLabels(labels: string[]) {
@@ -180,7 +180,6 @@ export class HistoryNavigator {
   private readonly detailCanvas: HistoryCanvas
   private entries: HistoryEntry[] = []
   private pendingTranscript = ''
-  private pendingReceivedAt = Date.now()
   private mode: HistoryNavigatorMode = 'closed'
   private selectedItemId: string | null = BACK_ROW_ID
   private seenDetailIds = new Set<string>()
@@ -287,13 +286,12 @@ export class HistoryNavigator {
     this.reconcileSelection(wasNewestSelected)
   }
 
-  setPendingTranscript(text: string) {
+  setPendingTranscript(text: string, _frame = '') {
     const previousNewestId = this.currentItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
 
     this.pendingTranscript = normalizeInlineText(text)
-    this.pendingReceivedAt = Date.now()
     this.reconcileSelection(wasNewestSelected)
   }
 
@@ -340,23 +338,6 @@ export class HistoryNavigator {
       .map((entry, index) => ({ entry, index }))
       .sort(compareEntryRecords)
       .map(({ entry, index }) => this.entryItem(entry, index))
-
-    if (this.pendingTranscript) {
-      items.unshift({
-        id: 'queued',
-        kind: 'queued' as const,
-        label: 'Queued',
-        listText: this.pendingTranscript,
-        detailText: this.pendingTranscript,
-        detailEntries: [{
-          id: 'queued',
-          label: 'Queued',
-          text: this.pendingTranscript,
-          receivedAt: this.pendingReceivedAt,
-        }],
-        receivedAt: this.pendingReceivedAt,
-      })
-    }
 
     return this.groupAdjacentTranscripts(items)
   }
@@ -496,7 +477,7 @@ export class HistoryNavigator {
     }
 
     return lines.length ? lines.join('\n') : this.formatListRow({
-      bodyLines: ['Back'],
+      bodyLines: [this.backRowBody()],
       selected: true,
       seen: true,
       id: BACK_ROW_ID,
@@ -506,7 +487,7 @@ export class HistoryNavigator {
   private listRows() {
     const rows: ListRow[] = [{
       id: BACK_ROW_ID,
-      bodyLines: ['Back'],
+      bodyLines: [this.backRowBody()],
       selected: this.selectedItemId === BACK_ROW_ID,
       seen: true,
     }]
@@ -538,6 +519,12 @@ export class HistoryNavigator {
     }
 
     return [`${formatHistoryTime(item.receivedAt)} ${listText}`]
+  }
+
+  private backRowBody() {
+    return this.pendingTranscript
+      ? `Back | Queued: ${this.pendingTranscript}`
+      : 'Back'
   }
 
   private agentListBodyLines(item: HistoryItem, listText: string) {

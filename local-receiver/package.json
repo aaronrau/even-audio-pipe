@@ -4,10 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js"
+    "start": "tsx server.js",
+    "check": "node --check server.js && node --import tsx --test test/vad-endpoint.test.mjs test/silero-vad.test.mts",
+    "test:vad": "node --import tsx --test test/vad-endpoint.test.mjs test/silero-vad.test.mts"
   },
   "dependencies": {
+    "@ricky0123/vad-node": "^0.0.3",
+    "onnxruntime-node": "^1.27.0",
+    "tsx": "^4.22.4",
     "ws": "^8.20.0"
   }
 }

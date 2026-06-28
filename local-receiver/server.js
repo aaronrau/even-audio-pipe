@@ -3,6 +3,8 @@ import { spawn } from 'node:child_process'
 import { appendFileSync, createWriteStream, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
+import { VadEndpoint } from './vad-endpoint.js'
+import { createSileroFrameVad } from './silero-vad.ts'
 
 const port = Number(process.env.PORT || 8788)
 const audioDir = process.env.AUDIO_DIR || process.env.OUT_DIR || 'recordings'
@@ -34,11 +36,24 @@ const bytesPerSecond = 16_000 * 2
 const segmentBytesLimit = segmentSeconds > 0 ? Math.floor(segmentSeconds * bytesPerSecond) : 0
 const chunkMode = (process.env.ASR_CHUNK_MODE || 'vad').toLowerCase()
 const useVad = chunkMode !== 'fixed'
-const vadThreshold = Number(process.env.VAD_THRESHOLD || 0.0018)
-const vadSilenceMs = Number(process.env.VAD_SILENCE_MS || 700)
-const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
+const vadBackend = String(process.env.VAD_BACKEND || 'silero').trim().toLowerCase()
+const vadFrameMs = Number(process.env.VAD_FRAME_MS || 30)
+const sileroVadFrameSamples = normalizeSileroFrameSamples(process.env.SILERO_VAD_FRAME_SAMPLES || 512)
+const vadFrameSamples = vadBackend === 'silero'
+  ? sileroVadFrameSamples
+  : Math.max(1, Math.floor((vadFrameMs / 1000) * 16_000))
+const vadFrameBytes = Math.max(2, vadFrameSamples * 2)
+const vadStartThreshold = Number(process.env.VAD_START_THRESHOLD || process.env.VAD_THRESHOLD || 0.006)
+const vadReleaseThreshold = Number(
+  process.env.VAD_RELEASE_THRESHOLD ||
+  Math.max(0.0025, vadStartThreshold * 0.55),
+)
+const vadSilenceMs = Number(process.env.VAD_SILENCE_MS || (vadBackend === 'silero' ? 240 : 700))
+const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || (vadBackend === 'silero' ? 60 : 250))
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
-const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
+const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || (vadBackend === 'silero' ? 250 : 700))
+const sileroVadModel = process.env.SILERO_VAD_MODEL || ''
+const sileroVadThreshold = Number(process.env.SILERO_VAD_THRESHOLD || 0.5)
 const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 3_000)
 const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
@@ -83,6 +98,10 @@ let runtimeConfigCache = {
 const audioSockets = new Set()
 const pendingWorkbenchAgents = new WeakMap()
 const transcriptQueues = new WeakMap()
+let sileroVad = null
+let sileroVadStartPromise = null
+let sileroVadUnavailable = false
+let sileroVadFallbackLogged = false
 
 const server = createServer((req, res) => {
   const url = new URL(req.url || '/', 'http://localhost')
@@ -528,25 +547,47 @@ async function maybePostToTerminal(text) {
 }
 
 async function maybePostToWorkbench(text, targetSocket, context = {}) {
-  if (!workbenchConfig.enabled || !text) return
+  if (!text) {
+    console.log('[workbench] skipped transcript: empty_transcript')
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: 'empty_transcript',
+      jobId: context.jobId,
+    })
+    return
+  }
+
+  if (!workbenchConfig.enabled) {
+    console.log('[workbench] skipped transcript: workbench_disabled')
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: 'workbench_disabled',
+      jobId: context.jobId,
+    })
+    return
+  }
 
   const baseUrl = workbenchConfig.url.replace(/\/$/, '')
   if (!baseUrl) {
     console.warn('[workbench] enabled but SPEECH_WORKBENCH_URL is empty')
+    console.log('[workbench] skipped transcript: workbench_unconfigured')
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: 'workbench_unconfigured',
+      jobId: context.jobId,
+    })
     return
   }
 
   const route = routeWorkbenchTranscript(text, targetSocket)
   if (route.skip) {
     console.log(`[workbench] skipped transcript: ${route.reason}`)
-    if (route.agent) {
-      sendSocketJson(targetSocket, {
-        type: 'agent_status',
-        status: route.reason,
-        agent: route.agent,
-        jobId: context.jobId,
-      })
-    }
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: route.reason,
+      agent: route.agent || '',
+      jobId: context.jobId,
+    })
     return
   }
 
@@ -562,6 +603,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     agent: route.agent || workbenchConfig.agent,
     jobId: context.jobId,
   })
+  console.log(`[workbench] sending transcript to ${baseUrl}/messages`)
 
   const controller = new AbortController()
   const timeoutMs = Number.isFinite(workbenchConfig.timeoutMs) ? workbenchConfig.timeoutMs : 15_000
@@ -1464,6 +1506,11 @@ function bufferDurationMs(buffer) {
   return (buffer.byteLength / bytesPerSecond) * 1000
 }
 
+function normalizeSileroFrameSamples(value) {
+  const frameSamples = Number(value)
+  return [512, 1024, 1536].includes(frameSamples) ? frameSamples : 512
+}
+
 function pcmRms(buffer) {
   const samples = Math.floor(buffer.byteLength / 2)
   if (!samples) return 0
@@ -1476,14 +1523,72 @@ function pcmRms(buffer) {
   return Math.sqrt(sumSquares / samples)
 }
 
-function pushPreRoll(preRoll, chunk, maxBytes) {
-  if (maxBytes <= 0) return
-  preRoll.buffers.push(chunk)
-  preRoll.bytes += chunk.byteLength
+function rmsVadDecision(frame, endpoint = null) {
+  const rms = pcmRms(frame)
+  const threshold = endpoint?.active ? vadReleaseThreshold : vadStartThreshold
 
-  while (preRoll.bytes > maxBytes && preRoll.buffers.length) {
-    const removed = preRoll.buffers.shift()
-    preRoll.bytes -= removed.byteLength
+  return {
+    speech: rms >= threshold,
+    backend: 'rms',
+    rms,
+  }
+}
+
+async function sileroVadDecision(frame, endpoint = null) {
+  if (vadBackend !== 'silero') {
+    return rmsVadDecision(frame, endpoint)
+  }
+
+  const vad = await getSileroVad()
+  if (!vad) {
+    return rmsVadDecision(frame, endpoint)
+  }
+
+  try {
+    return await vad.analyzeFrame(frame)
+  } catch (err) {
+    sileroVadUnavailable = true
+    if (!sileroVadFallbackLogged) {
+      sileroVadFallbackLogged = true
+      console.warn(`[audio] Silero VAD failed; falling back to RMS VAD: ${err.message}`)
+    }
+    return rmsVadDecision(frame, endpoint)
+  }
+}
+
+async function getSileroVad() {
+  if (sileroVadUnavailable) return null
+  if (sileroVad) return sileroVad
+  if (sileroVadStartPromise) return sileroVadStartPromise
+
+  sileroVadStartPromise = (async () => {
+    const nextVad = await createSileroFrameVad({
+      modelPath: sileroVadModel || undefined,
+      positiveSpeechThreshold: sileroVadThreshold,
+      negativeSpeechThreshold: sileroVadThreshold - 0.15,
+    })
+    sileroVad = nextVad
+    console.log('[audio] Silero VAD ready')
+    return nextVad
+  })().catch(err => {
+    sileroVadUnavailable = true
+    console.warn(`[audio] Silero VAD unavailable; falling back to RMS VAD: ${err.message}`)
+    return null
+  }).finally(() => {
+    sileroVadStartPromise = null
+  })
+
+  return sileroVadStartPromise
+}
+
+async function resetSileroVadState() {
+  const vad = await getSileroVad()
+  if (!vad) return
+
+  try {
+    vad.reset()
+  } catch (err) {
+    console.warn(`[audio] failed to reset Silero VAD state: ${err.message}`)
   }
 }
 
@@ -1496,8 +1601,25 @@ wss.on('connection', (socket, req) => {
   let chunks = 0
   let userAuthenticated = false
   let evenUser = null
-  const preRoll = { buffers: [], bytes: 0 }
   const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
+  let audioQueue = Promise.resolve()
+  const endpoint = useVad
+    ? new VadEndpoint({
+      bytesPerSecond,
+      frameBytes: vadFrameBytes,
+      preRollBytes,
+      maxBytes: segmentBytesLimit,
+      minSpeechMs: vadMinSpeechMs,
+      silenceMs: vadSilenceMs,
+      minUtteranceMs: vadMinUtteranceMs,
+      analyzeFrame: frame => sileroVadDecision(frame, endpoint),
+      onSegmentStart: openVadSegment,
+      onSegmentData: writeVadSegmentChunk,
+      onSpeechDetected: markVadDetected,
+      onActivity: () => markTranscriptQueueActivity(socket),
+      onSegmentEnd: finishVadSegment,
+    })
+    : null
 
   console.log(`[audio] connected from ${req.socket.remoteAddress}`)
   sendSocketJson(socket, {
@@ -1505,12 +1627,17 @@ wss.on('connection', (socket, req) => {
     status: 'connected',
     asrConfigured: Boolean(asrWorkerUrl || asrCommand),
     chunkMode: useVad ? 'vad' : 'fixed',
+    vadBackend: useVad ? vadBackend : 'off',
   })
 
   if (useVad) {
-    console.log(
-      `[audio] VAD chunking threshold=${vadThreshold} silence=${vadSilenceMs}ms max=${segmentSeconds}s`,
-    )
+    const backendDetail = vadBackend === 'silero'
+      ? `silero frameSamples=${vadFrameSamples} silence=${vadSilenceMs}ms minSpeech=${vadMinSpeechMs}ms`
+      : `rms start=${vadStartThreshold} release=${vadReleaseThreshold} silence=${vadSilenceMs}ms`
+    console.log(`[audio] VAD chunking backend=${backendDetail} max=${segmentSeconds}s`)
+    if (vadBackend === 'silero') {
+      audioQueue = audioQueue.then(() => resetSileroVadState())
+    }
   } else if (segmentBytesLimit) {
     console.log(`[audio] fixed recordings every ${segmentSeconds}s (${segmentBytesLimit} bytes)`)
   } else {
@@ -1573,7 +1700,13 @@ wss.on('connection', (socket, req) => {
     bytes += chunk.byteLength
 
     if (useVad) {
-      handleVadChunk(chunk)
+      audioQueue = audioQueue
+        .catch(() => {})
+        .then(() => endpoint.processChunk(chunk))
+        .catch(err => {
+          console.error(`[audio] VAD processing failed: ${err.message}`)
+          closeCurrentSegment('vad error')
+        })
     } else {
       const segment = getCurrentSegment()
       writeSegmentChunk(segment, chunk)
@@ -1586,15 +1719,23 @@ wss.on('connection', (socket, req) => {
 
   socket.on('close', () => {
     audioSockets.delete(socket)
-    closeCurrentSegment('socket close')
-    console.log(`[audio] closed: ${bytes} bytes total`)
+    audioQueue = audioQueue
+      .catch(() => {})
+      .then(() => {
+        if (endpoint) {
+          endpoint.flush('socket close')
+        } else {
+          closeCurrentSegment('socket close')
+        }
+        console.log(`[audio] closed: ${bytes} bytes total`)
+      })
   })
 
   socket.on('error', err => {
     console.error(`[audio] socket error: ${err.message}`)
   })
 
-  function getCurrentSegment() {
+  function getCurrentSegment(options = {}) {
     if (currentSegment) return currentSegment
 
     segmentIndex += 1
@@ -1608,59 +1749,56 @@ wss.on('connection', (socket, req) => {
       silenceMs: 0,
       durationMs: 0,
       hasSpeech: false,
+      vadDetectedSent: false,
     }
     markAudioSegmentStarted(socket)
+    if (useVad) {
+      markVadDetected(currentSegment, options.rms)
+    }
     console.log(`[audio] writing raw PCM to ${paths.pcm}`)
     return currentSegment
   }
 
-  function handleVadChunk(chunk) {
-    const rms = pcmRms(chunk)
-    const durationMs = bufferDurationMs(chunk)
-    const isSpeech = rms >= vadThreshold
-    let wroteCurrentChunk = false
+  function openVadSegment(segment) {
+    segmentIndex += 1
+    const paths = recordingPaths(connectionStamp, segmentIndex)
+    segment.paths = paths
+    segment.stream = createWriteStream(paths.pcm)
+    currentSegment = segment
+    markAudioSegmentStarted(socket)
+    console.log(`[audio] writing raw PCM to ${paths.pcm}`)
+  }
 
-    if (!currentSegment) {
-      if (!isSpeech) {
-        pushPreRoll(preRoll, chunk, preRollBytes)
-        return
-      }
+  function writeVadSegmentChunk(segment, chunk) {
+    segment.stream.write(chunk)
+  }
 
-      const segment = getCurrentSegment()
-      for (const buffered of preRoll.buffers) {
-        writeSegmentChunk(segment, buffered, { countChunk: false })
-      }
-      preRoll.buffers = []
-      preRoll.bytes = 0
+  function finishVadSegment(segment, reason) {
+    if (currentSegment === segment) {
+      currentSegment = null
     }
 
-    const segment = getCurrentSegment()
-    if (!wroteCurrentChunk) {
-      writeSegmentChunk(segment, chunk)
-    }
+    segment.stream.end(() => {
+      console.log(
+        `[audio] segment closed (${reason}): ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, speech=${segment.speechMs.toFixed(0)}ms silence=${segment.silenceMs.toFixed(0)}ms, file=${segment.paths.pcm}`,
+      )
+      enqueueRecording(segment.paths, segment.bytes, reason, socket, evenUser)
+      markAudioSegmentFinished(socket)
+    })
+  }
 
-    if (isSpeech) {
-      markTranscriptQueueActivity(socket)
-      segment.speechMs += durationMs
-      segment.silenceMs = 0
-      segment.hasSpeech = true
-    } else {
-      segment.silenceMs += durationMs
-    }
+  function markVadDetected(segment, decision = {}) {
+    if (!segment || segment.vadDetectedSent) return
 
-    if (segmentBytesLimit && segment.bytes >= segmentBytesLimit) {
-      closeCurrentSegment('max utterance')
-      return
-    }
-
-    if (
-      segment.hasSpeech &&
-      segment.speechMs >= vadMinSpeechMs &&
-      segment.durationMs >= vadMinUtteranceMs &&
-      segment.silenceMs >= vadSilenceMs
-    ) {
-      closeCurrentSegment('vad silence')
-    }
+    segment.vadDetectedSent = true
+    const rmsText = Number.isFinite(decision.rms) ? ` rms=${decision.rms.toFixed(4)}` : ''
+    const backendText = decision.backend ? ` backend=${decision.backend}` : ''
+    console.log(`[audio] VAD detected speech${backendText}${rmsText}`)
+    sendSocketJson(socket, {
+      type: 'asr_status',
+      status: 'vad_detected',
+      backend: decision.backend || vadBackend,
+    })
   }
 
   function writeSegmentChunk(segment, chunk, options = {}) {
@@ -1679,7 +1817,7 @@ wss.on('connection', (socket, req) => {
 
     segment.stream.end(() => {
       console.log(
-        `[audio] segment closed (${reason}): ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, file=${segment.paths.pcm}`,
+        `[audio] segment closed (${reason}): ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, speech=${segment.speechMs.toFixed(0)}ms silence=${segment.silenceMs.toFixed(0)}ms, file=${segment.paths.pcm}`,
       )
       enqueueRecording(segment.paths, segment.bytes, reason, socket, evenUser)
       markAudioSegmentFinished(socket)
@@ -1706,6 +1844,10 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Workbench summary auth: ${workbenchConfig.summaryToken ? 'enabled' : 'disabled'}`)
   console.log(`[server] Even user allowlist: ${startupUserAuthConfig.required ? 'enabled' : 'disabled'}`)
   console.log(`[server] Chunk mode: ${useVad ? 'vad' : 'fixed'}`)
+  console.log(`[server] VAD backend: ${useVad ? vadBackend : 'off'}`)
+  if (useVad) {
+    console.log(`[server] VAD frame: ${vadFrameSamples} samples (${vadFrameBytes} bytes), silence=${vadSilenceMs}ms, minSpeech=${vadMinSpeechMs}ms`)
+  }
   console.log(`[server] ASR max segment seconds: ${segmentSeconds > 0 ? segmentSeconds : 'off'}`)
   console.log(`[server] Transcript queue idle: ${(transcriptQueueIdleMs / 1000).toFixed(1)}s`)
   console.log(`[server] Transcript queue max hold: ${transcriptQueueMaxHoldMs > 0 ? `${(transcriptQueueMaxHoldMs / 1000).toFixed(1)}s` : 'disabled'}`)

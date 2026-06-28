@@ -217,6 +217,7 @@ groupedNavigator.open()
 groupedNavigator.setPendingTranscript('queued newest transcript')
 const queuedGroupSelected = groupedNavigator.scroll(1)
 assert.match(queuedGroupSelected.content.split('\n')[0], /^  Back \| Queued: queued newest transcript$/)
+assert.doesNotMatch(queuedGroupSelected.content, /[⧖⋈⦚]/)
 assert.doesNotMatch(queuedGroupSelected.content, /^> Queued:/m)
 const queuedGroupDetail = groupedNavigator.tap()
 assert.equal(queuedGroupDetail.mode, 'detail')
@@ -247,6 +248,7 @@ queuedBackNavigator.setPendingTranscript([
 ].join(' '))
 const queuedBackContent = queuedBackNavigator.content()
 assert.match(queuedBackContent.split('\n')[0], /^< Back \| Queued: .*\.{3}$/)
+assert.doesNotMatch(queuedBackContent, /[⧖⋈⦚]/)
 assert.doesNotMatch(queuedBackContent, /^> Queued:/m)
 assertViewportSafe(queuedBackContent)
 for (const line of queuedBackContent.split('\n').filter(line => line.includes('Queued:'))) {
@@ -255,6 +257,21 @@ for (const line of queuedBackContent.split('\n').filter(line => line.includes('Q
     `queued back row should reserve ellipsis guard width: ${line}`,
   )
 }
+
+const queuedBackNavigatorIgnoresWaitingFrame = new HistoryNavigator({
+  width: CANVAS_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  scrollOverlapLines: 1,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+queuedBackNavigatorIgnoresWaitingFrame.replaceEntries([{ label: 'Flux', text: 'latest', receivedAt: atMinute(0) }])
+queuedBackNavigatorIgnoresWaitingFrame.open()
+queuedBackNavigatorIgnoresWaitingFrame.setPendingTranscript('queued transcript now waiting', '⋈')
+const queuedWaitingContent = queuedBackNavigatorIgnoresWaitingFrame.content()
+const queuedWaitingRow = queuedWaitingContent.split('\n')[0]
+assert.match(queuedWaitingRow, /Queued: queued transcript now waiting/)
+assert.doesNotMatch(queuedWaitingRow, /[⧖⋈⦚]/)
 
 const pagingNavigator = new HistoryNavigator({
   width: CANVAS_WIDTH,

@@ -35,10 +35,10 @@ The current flow is:
 ```text
 G2 mic audio
   -> WebSocket receiver
-  -> VAD audio segment closes
+  -> Silero VAD audio segment closes
   -> ASR worker returns final text for that segment
   -> non-empty STT text is appended to the STT batch queue
-  -> 5 seconds with no newer STT text or VAD speech
+  -> 3 seconds with no newer STT text or VAD speech
   -> no active audio segment and no pending ASR job
   -> or transcriptQueue.maxHoldMs is reached
   -> queued raw text is combined
@@ -48,7 +48,12 @@ G2 mic audio
   -> cleaned text is evaluated by the workbench command queue
 ```
 
-The 5 second wait is based on the last non-empty STT result or later VAD speech
+VAD uses the Silero ONNX model from TypeScript/Node by default. Audio is sliced
+into recommended Silero frames, speech starts an utterance after the configured
+speech window, and about 240 ms of silence closes the segment.
+`ASR_SEGMENT_SECONDS` remains a hard safety cap for long utterances.
+
+The 3 second wait is based on the last non-empty STT result or later VAD speech
 activity. VAD silence and background audio below the speech threshold do not
 reset the timer. That wait only makes the queued text eligible to flush. The
 receiver still holds the queue if the same glasses connection has an open audio
@@ -81,7 +86,7 @@ Armed agent expires before a command is sent
   -> clear the armed agent after agentArmTimeoutMs
 ```
 
-This means `Pike update the heading` posts after the 5 second STT/VAD idle flush.
+This means `Pike update the heading` posts after the 3 second STT/VAD idle flush.
 `Pike` followed by `update the heading` also posts, but only if the second
 flushed transcript arrives before `agentArmTimeoutMs` expires. In both command
 cases, the workbench command queue is flushed when `/messages` succeeds. Ambient
@@ -107,7 +112,8 @@ speech-agent-workbench
 - Phone and computer on the same LAN, VPN, or tunnel-reachable network.
 
 The default ASR worker installs `onnx-asr[cpu,hub]`, `soundfile`, and `numpy`
-into `asr-worker/.venv` on first run. Model files are downloaded by `onnx-asr`
+into `asr-worker/.venv` on first run. VAD runs in the local receiver with
+TypeScript/Node dependencies. ASR model files are downloaded by `onnx-asr`
 according to its own cache behavior.
 
 ## Quick Start
@@ -173,6 +179,17 @@ Default config:
     "transcriptDir": "data/transcripts",
     "transcriptsLog": "data/transcripts/transcripts.log"
   },
+  "vad": {
+    "backend": "silero",
+    "model": "",
+    "threshold": 0.5,
+    "frameMs": 30,
+    "frameSamples": 512,
+    "speechMs": 60,
+    "silenceMs": 240,
+    "preRollMs": 500,
+    "minUtteranceMs": 250
+  },
   "workbench": {
     "enabled": false,
     "url": "http://127.0.0.1:8787",
@@ -192,7 +209,7 @@ Default config:
     "summaryToken": ""
   },
   "transcriptQueue": {
-    "idleMs": 5000,
+    "idleMs": 3000,
     "maxHoldMs": 10000
   },
   "transcriptCleanup": {
@@ -358,7 +375,7 @@ npm start
 
 Final ASR chunks are queued as raw transcript text before cleanup. Each new
 non-empty ASR result or later VAD speech activity resets `transcriptQueue.idleMs`;
-when no new STT transcript text or VAD speech arrives for 5 seconds by default
+when no new STT transcript text or VAD speech arrives for 3 seconds by default
 and no audio segment or ASR job is still active, the queued raw text is
 combined, sent through transcript cleanup once, then forwarded to the workbench.
 If noisy background keeps VAD active, `transcriptQueue.maxHoldMs` defaults to
@@ -456,11 +473,26 @@ from `/v1/models` for cleanup requests.
 
 ## Chunking
 
-By default, the receiver uses simple energy-based VAD to close utterance chunks:
+By default, the receiver uses Silero VAD in the local TypeScript/Node receiver
+to close utterance chunks:
 
 ```bash
 ASR_CHUNK_MODE=vad \
-VAD_THRESHOLD=0.0018 \
+VAD_BACKEND=silero \
+SILERO_VAD_FRAME_SAMPLES=512 \
+SILERO_VAD_THRESHOLD=0.5 \
+VAD_SILENCE_MS=240 \
+npm start
+```
+
+Use the RMS fallback explicitly when debugging or when the Node ONNX runtime is
+not available:
+
+```bash
+ASR_CHUNK_MODE=vad \
+VAD_BACKEND=rms \
+VAD_START_THRESHOLD=0.006 \
+VAD_RELEASE_THRESHOLD=0.0033 \
 VAD_SILENCE_MS=700 \
 npm start
 ```

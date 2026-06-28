@@ -42,6 +42,7 @@ let sentBytes = 0
 let droppedChunks = 0
 let transcriptText = ''
 let queuedTranscriptText = ''
+let speechDetected = false
 let glassesMode: GlassesMode = 'live'
 let historyTransitioning = false
 let historyUpdateInFlight = false
@@ -54,7 +55,8 @@ let ws: WebSocket | null = null
 let reconnectTimer: number | null = null
 let clearTranscriptTimer: number | null = null
 let spinnerTimer: number | null = null
-let spinnerIndex = 0
+let idleSpinnerIndex = 0
+let waitingSpinnerIndex = 0
 let unsubscribe: (() => void) | null = null
 let evenUserInfo: UserPayload | null = null
 
@@ -62,7 +64,8 @@ const GLASSES_LINE_WIDTH = 52
 const GLASSES_MAX_LINES = 7
 const GLASSES_TEXT_LIMIT = GLASSES_LINE_WIDTH * GLASSES_MAX_LINES
 const TRANSCRIPT_CLEAR_MS = 5_000
-const SPINNER_FRAMES = ['.', '..', '...', '..']
+const DOT_SPINNER_FRAMES = ['.', '..', '...', '..']
+const WAITING_FRAMES = ['|', '||', '|||', '||']
 const SPINNER_INTERVAL_MS = 650
 const HISTORY_TOGGLE_DEBOUNCE_MS = 700
 const HISTORY_SCROLL_DEBOUNCE_MS = 350
@@ -271,9 +274,23 @@ async function scrollHistoryWindow(direction: HistoryScrollDirection) {
 }
 
 function currentLiveGlassesContent() {
-  return transcriptText
-    ? formatGlassesTranscript(transcriptText)
-    : SPINNER_FRAMES[spinnerIndex]
+  if (isSpeechProcessingActive()) {
+    return currentWaitingFrame()
+  }
+  if (transcriptText) return formatGlassesTranscript(transcriptText)
+  return currentIdleFrame()
+}
+
+function currentIdleFrame() {
+  return DOT_SPINNER_FRAMES[idleSpinnerIndex % DOT_SPINNER_FRAMES.length]
+}
+
+function currentWaitingFrame() {
+  return WAITING_FRAMES[waitingSpinnerIndex % WAITING_FRAMES.length]
+}
+
+function isSpeechProcessingActive() {
+  return speechDetected || Boolean(queuedTranscriptText)
 }
 
 function makeStatusContainer(content: string, _isHistory: boolean) {
@@ -512,12 +529,39 @@ async function handleHistoryTap() {
   }
 }
 
-function appendTranscript(text: string, label = 'Message', detail = '') {
+function clearSpeechProcessingState() {
+  speechDetected = false
+  queuedTranscriptText = ''
+  waitingSpinnerIndex = 0
+  transcriptText = ''
+  transcriptEl.textContent = 'Listening...'
+  if (clearTranscriptTimer !== null) {
+    window.clearTimeout(clearTranscriptTimer)
+    clearTranscriptTimer = null
+  }
+  historyNavigator.clearPendingTranscript()
+  requestHistoryWindowUpdate()
+}
+
+function startSpeechProcessingState() {
+  if (!isSpeechProcessingActive()) {
+    waitingSpinnerIndex = 0
+  }
+  speechDetected = true
+}
+
+function appendTranscript(
+  text: string,
+  label = 'Message',
+  detail = '',
+  options: { clearProcessing?: boolean } = {},
+) {
   const normalized = normalizeInlineText(text)
   if (!normalized) return
 
-  queuedTranscriptText = ''
-  historyNavigator.clearPendingTranscript()
+  if (options.clearProcessing !== false) {
+    clearSpeechProcessingState()
+  }
   pushHistory(label, normalized, detail)
   transcriptText = takeTail(normalized, GLASSES_TEXT_LIMIT)
   transcriptEl.textContent = transcriptText
@@ -568,8 +612,19 @@ function startIdleSpinner() {
   if (spinnerTimer !== null) return
 
   spinnerTimer = window.setInterval(() => {
-    if (transcriptText) return
-    spinnerIndex = (spinnerIndex + 1) % SPINNER_FRAMES.length
+    if (isSpeechProcessingActive()) {
+      waitingSpinnerIndex = (waitingSpinnerIndex + 1) % WAITING_FRAMES.length
+    } else if (!transcriptText) {
+      idleSpinnerIndex = (idleSpinnerIndex + 1) % DOT_SPINNER_FRAMES.length
+    }
+    if (queuedTranscriptText) {
+      historyNavigator.setPendingTranscript(queuedTranscriptText)
+      if (isHistoryMode()) {
+        requestHistoryWindowUpdate()
+      }
+    }
+
+    if (transcriptText && !queuedTranscriptText && !speechDetected) return
     void renderGlassesStatus()
   }, SPINNER_INTERVAL_MS)
 }
@@ -602,7 +657,7 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'transcript' && typeof payload.text === 'string') {
-    appendTranscript(payload.text, 'You')
+    appendTranscript(payload.text, 'You', '', { clearProcessing: false })
     setUiStatus('Streaming G2 mic audio')
     return
   }
@@ -626,11 +681,13 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'agent_status' && payload.status === 'sent') {
+    clearSpeechProcessingState()
     setUiStatus('Waiting for agent summary...')
     return
   }
 
   if (payload.type === 'agent_status' && payload.status === 'agent_armed') {
+    clearSpeechProcessingState()
     const agent = typeof payload.agent === 'string' && payload.agent
       ? payload.agent
       : 'agent'
@@ -638,7 +695,22 @@ function handleReceiverMessage(raw: string) {
     return
   }
 
+  if (
+    payload.type === 'agent_status' &&
+    (
+      payload.status === 'missing_agent_prefix' ||
+      payload.status === 'empty_transcript' ||
+      payload.status === 'workbench_disabled' ||
+      payload.status === 'workbench_unconfigured'
+    )
+  ) {
+    clearSpeechProcessingState()
+    setUiStatus('Listening for speech...')
+    return
+  }
+
   if (payload.type === 'agent_error') {
+    clearSpeechProcessingState()
     const error = typeof payload.error === 'string' ? payload.error : 'Workbench error'
     appendTranscript(error, 'Error')
     setUiStatus('Workbench error')
@@ -646,11 +718,19 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'asr_status' && payload.status === 'transcribing') {
+    startSpeechProcessingState()
     setUiStatus('Transcribing speech...')
     return
   }
 
+  if (payload.type === 'asr_status' && payload.status === 'vad_detected') {
+    startSpeechProcessingState()
+    void renderGlassesStatus()
+    return
+  }
+
   if (payload.type === 'asr_status' && payload.status === 'queued') {
+    speechDetected = false
     const queuedText = typeof payload.queuedText === 'string'
       ? payload.queuedText
       : typeof payload.text === 'string'
@@ -664,6 +744,7 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'asr_status' && payload.status === 'cleaning') {
+    speechDetected = false
     const queuedText = typeof payload.queuedText === 'string'
       ? payload.queuedText
       : typeof payload.text === 'string'
@@ -677,9 +758,7 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'asr_status' && payload.status === 'no_transcript') {
-    queuedTranscriptText = ''
-    historyNavigator.clearPendingTranscript()
-    requestHistoryWindowUpdate()
+    clearSpeechProcessingState()
     setUiStatus('Listening for speech...')
     return
   }
@@ -962,6 +1041,7 @@ function connect() {
 
   ws.addEventListener('close', async () => {
     ws = null
+    clearSpeechProcessingState()
     await setAudio(false)
     if (!cleanedUp) {
       setUiStatus('Receiver disconnected, retrying...')
@@ -970,6 +1050,7 @@ function connect() {
   })
 
   ws.addEventListener('error', () => {
+    speechDetected = false
     setUiStatus('Receiver connection error')
   })
 }

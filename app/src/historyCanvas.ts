@@ -365,7 +365,7 @@ export class HistoryCanvas {
     const lines: string[] = []
     for (const [index, line] of lineObjects.entries()) {
       if (index === 0 && hasPageContinuation) {
-        lines.push(this.pageContinuationLines(
+        lines.push(...this.pageContinuationLines(
           line.contextPrefix,
           line.content,
           hasPageContinuationAbove,
