@@ -43,7 +43,8 @@ type HistoryVisualLine = {
 
 const DEFAULT_LINE_HEIGHT = 27
 const DEFAULT_MAX_CONTENT_LENGTH = 2000
-const ELLIPSIS = '...'
+const PAGE_CONTINUATION_ARROW = '↑'
+const PAGE_CONTINUATION_ARROW_DOWN = '↓'
 
 export function normalizeInlineText(text: string) {
   return text.replace(/\s+/g, ' ').trim()
@@ -350,21 +351,36 @@ export class HistoryCanvas {
     this.scrollTopLine = clamp(this.scrollTopLine, 0, this.maxScrollTop())
     this.pinnedToBottom = this.scrollTopLine >= this.maxScrollTop()
 
+    const hasPageContinuationAbove = this.showPageContinuation && this.scrollTopLine > 0
+    const hasPageContinuationBelow = this.showPageContinuation && this.scrollTopLine < this.maxScrollTop()
+    const hasPageContinuation = hasPageContinuationAbove || hasPageContinuationBelow
+    const pageLineCount = Math.max(
+      1,
+      this.visibleLineCount,
+    )
     const lineObjects = this.visualLines.slice(
       this.scrollTopLine,
-      this.scrollTopLine + this.visibleLineCount,
+      this.scrollTopLine + pageLineCount,
     )
-    const lines = lineObjects.map((line, index) => {
-      if (index === 0 && this.showPageContinuation && this.scrollTopLine > 0) {
-        return this.addPageContinuation(line.contextPrefix, line.content)
+    const lines: string[] = []
+    for (const [index, line] of lineObjects.entries()) {
+      if (index === 0 && hasPageContinuation) {
+        lines.push(this.pageContinuationLines(
+          line.contextPrefix,
+          line.content,
+          hasPageContinuationAbove,
+          hasPageContinuationBelow,
+        ))
+        continue
       }
 
       if (index > 0 || hasRenderedPrefix(line.content, line.contextPrefix)) {
-        return line.content
+        lines.push(line.content)
+        continue
       }
 
-      return this.addPageContext(line.contextPrefix, line.content)
-    })
+      lines.push(this.addPageContext(line.contextPrefix, line.content))
+    }
 
     while (lines.length > 1 && lines.join('\n').length > this.maxContentLength) {
       lines.pop()
@@ -377,16 +393,39 @@ export class HistoryCanvas {
     return lines.length ? lines : ['No messages']
   }
 
-  private addPageContinuation(prefix: string, content: string) {
-    if (prefix) {
-      const prefixContext = `${prefix}${ELLIPSIS}`
-      if (this.textFitsLine(prefixContext)) return prefixContext
+  private pageContinuationLines(
+    prefix: string,
+    content: string,
+    showUpArrow: boolean,
+    showDownArrow: boolean,
+  ) {
+    const header = this.pageContinuationHeader(prefix, showUpArrow, showDownArrow)
+    if (!prefix) return [content]
+    if (header === prefix) return [content]
+
+    let body = content
+    if (content.startsWith(`${prefix} `)) {
+      body = content.slice(prefix.length + 1)
+    } else if (content.startsWith(prefix)) {
+      body = content.slice(prefix.length)
     }
 
-    const candidate = `${ELLIPSIS}${content}`
-    if (this.textFitsLine(candidate)) return candidate
+    const withBody = body ? `${header} ${body}` : header
+    if (this.textFitsLine(withBody)) return [withBody]
 
-    return ELLIPSIS
+    const headerWithSpace = `${header}${body ? ' ' : ''}`.trim()
+    if (this.textFitsLine(headerWithSpace)) return [headerWithSpace]
+
+    const headerOnly = this.pageContinuationHeaderOnly(showUpArrow, showDownArrow)
+    if (this.textFitsLine(headerOnly)) return [headerOnly]
+
+    return [headerOnly]
+  }
+
+  private pageContinuationHeaderOnly(showUpArrow: boolean, showDownArrow: boolean) {
+    if (!showUpArrow && !showDownArrow) return ''
+
+    return `${showUpArrow ? PAGE_CONTINUATION_ARROW : ''}${showDownArrow ? PAGE_CONTINUATION_ARROW_DOWN : ''}`
   }
 
   private addPageContext(prefix: string, content: string) {
@@ -395,10 +434,18 @@ export class HistoryCanvas {
     const candidate = `${prefix} ${content}`
     if (this.textFitsLine(candidate)) return candidate
 
-    const contextOnly = `${prefix}${ELLIPSIS}`
-    if (this.textFitsLine(contextOnly)) return contextOnly
-
     return prefix
+  }
+
+  private pageContinuationHeader(prefix: string, showUpArrow: boolean, showDownArrow: boolean) {
+    if (!showUpArrow && !showDownArrow) return prefix
+
+    const arrowSuffix = `${showUpArrow ? PAGE_CONTINUATION_ARROW : ''}${showDownArrow ? PAGE_CONTINUATION_ARROW_DOWN : ''}`
+    const withSpace = `${prefix} ${arrowSuffix}`
+    const withNoSpace = `${prefix}${arrowSuffix}`
+    if (this.textFitsLine(withSpace)) return withSpace
+    if (this.textFitsLine(withNoSpace)) return withNoSpace
+    return arrowSuffix
   }
 
   private maxScrollTop() {

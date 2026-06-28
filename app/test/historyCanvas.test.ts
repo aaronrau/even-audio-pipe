@@ -114,6 +114,59 @@ assert.match(prefixLines[0], /^12:05 Agent first detail line/)
 assert.doesNotMatch(prefixLines[1], /^12:05 Agent/)
 assert.doesNotMatch(prefixLines[2], /^12:05 Agent/)
 
+const continuationCanvas = new HistoryCanvas({
+  width: HISTORY_WRAP_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: 3,
+  maxContentLength: MAX_CONTENT_LENGTH,
+  showPageContinuation: true,
+})
+continuationCanvas.replaceEntries([
+  entry(7, 'continuation check', [
+    'line one',
+    'line two',
+    'line three',
+    'line four',
+    'line five',
+  ].join('\n')),
+])
+const continuationLines = continuationCanvas.content().split('\n')
+assert.match(continuationLines[0], /^12:07 Agent ↑/)
+assert.match(continuationLines[1], /^line four$/)
+assert.match(continuationLines[2], /^line five$/)
+assert.doesNotMatch(continuationLines[0], /\.\.\.$/)
+
+const directionCanvas = new HistoryCanvas({
+  width: HISTORY_WRAP_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: 4,
+  maxContentLength: MAX_CONTENT_LENGTH,
+  showPageContinuation: true,
+})
+directionCanvas.replaceEntries([
+  entry(0, 'first line'),
+  entry(1, 'second line'),
+  entry(2, 'third line'),
+  entry(3, 'fourth line'),
+  entry(4, 'fifth line'),
+  entry(5, 'sixth line'),
+  entry(6, 'seventh line'),
+  entry(7, 'eighth line'),
+])
+const bottomDirectionLines = directionCanvas.content().split('\n')
+assert.match(bottomDirectionLines[0], /↑/)
+assert.doesNotMatch(bottomDirectionLines[0], /↓/)
+
+const middleDirection = directionCanvas.scroll(-1)
+const middleDirectionLines = middleDirection.content.split('\n')
+assert.match(middleDirectionLines[0], /↑/)
+assert.match(middleDirectionLines[0], /↓/)
+
+const topDirection = directionCanvas.scroll(-1)
+const topDirectionLines = topDirection.content.split('\n')
+assert.match(topDirectionLines[0], /↓/)
+assert.doesNotMatch(topDirectionLines[0], /↑/)
+
 const cleanedTerminalOutput = normalizeHistoryBlock([
   ']0;terminal titleMMMMMMMMM',
   'real output lineMM',

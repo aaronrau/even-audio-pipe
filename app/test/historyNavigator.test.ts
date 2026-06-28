@@ -92,8 +92,10 @@ assertViewportSafe(selectedNewest.content)
 const detail = navigator.tap()
 assert.equal(detail.mode, 'detail')
 assert.doesNotMatch(detail.content, /Detailed Pike output line one\./)
-assert.match(detail.content.split('\n')[0], /^12:02 Pike\.\.\.$/)
+assert.match(detail.content.split('\n')[0], /^12:02 Pike ↑/)
+assert.match(detail.content.split('\n')[1], /^Detailed Pike output line/)
 assert.match(detail.content, /Detailed Pike output line twelve\./)
+assert.doesNotMatch(detail.content, /\.\.\./, 'detail should not inject paging ellipses')
 assert.equal(detail.debug.detail?.pinnedToBottom, true)
 assertViewportSafe(detail.content)
 
@@ -140,13 +142,15 @@ for (const line of transcriptSelected.split('\n').filter(line => line.endsWith('
 const transcriptDetail = navigator.tap()
 assert.equal(transcriptDetail.mode, 'detail')
 assert.match(transcriptDetail.content, /available in full when the transcript item is opened as detail/)
+assert.doesNotMatch(transcriptDetail.content, /\.\.\./, 'detail should not inject paging ellipses')
 assertViewportSafe(transcriptDetail.content)
 
 navigator.tap()
 navigator.setPendingTranscript('queued transcript text that has not been sent yet')
 const pendingList = navigator.content()
-assert.match(pendingList, /Queued: queued transcript text/)
+assert.match(pendingList.split('\n')[0], /^ {2}Back \| Queued: queued transcript text/)
 assertViewportSafe(pendingList)
+assert.doesNotMatch(pendingList, /^> Queued:/m)
 
 const groupedNavigator = new HistoryNavigator({
   width: CANVAS_WIDTH,
@@ -195,14 +199,15 @@ assert.doesNotMatch(newestGroupSelected.content, /^ {10,}newer transcript one$/m
 assert.doesNotMatch(newestGroupSelected.content, /^> 12:\d{2} (You|Flux|Pike|agent|The agent) /im)
 const newestGroupDetail = groupedNavigator.tap()
 assert.equal(newestGroupDetail.mode, 'detail')
-assert.match(newestGroupDetail.content.split('\n')[0], /^12:04 You\.\.\.$/)
+assert.match(newestGroupDetail.content.split('\n')[0], /^12:04 You ↑/)
+assert.match(newestGroupDetail.content.split('\n')[1], /^detail line /)
 assert.match(newestGroupDetail.content, /detail line twelve/)
 assert.doesNotMatch(newestGroupDetail.content, /older transcript one/)
 assert.doesNotMatch(newestGroupDetail.content, /agent detail/)
 assert.equal(newestGroupDetail.debug.detail?.pinnedToBottom, true)
 assertViewportSafe(newestGroupDetail.content)
 const newestGroupOlderPage = groupedNavigator.scroll(-1)
-assert.match(newestGroupOlderPage.content, /12:03 You newer transcript one/)
+assert.match(newestGroupOlderPage.content, /12:03 You .*newer transcript one/)
 assert.match(newestGroupOlderPage.content, /12:04 You Flux, newer transcript two/)
 assertViewportSafe(newestGroupOlderPage.content)
 
@@ -211,17 +216,45 @@ groupedNavigator.tap()
 groupedNavigator.open()
 groupedNavigator.setPendingTranscript('queued newest transcript')
 const queuedGroupSelected = groupedNavigator.scroll(1)
-assert.match(queuedGroupSelected.content, /^> Queued: queued newest transcript$/m)
+assert.match(queuedGroupSelected.content.split('\n')[0], /^  Back \| Queued: queued newest transcript$/)
+assert.doesNotMatch(queuedGroupSelected.content, /^> Queued:/m)
 const queuedGroupDetail = groupedNavigator.tap()
 assert.equal(queuedGroupDetail.mode, 'detail')
-assert.match(queuedGroupDetail.content.split('\n')[0], /^(12:04 You|Queued)\.\.\.$/)
-assert.match(queuedGroupDetail.content, /Queued queued newest transcript/)
+assert.match(queuedGroupDetail.content.split('\n')[0], /^12:04 You ↑/)
+assert.match(queuedGroupDetail.content.split('\n')[1], /^detail line /)
+assert.doesNotMatch(queuedGroupDetail.content, /\.\.\./, 'detail should not inject paging ellipses')
 assert.doesNotMatch(queuedGroupDetail.content, /older transcript one/)
 assertViewportSafe(queuedGroupDetail.content)
 const queuedGroupOlderPage = groupedNavigator.scroll(-1)
-assert.match(queuedGroupOlderPage.content, /12:03 You newer transcript one/)
+assert.match(queuedGroupOlderPage.content, /12:03 You .*newer transcript one/)
 assert.match(queuedGroupOlderPage.content, /12:04 You Flux, newer transcript two/)
 assertViewportSafe(queuedGroupOlderPage.content)
+
+const queuedBackNavigator = new HistoryNavigator({
+  width: CANVAS_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  scrollOverlapLines: 1,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+queuedBackNavigator.replaceEntries([
+  entry(0, 'Flux', 'short agent response'),
+])
+queuedBackNavigator.open()
+queuedBackNavigator.setPendingTranscript([
+  'this queued transcript is deliberately long enough to require truncation',
+  'on the same row as the back button without becoming a selectable item',
+].join(' '))
+const queuedBackContent = queuedBackNavigator.content()
+assert.match(queuedBackContent.split('\n')[0], /^< Back \| Queued: .*\.{3}$/)
+assert.doesNotMatch(queuedBackContent, /^> Queued:/m)
+assertViewportSafe(queuedBackContent)
+for (const line of queuedBackContent.split('\n').filter(line => line.includes('Queued:'))) {
+  assert.ok(
+    measureTextWrap(line, CANVAS_WIDTH - ELLIPSIS_GUARD_WIDTH).lineCount <= 1,
+    `queued back row should reserve ellipsis guard width: ${line}`,
+  )
+}
 
 const pagingNavigator = new HistoryNavigator({
   width: CANVAS_WIDTH,
