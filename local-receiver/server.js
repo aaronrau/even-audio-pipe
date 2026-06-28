@@ -39,11 +39,24 @@ const vadSilenceMs = Number(process.env.VAD_SILENCE_MS || 700)
 const vadMinSpeechMs = Number(process.env.VAD_MIN_SPEECH_MS || 250)
 const vadPreRollMs = Number(process.env.VAD_PRE_ROLL_MS || 500)
 const vadMinUtteranceMs = Number(process.env.VAD_MIN_UTTERANCE_MS || 700)
-const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 5_000)
+const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 3_000)
 const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const messageHistoryDirPath = resolve(process.env.MESSAGE_HISTORY_DIR || join(transcriptDirPath, 'message-history'))
-const messageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || 50)
+const messageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || 0)
+const summaryTextFields = ['text', 'summary', 'message', 'response']
+const detailTextFields = [
+  'detail',
+  'details',
+  'detail_response',
+  'detailResponse',
+  'detailed_response',
+  'detailedResponse',
+  'response_detail',
+  'responseDetail',
+  'detail response',
+  'detailed response',
+]
 const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
 const transcriptCleanupEnv = {
@@ -223,8 +236,8 @@ function broadcastSocketJson(payload) {
 function sanitizeMessageHistoryEntry(value) {
   if (!value || typeof value !== 'object') return null
 
-  const detail = normalizeTranscript(value.detail || value.details || '')
-  const text = normalizeTranscript(value.text || value.summary || value.message || detail)
+  const detail = normalizeTranscript(textFromFields(value, detailTextFields))
+  const text = normalizeTranscript(textFromFields(value, summaryTextFields) || detail)
   if (!text) return null
 
   const receivedAt = Number(value.receivedAt)
@@ -292,17 +305,15 @@ function readMessageHistoryFile(fileName) {
   }
 }
 
-function readMessageHistory(limit = messageHistoryLimit) {
-  const entries = []
-  const files = messageHistoryFiles()
-
-  for (let index = files.length - 1; index >= 0 && entries.length < limit; index -= 1) {
-    entries.push(...readMessageHistoryFile(files[index]))
-  }
+function readMessageHistory(limit = messageHistoryLimit, dateStamp = historyDateStamp()) {
+  const fileName = `${dateStamp}.jsonl`
+  const entries = messageHistoryFiles().includes(fileName)
+    ? readMessageHistoryFile(fileName)
+    : []
 
   return entries
     .sort((a, b) => a.receivedAt - b.receivedAt)
-    .slice(-limit)
+    .slice(limit > 0 ? -limit : 0)
 }
 
 function appendMessageHistory(entry) {
@@ -318,9 +329,13 @@ function appendMessageHistory(entry) {
 }
 
 function sendMessageHistory(socket) {
+  const date = historyDateStamp()
+  const entries = readMessageHistory(messageHistoryLimit, date)
+  console.log(`[history] sending ${entries.length} entries for ${date}`)
   sendSocketJson(socket, {
     type: 'message_history',
-    entries: readMessageHistory(),
+    date,
+    entries,
   })
 }
 
@@ -341,6 +356,14 @@ function normalizeTranscript(text) {
     .filter(Boolean)
     .join('\n')
     .trim()
+}
+
+function textFromFields(record, fields) {
+  for (const field of fields) {
+    const text = stringValue(record?.[field])
+    if (text) return text
+  }
+  return ''
 }
 
 function normalizeCommandText(text) {
@@ -444,8 +467,8 @@ async function handleWorkbenchSummary(req, res) {
   }
 
   const payload = await readJsonRequest(req)
-  const detail = normalizeTranscript(payload.detail || payload.details || '')
-  const summary = normalizeTranscript(payload.summary || payload.text || payload.message || detail)
+  const detail = normalizeTranscript(textFromFields(payload, detailTextFields))
+  const summary = normalizeTranscript(textFromFields(payload, summaryTextFields) || detail)
   if (!summary) {
     sendHttpJson(res, 400, { ok: false, error: 'missing_summary' })
     return
@@ -466,6 +489,7 @@ async function handleWorkbenchSummary(req, res) {
     text: summary,
     summary,
     detail,
+    detail_response: detail,
     agent,
     command,
     timestamp,
@@ -1470,7 +1494,6 @@ wss.on('connection', (socket, req) => {
   let segmentIndex = 0
   let bytes = 0
   let chunks = 0
-  let lastBytes = 0
   let userAuthenticated = false
   let evenUser = null
   const preRoll = { buffers: [], bytes: 0 }
@@ -1493,12 +1516,6 @@ wss.on('connection', (socket, req) => {
   } else {
     console.log('[audio] recording one file until the socket closes')
   }
-
-  const meter = setInterval(() => {
-    const delta = bytes - lastBytes
-    lastBytes = bytes
-    console.log(`[audio] ${chunks} chunks, ${bytes} bytes total, ${delta} B/s`)
-  }, 1000)
 
   socket.on('message', (data, isBinary) => {
     if (!isBinary) {
@@ -1534,6 +1551,8 @@ wss.on('connection', (socket, req) => {
           user: evenUser,
           restricted: auth.required,
         })
+      }
+      if (control?.type === 'get_message_history') {
         sendMessageHistory(socket)
       }
       return
@@ -1567,9 +1586,8 @@ wss.on('connection', (socket, req) => {
 
   socket.on('close', () => {
     audioSockets.delete(socket)
-    clearInterval(meter)
     closeCurrentSegment('socket close')
-    console.log(`[audio] closed: ${chunks} chunks, ${bytes} bytes total`)
+    console.log(`[audio] closed: ${bytes} bytes total`)
   })
 
   socket.on('error', err => {
@@ -1661,7 +1679,7 @@ wss.on('connection', (socket, req) => {
 
     segment.stream.end(() => {
       console.log(
-        `[audio] segment closed (${reason}): ${segment.chunks} chunks, ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, file=${segment.paths.pcm}`,
+        `[audio] segment closed (${reason}): ${segment.bytes} bytes, duration=${(segment.durationMs / 1000).toFixed(2)}s, file=${segment.paths.pcm}`,
       )
       enqueueRecording(segment.paths, segment.bytes, reason, socket, evenUser)
       markAudioSegmentFinished(socket)

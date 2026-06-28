@@ -4,10 +4,17 @@ import {
   CreateStartUpPageContainer,
   TextContainerUpgrade,
   OsEventTypeList,
-  RebuildPageContainer,
   EventSourceType,
   type EvenHubEvent,
 } from '@evenrealities/even_hub_sdk'
+import {
+  HistoryCanvas,
+  normalizeHistoryBlock,
+  normalizeInlineText,
+  type HistoryEntry,
+  type HistoryScrollDirection,
+} from './historyCanvas'
+import { historyScrollDirectionFromEventType } from './historyInput'
 
 const BASE_AUDIO_WS_URL = import.meta.env.VITE_AUDIO_WS_URL as string | undefined
 const AUDIO_WS_URL = withLaunchToken(BASE_AUDIO_WS_URL)
@@ -17,6 +24,11 @@ const statsEl = document.getElementById('stats')!
 const urlEl = document.getElementById('url')!
 const transcriptEl = document.getElementById('transcript')!
 
+function positiveNumber(value: string | undefined, fallback: number) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
 type UserPayload = {
   uid?: string
   name?: string
@@ -24,13 +36,6 @@ type UserPayload = {
 }
 
 type GlassesMode = 'live' | 'history'
-
-type HistoryEntry = {
-  label: string
-  text: string
-  detail?: string
-  receivedAt: number
-}
 
 let sentChunks = 0
 let sentBytes = 0
@@ -57,14 +62,44 @@ const GLASSES_TEXT_LIMIT = GLASSES_LINE_WIDTH * GLASSES_MAX_LINES
 const TRANSCRIPT_CLEAR_MS = 5_000
 const SPINNER_FRAMES = ['.', '..', '...', '..']
 const SPINNER_INTERVAL_MS = 650
-const HISTORY_LIMIT = 24
-const HISTORY_ENTRY_TEXT_LIMIT = 930
-const HISTORY_TEXT_LIMIT = 1000
 const HISTORY_TOGGLE_DEBOUNCE_MS = 700
+const HISTORY_SCROLL_DEBOUNCE_MS = 350
+const STATUS_CONTAINER_ID = 1
+const STATUS_CONTAINER_NAME = 'audio_status'
+const CANVAS_WIDTH = 576
+const CANVAS_HEIGHT = 288
+const CANVAS_PADDING = 0
+const CANVAS_BORDER_WIDTH = 0
+const HISTORY_VISIBLE_LINES = positiveNumber(import.meta.env.VITE_HISTORY_VISIBLE_LINES, 9)
+const HISTORY_WRAP_WIDTH = positiveNumber(import.meta.env.VITE_HISTORY_WRAP_WIDTH, CANVAS_WIDTH + 80)
+const TEXT_UPGRADE_LIMIT = 2000
 // Some host builds normalize ring clicks into source-less text events.
 const ALLOW_UNSOURCED_HISTORY_TOGGLE = true
+const SUMMARY_TEXT_FIELDS = ['text', 'summary', 'message', 'response'] as const
+const DETAIL_TEXT_FIELDS = [
+  'detail',
+  'details',
+  'detail_response',
+  'detailResponse',
+  'detailed_response',
+  'detailedResponse',
+  'response_detail',
+  'responseDetail',
+  'detail response',
+  'detailed response',
+] as const
 const messageHistory: HistoryEntry[] = []
 let lastHistoryToggleInputAt = 0
+let lastHistoryScrollInputAt = 0
+let statusRenderRevision = 0
+let statusRenderQueue: Promise<boolean> = Promise.resolve(true)
+const historyCanvas = new HistoryCanvas({
+  width: HISTORY_WRAP_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: HISTORY_VISIBLE_LINES,
+  scrollOverlapLines: 1,
+  maxContentLength: TEXT_UPGRADE_LIMIT,
+})
 
 function setUiStatus(text: string) {
   statusEl.textContent = text
@@ -110,6 +145,14 @@ function stringValue(value: unknown) {
   return String(value).trim()
 }
 
+function textFromFields(record: Record<string, unknown>, fields: readonly string[]) {
+  for (const field of fields) {
+    const text = stringValue(record[field])
+    if (text) return text
+  }
+  return ''
+}
+
 function sanitizeUserInfo(value: unknown): UserPayload | null {
   if (!value || typeof value !== 'object') return null
 
@@ -141,26 +184,21 @@ function takeTail(text: string, limit: number) {
   return text.slice(-limit).replace(/^\S*\s?/, '').trimStart()
 }
 
-function trimWithEllipsis(text: string, limit: number) {
-  if (text.length <= limit) return text
-  return `${text.slice(0, Math.max(0, limit - 3)).trimEnd()}...`
-}
-
 function sanitizeHistoryEntry(value: unknown): HistoryEntry | null {
   if (!value || typeof value !== 'object') return null
 
   const record = value as Record<string, unknown>
-  const detail = stringValue(record.detail).replace(/\s+/g, ' ').trim()
-  const text = stringValue(record.text || record.summary || detail).replace(/\s+/g, ' ').trim()
+  const detail = normalizeHistoryBlock(textFromFields(record, DETAIL_TEXT_FIELDS))
+  const text = normalizeInlineText(textFromFields(record, SUMMARY_TEXT_FIELDS) || detail)
   const receivedAt = Number(record.receivedAt)
   if (!text || !Number.isFinite(receivedAt)) return null
 
   const entry: HistoryEntry = {
     label: stringValue(record.label) || 'Message',
-    text: trimWithEllipsis(text, HISTORY_ENTRY_TEXT_LIMIT),
+    text,
     receivedAt,
   }
-  if (detail) entry.detail = trimWithEllipsis(detail, HISTORY_ENTRY_TEXT_LIMIT)
+  if (detail) entry.detail = detail
   return entry
 }
 
@@ -168,51 +206,41 @@ function replaceHistory(entries: HistoryEntry[]) {
   messageHistory.splice(
     0,
     messageHistory.length,
-    ...entries.slice(-HISTORY_LIMIT),
+    ...entries,
   )
+  historyCanvas.replaceEntries(messageHistory, true)
 }
 
 function pushHistory(label: string, text: string, detail = '') {
-  const normalized = text.replace(/\s+/g, ' ').trim()
+  const normalized = normalizeInlineText(text)
   if (!normalized) return
 
   const entry: HistoryEntry = {
     label,
-    text: trimWithEllipsis(normalized, HISTORY_ENTRY_TEXT_LIMIT),
+    text: normalized,
     receivedAt: Date.now(),
   }
-  const normalizedDetail = detail.replace(/\s+/g, ' ').trim()
+  const normalizedDetail = normalizeHistoryBlock(detail)
   if (normalizedDetail) {
-    entry.detail = trimWithEllipsis(normalizedDetail, HISTORY_ENTRY_TEXT_LIMIT)
+    entry.detail = normalizedDetail
   }
 
   messageHistory.push(entry)
-
-  if (messageHistory.length > HISTORY_LIMIT) {
-    messageHistory.splice(0, messageHistory.length - HISTORY_LIMIT)
-  }
+  historyCanvas.appendEntry(entry, true)
 }
 
-function formatHistoryTime(receivedAt: number) {
-  const date = new Date(receivedAt)
-  const hours = String(date.getHours()).padStart(2, '0')
-  const minutes = String(date.getMinutes()).padStart(2, '0')
-  return `${hours}:${minutes}`
-}
-
-function formatHistoryContent() {
-  const rows: string[] = []
-  if (queuedTranscriptText) {
-    rows.push(`Queued: ${trimWithEllipsis(queuedTranscriptText, HISTORY_ENTRY_TEXT_LIMIT)}`)
-  }
-
-  rows.push(...messageHistory
-    .slice()
-    .reverse()
-    .map(entry => `${formatHistoryTime(entry.receivedAt)} ${entry.detail || entry.text}`)
-  )
-
-  return trimWithEllipsis(rows.join('\n'), HISTORY_TEXT_LIMIT)
+function scrollHistoryWindow(direction: HistoryScrollDirection) {
+  const result = historyCanvas.scroll(direction)
+  sendControlDebug({
+    type: 'history_debug',
+    action: 'scrolled',
+    mode: glassesMode,
+    direction: direction > 0 ? 'newer' : 'older',
+    fromLineStart: result.previousTopLine + 1,
+    toLineStart: result.currentTopLine + 1,
+    ...historyCanvas.debug(result.content),
+  })
+  requestHistoryWindowUpdate()
 }
 
 function currentLiveGlassesContent() {
@@ -221,18 +249,18 @@ function currentLiveGlassesContent() {
     : SPINNER_FRAMES[spinnerIndex]
 }
 
-function makeStatusContainer(content: string, isHistory: boolean) {
+function makeStatusContainer(content: string, _isHistory: boolean) {
   return new TextContainerProperty({
     xPosition: 0,
     yPosition: 0,
-    width: 576,
-    height: 288,
-    borderWidth: isHistory ? 1 : 0,
+    width: CANVAS_WIDTH,
+    height: CANVAS_HEIGHT,
+    borderWidth: CANVAS_BORDER_WIDTH,
     borderColor: 15,
     borderRadius: 0,
-    paddingLength: 0,
-    containerID: 1,
-    containerName: 'audio_status',
+    paddingLength: CANVAS_PADDING,
+    containerID: STATUS_CONTAINER_ID,
+    containerName: STATUS_CONTAINER_NAME,
     content,
     isEventCapture: 1,
   })
@@ -242,6 +270,43 @@ function requestHistoryWindowUpdate() {
   if (glassesMode !== 'history') return
   historyUpdatePending = true
   void flushHistoryWindowUpdate()
+}
+
+function requestMessageHistory(reason: string) {
+  if (ws?.readyState !== WebSocket.OPEN) return
+  ws.send(JSON.stringify({
+    type: 'get_message_history',
+    reason,
+  }))
+}
+
+function sendControlDebug(payload: Record<string, unknown>) {
+  console.log('[even-control]', payload)
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload))
+  }
+}
+
+function upgradeStatusContainer(content: string) {
+  const revision = ++statusRenderRevision
+  const safeContent = content.slice(0, TEXT_UPGRADE_LIMIT)
+
+  statusRenderQueue = statusRenderQueue
+    .catch(() => false)
+    .then(async () => {
+      if (revision !== statusRenderRevision) return true
+      return bridge.textContainerUpgrade(
+        new TextContainerUpgrade({
+          containerID: STATUS_CONTAINER_ID,
+          containerName: STATUS_CONTAINER_NAME,
+          contentOffset: 0,
+          contentLength: 0,
+          content: safeContent,
+        }),
+      )
+    })
+
+  return statusRenderQueue
 }
 
 async function flushHistoryWindowUpdate() {
@@ -259,13 +324,7 @@ async function flushHistoryWindowUpdate() {
   try {
     while (historyUpdatePending && glassesMode === 'history' && !historyTransitioning) {
       historyUpdatePending = false
-      await bridge.textContainerUpgrade(
-        new TextContainerUpgrade({
-          containerID: 1,
-          containerName: 'audio_status',
-          content: formatHistoryContent(),
-        }),
-      )
+      await upgradeStatusContainer(historyCanvas.content())
     }
   } finally {
     historyUpdateInFlight = false
@@ -278,20 +337,28 @@ async function flushHistoryWindowUpdate() {
 async function showHistoryWindow() {
   const previousMode = glassesMode
   glassesMode = 'history'
+  requestMessageHistory('open_history')
+  historyCanvas.scrollToBottom()
+  const content = historyCanvas.content()
+  const rendered = await upgradeStatusContainer(content)
 
-  const rebuilt = await bridge.rebuildPageContainer(
-    new RebuildPageContainer({
-      containerTotalNum: 1,
-      textObject: [makeStatusContainer(formatHistoryContent(), true)],
-    }),
-  )
-
-  if (rebuilt) {
+  if (rendered) {
+    sendControlDebug({
+      type: 'history_debug',
+      action: 'opened',
+      mode: glassesMode,
+      ...historyCanvas.debug(content),
+    })
     requestHistoryWindowUpdate()
     return
   }
 
   glassesMode = previousMode
+  sendControlDebug({
+    type: 'history_debug',
+    action: 'open_failed',
+    mode: glassesMode,
+  })
   setUiStatus('History view failed')
 }
 
@@ -299,19 +366,24 @@ async function closeHistoryWindow() {
   const previousMode = glassesMode
   glassesMode = 'live'
 
-  const rebuilt = await bridge.rebuildPageContainer(
-    new RebuildPageContainer({
-      containerTotalNum: 1,
-      textObject: [makeStatusContainer(currentLiveGlassesContent(), false)],
-    }),
-  )
+  const rendered = await upgradeStatusContainer(currentLiveGlassesContent())
 
-  if (rebuilt) {
+  if (rendered) {
+    sendControlDebug({
+      type: 'history_debug',
+      action: 'closed',
+      mode: glassesMode,
+    })
     return
   }
 
   glassesMode = previousMode
   requestHistoryWindowUpdate()
+  sendControlDebug({
+    type: 'history_debug',
+    action: 'close_failed',
+    mode: glassesMode,
+  })
   console.warn('Failed to close history view')
 }
 
@@ -337,10 +409,11 @@ async function toggleHistoryWindow() {
 }
 
 function appendTranscript(text: string, label = 'Message', detail = '') {
-  const normalized = text.replace(/\s+/g, ' ').trim()
+  const normalized = normalizeInlineText(text)
   if (!normalized) return
 
   queuedTranscriptText = ''
+  historyCanvas.clearPendingTranscript(false)
   pushHistory(label, normalized, detail)
   transcriptText = takeTail(normalized, GLASSES_TEXT_LIMIT)
   transcriptEl.textContent = transcriptText
@@ -414,6 +487,12 @@ function handleReceiverMessage(raw: string) {
       .map(sanitizeHistoryEntry)
       .filter((entry): entry is HistoryEntry => entry !== null)
     replaceHistory(entries)
+    sendControlDebug({
+      type: 'history_debug',
+      action: 'loaded_history',
+      count: entries.length,
+      mode: glassesMode,
+    })
     requestHistoryWindowUpdate()
     return
   }
@@ -424,12 +503,15 @@ function handleReceiverMessage(raw: string) {
     return
   }
 
-  if (payload.type === 'agent_summary' && typeof payload.text === 'string') {
+  if (payload.type === 'agent_summary') {
+    const detail = normalizeHistoryBlock(textFromFields(payload, DETAIL_TEXT_FIELDS))
+    const summary = normalizeInlineText(textFromFields(payload, SUMMARY_TEXT_FIELDS) || detail)
+    if (!summary) return
+
     const agent = typeof payload.agent === 'string' && payload.agent
       ? payload.agent
       : 'Agent'
-    const detail = typeof payload.detail === 'string' ? payload.detail : ''
-    appendTranscript(payload.text, agent, detail)
+    appendTranscript(summary, agent, detail)
     setUiStatus('Agent summary received')
     return
   }
@@ -470,7 +552,8 @@ function handleReceiverMessage(raw: string) {
       : typeof payload.text === 'string'
         ? payload.text
         : ''
-    queuedTranscriptText = queuedText.replace(/\s+/g, ' ').trim()
+    queuedTranscriptText = normalizeInlineText(queuedText)
+    historyCanvas.setPendingTranscript(queuedTranscriptText, true)
     requestHistoryWindowUpdate()
     setUiStatus('Waiting for more speech...')
     return
@@ -482,7 +565,8 @@ function handleReceiverMessage(raw: string) {
       : typeof payload.text === 'string'
         ? payload.text
         : queuedTranscriptText
-    queuedTranscriptText = queuedText.replace(/\s+/g, ' ').trim()
+    queuedTranscriptText = normalizeInlineText(queuedText)
+    historyCanvas.setPendingTranscript(queuedTranscriptText, true)
     requestHistoryWindowUpdate()
     setUiStatus('Cleaning transcript...')
     return
@@ -490,6 +574,7 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'asr_status' && payload.status === 'no_transcript') {
     queuedTranscriptText = ''
+    historyCanvas.clearPendingTranscript(true)
     requestHistoryWindowUpdate()
     setUiStatus('Listening for speech...')
     return
@@ -583,10 +668,51 @@ function shouldHandleHistoryToggle(event: EvenHubEvent) {
   if (!isHistoryToggleInput(event)) return false
 
   const now = Date.now()
-  if (now - lastHistoryToggleInputAt < HISTORY_TOGGLE_DEBOUNCE_MS) return false
+  const sinceLastToggle = now - lastHistoryToggleInputAt
+  if (sinceLastToggle < HISTORY_TOGGLE_DEBOUNCE_MS) {
+    sendControlDebug({
+      type: 'history_debug',
+      action: 'ignored_duplicate',
+      mode: glassesMode,
+      sinceLastToggle,
+    })
+    return false
+  }
 
   lastHistoryToggleInputAt = now
+  sendControlDebug({
+    type: 'history_debug',
+    action: 'accepted_toggle',
+    fromMode: glassesMode,
+  })
   return true
+}
+
+function historyScrollDirection(event: EvenHubEvent): HistoryScrollDirection | null {
+  if (glassesMode !== 'history') return null
+  if (isHistoryToggleInput(event)) return null
+
+  return historyScrollDirectionFromEventType(getEventType(event))
+}
+
+function shouldHandleHistoryScroll(event: EvenHubEvent): HistoryScrollDirection | null {
+  const direction = historyScrollDirection(event)
+  if (direction === null) return null
+
+  const now = Date.now()
+  const sinceLastScroll = now - lastHistoryScrollInputAt
+  if (sinceLastScroll < HISTORY_SCROLL_DEBOUNCE_MS) {
+    sendControlDebug({
+      type: 'history_debug',
+      action: 'ignored_scroll_duplicate',
+      mode: glassesMode,
+      sinceLastScroll,
+    })
+    return null
+  }
+
+  lastHistoryScrollInputAt = now
+  return direction
 }
 
 function osEventTypeName(type: OsEventTypeList | undefined) {
@@ -670,13 +796,7 @@ if (created !== 0) {
 async function renderGlassesStatus() {
   if (glassesMode !== 'live') return
 
-  await bridge.textContainerUpgrade(
-    new TextContainerUpgrade({
-      containerID: 1,
-      containerName: 'audio_status',
-      content: currentLiveGlassesContent(),
-    }),
-  )
+  await upgradeStatusContainer(currentLiveGlassesContent())
 }
 
 async function setAudio(open: boolean) {
@@ -783,9 +903,18 @@ unsubscribe = bridge.onEvenHubEvent(event => {
   }
 
   const inputType = getEventType(event)
+  if (inputType === OsEventTypeList.SYSTEM_EXIT_EVENT) {
+    return
+  }
+
   logInputEvent(event)
 
   if (inputType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+    if (glassesMode === 'history') {
+      void closeHistoryWindow()
+      return
+    }
+
     void bridge.shutDownPageContainer(1)
     return
   }
@@ -795,7 +924,9 @@ unsubscribe = bridge.onEvenHubEvent(event => {
     return
   }
 
-  if (inputType === OsEventTypeList.SYSTEM_EXIT_EVENT) {
+  const historyScroll = shouldHandleHistoryScroll(event)
+  if (historyScroll !== null) {
+    scrollHistoryWindow(historyScroll)
     return
   }
 

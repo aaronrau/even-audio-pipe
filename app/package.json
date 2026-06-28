@@ -8,14 +8,18 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "pack": "evenhub pack",
+    "test:history": "tsx test/historyCanvas.test.ts",
+    "test:history:current": "tsx test/historyCurrentData.test.ts",
     "simulate": "evenhub-simulator http://localhost:5173"
   },
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "^0.0.10"
+    "@evenrealities/even_hub_sdk": "^0.0.10",
+    "@evenrealities/pretext": "^0.1.4"
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.1.12",
     "@evenrealities/evenhub-simulator": "^0.7.2",
+    "tsx": "^4.22.4",
     "typescript": "^5.7.0",
     "vite": "^8.0.16"
   }
