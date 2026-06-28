@@ -35,6 +35,7 @@ export type HistoryNavigatorDebug = {
   selectedRow: number
   selectedItemId: string | null
   listTopRow: number
+  listTopLine: number
   visibleLines: number
   contentLength: number
   detail?: ReturnType<HistoryCanvas['debug']>
@@ -54,14 +55,32 @@ type HistoryItem = {
   label: string
   listText: string
   detailText: string
+  detailEntries: HistoryEntry[]
   receivedAt: number
+}
+
+type ListRow = {
+  id: string | null
+  bodyLines: string[]
+  selected: boolean
+  seen: boolean
+}
+
+type ListVisualLine = {
+  id: string | null
+  content: string
+  isFirstLine: boolean
 }
 
 const BACK_ROW_ID = null
 const SELECTED_MARKER = '> '
+const SEEN_SELECTED_MARKER = '< '
 const UNSELECTED_MARKER = '  '
 const ELLIPSIS = '...'
-const ELLIPSIS_GUARD_WIDTH = 24
+const ELLIPSIS_GUARD_WIDTH = 40
+const CONTINUATION_INDENT = '          '
+const CONTINUATION_INDENT_GUARD_WIDTH = 96
+const DEFAULT_AGENT_LABELS = ['Flux', 'Brock', 'Pike', 'Wolf']
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
@@ -110,7 +129,47 @@ function stripLeadingLabel(text: string, label: string) {
   if (!normalizedLabel) return text
 
   return text
-    .replace(new RegExp(`^${escapedRegExp(normalizedLabel)}\\s*[:\\-]?\\s+`, 'i'), '')
+    .replace(new RegExp(`^(?:hey|hi|ok|okay)?\\s*${escapedRegExp(normalizedLabel)}\\s*[:,.\\-]?\\s+`, 'i'), '')
+    .trim()
+}
+
+function isTranscriptLike(item: HistoryItem) {
+  return item.kind === 'transcript' || item.kind === 'queued'
+}
+
+function uniqueLabels(labels: string[]) {
+  return Array.from(new Set(
+    labels
+      .map(label => label.trim())
+      .filter(Boolean),
+  ))
+}
+
+function stripLeadingLabels(text: string, labels: string[]) {
+  return uniqueLabels(labels)
+    .sort((a, b) => b.length - a.length)
+    .reduce((current, label) => stripLeadingLabel(current, label), text)
+}
+
+function stripLeadingAgentIntro(text: string, label: string) {
+  const normalizedLabel = label.trim()
+  let cleaned = text.trim()
+
+  if (normalizedLabel) {
+    const labelAgent = escapedRegExp(normalizedLabel)
+    cleaned = cleaned
+      .replace(new RegExp(`^the\\s+${labelAgent}\\s+agent\\s+(?:is|has|will|can|was|were|did|does|pulled|updated|created|completed|finished|started)\\s+`, 'i'), '')
+      .replace(new RegExp(`^${labelAgent}\\s+agent\\s+(?:is|has|will|can|was|were|did|does|pulled|updated|created|completed|finished|started)\\s+`, 'i'), '')
+      .replace(new RegExp(`^the\\s+${labelAgent}\\s+agent\\s+`, 'i'), '')
+      .replace(new RegExp(`^${labelAgent}\\s+agent\\s+`, 'i'), '')
+      .trim()
+  }
+
+  return cleaned
+    .replace(/^the\s+agent\s+(?:is|has|will|can|was|were|did|does|pulled|updated|created|completed|finished|started)\s+/i, '')
+    .replace(/^agent\s+(?:is|has|will|can|was|were|did|does|pulled|updated|created|completed|finished|started)\s+/i, '')
+    .replace(/^the\s+agent\s+/i, '')
+    .replace(/^agent\s+/i, '')
     .trim()
 }
 
@@ -125,7 +184,7 @@ export class HistoryNavigator {
   private mode: HistoryNavigatorMode = 'closed'
   private selectedItemId: string | null = BACK_ROW_ID
   private seenDetailIds = new Set<string>()
-  private listTopRow = 0
+  private listTopLine = 0
 
   constructor(options: HistoryNavigatorOptions) {
     this.width = options.width
@@ -137,6 +196,7 @@ export class HistoryNavigator {
       visibleLineCount: options.visibleLineCount,
       scrollOverlapLines: options.scrollOverlapLines,
       maxContentLength: options.maxContentLength,
+      showPageContinuation: true,
     })
   }
 
@@ -152,14 +212,14 @@ export class HistoryNavigator {
     this.mode = 'list'
     this.selectedItemId = BACK_ROW_ID
     this.seenDetailIds.clear()
-    this.listTopRow = 0
+    this.listTopLine = 0
     return this.result('opened')
   }
 
   close(action: HistoryNavigatorAction = 'closed_back'): HistoryNavigatorResult {
     this.mode = 'closed'
     this.selectedItemId = BACK_ROW_ID
-    this.listTopRow = 0
+    this.listTopLine = 0
     return this.result(action)
   }
 
@@ -257,7 +317,8 @@ export class HistoryNavigator {
       itemCount: this.currentItems().length,
       selectedRow: this.selectedRow(),
       selectedItemId: this.selectedItemId,
-      listTopRow: this.listTopRow,
+      listTopRow: this.listTopLine,
+      listTopLine: this.listTopLine,
       visibleLines: content ? content.split('\n').length : 0,
       contentLength: content.length,
       detail,
@@ -287,23 +348,85 @@ export class HistoryNavigator {
         label: 'Queued',
         listText: this.pendingTranscript,
         detailText: this.pendingTranscript,
+        detailEntries: [{
+          id: 'queued',
+          label: 'Queued',
+          text: this.pendingTranscript,
+          receivedAt: this.pendingReceivedAt,
+        }],
         receivedAt: this.pendingReceivedAt,
       })
     }
 
-    return items
+    return this.groupAdjacentTranscripts(items)
   }
 
   private entryItem(entry: HistoryEntry, index: number): HistoryItem {
     const detailText = normalizeHistoryBlock(entry.detail || entry.text)
     const listText = normalizeInlineText(entry.text || detailText)
+    const id = entryBaseId(entry, index)
+    const detailEntry: HistoryEntry = {
+      id,
+      label: entry.label,
+      text: listText,
+      receivedAt: entry.receivedAt,
+    }
+    if (detailText) detailEntry.detail = detailText
+
     return {
-      id: entryBaseId(entry, index),
+      id,
       kind: entryKind(entry),
       label: entry.label,
       listText,
       detailText: detailText || listText,
+      detailEntries: [detailEntry],
       receivedAt: entry.receivedAt,
+    }
+  }
+
+  private groupAdjacentTranscripts(items: HistoryItem[]) {
+    const groupedItems: HistoryItem[] = []
+
+    for (let index = 0; index < items.length;) {
+      const item = items[index]
+      if (!item || !isTranscriptLike(item)) {
+        if (item) groupedItems.push(item)
+        index += 1
+        continue
+      }
+
+      const group: HistoryItem[] = []
+      while (index < items.length && isTranscriptLike(items[index])) {
+        group.push(items[index])
+        index += 1
+      }
+
+      groupedItems.push(this.transcriptGroupItem(group))
+    }
+
+    return groupedItems
+  }
+
+  private transcriptGroupItem(group: HistoryItem[]) {
+    const newest = group[0]
+    const oldest = group[group.length - 1]
+    if (!newest || !oldest || group.length === 1) return newest
+
+    const detailEntries = group
+      .slice()
+      .reverse()
+      .flatMap(item => item.detailEntries)
+
+    return {
+      id: `transcripts:${newest.id}:${oldest.id}:${group.length}`,
+      kind: newest.kind,
+      label: newest.label,
+      listText: newest.listText,
+      detailText: detailEntries
+        .map(entry => entry.detail || entry.text)
+        .join('\n'),
+      detailEntries,
+      receivedAt: newest.receivedAt,
     }
   }
 
@@ -356,81 +479,173 @@ export class HistoryNavigator {
 
   private openDetail(item: HistoryItem, resetScroll = true) {
     this.mode = 'detail'
-    this.detailCanvas.replaceEntries([
-      {
-        id: item.id,
-        label: item.label,
-        text: item.listText,
-        detail: item.detailText,
-        receivedAt: item.receivedAt,
-      },
-    ], false)
-    if (resetScroll) this.detailCanvas.scrollToTop()
+    this.detailCanvas.replaceEntries(item.detailEntries, false)
+    if (resetScroll) this.detailCanvas.scrollToBottom()
   }
 
   private listContent() {
     const rows = this.listRows()
-    this.ensureSelectedVisible(rows.length)
-    const visibleRows = rows.slice(
-      this.listTopRow,
-      this.listTopRow + this.visibleLineCount,
-    )
-    const lines = visibleRows.map(row => this.formatListRow(row))
+    const visualLines = this.listVisualLines(rows)
+    this.ensureSelectedVisible(visualLines)
+    const lines = visualLines
+      .slice(this.listTopLine, this.listTopLine + this.visibleLineCount)
+      .map(line => line.content)
 
     while (lines.length > 1 && lines.join('\n').length > this.maxContentLength) {
       lines.pop()
     }
 
     return lines.length ? lines.join('\n') : this.formatListRow({
-      body: 'Back',
+      bodyLines: ['Back'],
       selected: true,
-    })
+      seen: true,
+      id: BACK_ROW_ID,
+    }).map(line => line.content).join('\n')
   }
 
   private listRows() {
-    const rows: Array<{ id: string | null; body: string; selected: boolean }> = [{
+    const rows: ListRow[] = [{
       id: BACK_ROW_ID,
-      body: 'Back',
+      bodyLines: ['Back'],
       selected: this.selectedItemId === BACK_ROW_ID,
+      seen: true,
     }]
 
     for (const item of this.currentItems()) {
       rows.push({
         id: item.id,
-        body: this.itemListBody(item),
+        bodyLines: this.itemListBodyLines(item),
         selected: this.selectedItemId === item.id,
+        seen: this.seenDetailIds.has(item.id),
       })
     }
 
     return rows
   }
 
-  private itemListBody(item: HistoryItem) {
-    if (item.kind === 'queued') {
-      return `Queued: ${item.listText}`
-    }
-
-    const listText = stripLeadingLabel(item.listText, item.label)
-    return `${formatHistoryTime(item.receivedAt)} ${item.label} ${listText}`
+  private listVisualLines(rows = this.listRows()): ListVisualLine[] {
+    return rows.flatMap(row => this.formatListRow(row))
   }
 
-  private formatListRow(row: { body: string; selected: boolean }) {
-    const marker = row.selected ? SELECTED_MARKER : UNSELECTED_MARKER
-    const body = normalizeInlineText(row.body)
+  private itemListBodyLines(item: HistoryItem) {
+    if (item.kind === 'queued') {
+      return [`Queued: ${item.listText}`]
+    }
+
+    const listText = this.listPreviewText(item)
+    if (item.kind === 'agent' || item.kind === 'error') {
+      return this.agentListBodyLines(item, listText)
+    }
+
+    return [`${formatHistoryTime(item.receivedAt)} ${listText}`]
+  }
+
+  private agentListBodyLines(item: HistoryItem, listText: string) {
+    const prefix = `${formatHistoryTime(item.receivedAt)} ${item.label}`
+    const fullBody = `${prefix} ${listText}`
+    if (this.textFitsLine(`${SELECTED_MARKER}${fullBody}`)) {
+      return [fullBody]
+    }
+
+    const split = this.splitIndentedPreview(prefix, listText)
+    return split.remaining
+      ? [`${prefix} ${split.first}`, split.remaining]
+      : [`${prefix} ${split.first}`]
+  }
+
+  private splitIndentedPreview(prefix: string, text: string) {
+    const normalized = normalizeInlineText(text)
+    const chars = Array.from(normalized)
+    let low = 1
+    let high = chars.length
+    let best = ''
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2)
+      const candidate = this.trimPreviewBody(chars.slice(0, mid).join(''))
+      if (candidate && this.textFitsLine(`${SELECTED_MARKER}${prefix} ${candidate}`)) {
+        best = candidate
+        low = mid + 1
+      } else {
+        high = mid - 1
+      }
+    }
+
+    if (!best) {
+      const [first = '', ...rest] = normalized.split(' ')
+      return {
+        first,
+        remaining: rest.join(' '),
+      }
+    }
+
+    return {
+      first: best,
+      remaining: normalized.slice(best.length).trimStart(),
+    }
+  }
+
+  private listPreviewText(item: HistoryItem, text = item.listText) {
+    const agentLabels = this.agentLabels()
+    const labelsToStrip = isTranscriptLike(item)
+      ? [item.label, ...agentLabels]
+      : [item.label]
+    const withoutLabels = stripLeadingLabels(text, labelsToStrip)
+
+    if (item.kind === 'agent') {
+      return stripLeadingAgentIntro(withoutLabels, item.label)
+    }
+
+    return withoutLabels
+  }
+
+  private agentLabels() {
+    return uniqueLabels([
+      ...DEFAULT_AGENT_LABELS,
+      ...this.entries
+        .filter(entry => entryKind(entry) === 'agent')
+        .map(entry => entry.label),
+    ])
+  }
+
+  private formatListRow(row: ListRow): ListVisualLine[] {
+    const marker = row.selected
+      ? row.seen ? SEEN_SELECTED_MARKER : SELECTED_MARKER
+      : UNSELECTED_MARKER
+    return row.bodyLines.map((body, index) => ({
+      id: row.id,
+      content: this.formatListLine(
+        body,
+        index === 0 ? marker : `${UNSELECTED_MARKER}${CONTINUATION_INDENT}`,
+        index > 0,
+      ),
+      isFirstLine: index === 0,
+    }))
+  }
+
+  private formatListLine(bodyText: string, marker: string, isContinuation = false) {
+    const body = normalizeInlineText(bodyText)
     const full = `${marker}${body}`
-    if (this.textFitsLine(full)) return full
+    if (!isContinuation && this.textFitsLine(full)) return full
 
     const chars = Array.from(body)
     let low = 0
     let high = chars.length
     let bestBody = ''
-    const previewWidth = Math.max(1, this.width - ELLIPSIS_GUARD_WIDTH)
+    const previewWidth = Math.max(
+      1,
+      this.width - ELLIPSIS_GUARD_WIDTH - (isContinuation ? CONTINUATION_INDENT_GUARD_WIDTH : 0),
+    )
 
     while (low <= high) {
       const mid = Math.floor((low + high) / 2)
       const candidateBody = this.trimPreviewBody(chars.slice(0, mid).join(''))
       const candidate = `${marker}${candidateBody}${ELLIPSIS}`
-      if (candidateBody && this.textFitsLine(candidate, previewWidth)) {
+      if (
+        candidateBody
+        && this.textFitsLine(candidate)
+        && this.textFitsLine(candidate, previewWidth)
+      ) {
         bestBody = candidateBody
         low = mid + 1
       } else {
@@ -457,16 +672,77 @@ export class HistoryNavigator {
     return trimmed
   }
 
-  private ensureSelectedVisible(rowCount = this.currentItems().length + 1) {
-    const maxTopRow = Math.max(0, rowCount - this.visibleLineCount)
-    const selectedRow = this.selectedRow()
-    if (selectedRow < this.listTopRow) {
-      this.listTopRow = selectedRow
-    } else if (selectedRow >= this.listTopRow + this.visibleLineCount) {
-      this.listTopRow = selectedRow - this.visibleLineCount + 1
+  private ensureSelectedVisible(visualLines = this.listVisualLines()) {
+    const maxTopLine = Math.max(0, visualLines.length - this.visibleLineCount)
+    const selectedStart = visualLines.findIndex(line => line.id === this.selectedItemId)
+    if (selectedStart < 0) {
+      this.listTopLine = this.normalizeListTopLine(this.listTopLine, visualLines, maxTopLine)
+      return
     }
 
-    this.listTopRow = clamp(this.listTopRow, 0, maxTopRow)
+    let selectedEnd = selectedStart
+    while (
+      selectedEnd + 1 < visualLines.length
+      && visualLines[selectedEnd + 1]?.id === this.selectedItemId
+    ) {
+      selectedEnd += 1
+    }
+
+    if (selectedStart < this.listTopLine) {
+      this.listTopLine = selectedStart
+    } else if (selectedEnd >= this.listTopLine + this.visibleLineCount) {
+      this.listTopLine = selectedEnd - this.visibleLineCount + 1
+    }
+
+    this.listTopLine = this.normalizeListTopLine(
+      this.listTopLine,
+      visualLines,
+      maxTopLine,
+      selectedStart,
+      selectedEnd,
+    )
+  }
+
+  private normalizeListTopLine(
+    requestedTopLine: number,
+    visualLines: ListVisualLine[],
+    maxTopLine = Math.max(0, visualLines.length - this.visibleLineCount),
+    selectedStart?: number,
+    selectedEnd?: number,
+  ) {
+    let topLine = clamp(requestedTopLine, 0, maxTopLine)
+    if (visualLines[topLine]?.isFirstLine !== false) {
+      return topLine
+    }
+
+    let previousFirst = topLine
+    while (
+      previousFirst > 0
+      && visualLines[previousFirst]
+      && !visualLines[previousFirst].isFirstLine
+    ) {
+      previousFirst -= 1
+    }
+
+    let nextFirst = topLine
+    while (
+      nextFirst < visualLines.length - 1
+      && visualLines[nextFirst]
+      && !visualLines[nextFirst].isFirstLine
+    ) {
+      nextFirst += 1
+    }
+
+    const previousKeepsSelection = selectedEnd === undefined
+      || selectedEnd < previousFirst + this.visibleLineCount
+    const nextKeepsSelection = selectedStart === undefined
+      || nextFirst <= selectedStart
+
+    if (!previousKeepsSelection && nextKeepsSelection && nextFirst <= maxTopLine) {
+      return nextFirst
+    }
+
+    return previousFirst
   }
 
   private textFitsLine(text: string, width = this.width) {

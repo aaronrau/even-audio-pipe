@@ -9,7 +9,7 @@ const CANVAS_HEIGHT = 288
 const HISTORY_WRAP_WIDTH = CANVAS_WIDTH
 const VISIBLE_LINES = 9
 const MAX_CONTENT_LENGTH = 2000
-const ELLIPSIS_GUARD_WIDTH = 24
+const ELLIPSIS_GUARD_WIDTH = 40
 const DETAIL_TEXT_FIELDS = [
   'detail',
   'details',
@@ -79,11 +79,19 @@ function assertAllPagesSafe(canvas: HistoryCanvas) {
 function assertNavigatorSafe(navigator: HistoryNavigator) {
   let result = navigator.open()
   assertViewportSafe(result.content)
-  assert.match(result.content.split('\n')[0], /^> Back$/)
+  assert.match(result.content.split('\n')[0], /^< Back$/)
 
   for (let index = 0; index < entries.length; index += 1) {
     result = navigator.scroll(1)
     assertViewportSafe(result.content)
+    const selectedCursorLines = result.content
+      .split('\n')
+      .filter(line => line.startsWith('> ') || (line.startsWith('< ') && !line.startsWith('< Back')))
+    assert.equal(
+      selectedCursorLines.length,
+      1,
+      `selected cursor should be visible exactly once at scroll index ${index}:\n${result.content}`,
+    )
 
     if (index < 5) {
       const detail = navigator.tap()

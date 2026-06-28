@@ -28,6 +28,7 @@ type HistoryCanvasOptions = {
   visibleLineCount?: number
   scrollOverlapLines?: number
   maxContentLength?: number
+  showPageContinuation?: boolean
 }
 
 type HistoryLogicalLine = {
@@ -111,6 +112,7 @@ export class HistoryCanvas {
   private readonly visibleLineCount: number
   private readonly scrollStepLines: number
   private readonly maxContentLength: number
+  private readonly showPageContinuation: boolean
   private entries: HistoryEntry[] = []
   private pendingTranscript = ''
   private visualLines: HistoryVisualLine[] = [{ content: 'No messages', contextPrefix: '' }]
@@ -131,6 +133,7 @@ export class HistoryCanvas {
       this.visibleLineCount - (options.scrollOverlapLines ?? 1),
     )
     this.maxContentLength = options.maxContentLength ?? DEFAULT_MAX_CONTENT_LENGTH
+    this.showPageContinuation = options.showPageContinuation ?? false
   }
 
   replaceEntries(entries: HistoryEntry[], anchorToBottom = true) {
@@ -352,6 +355,10 @@ export class HistoryCanvas {
       this.scrollTopLine + this.visibleLineCount,
     )
     const lines = lineObjects.map((line, index) => {
+      if (index === 0 && this.showPageContinuation && this.scrollTopLine > 0) {
+        return this.addPageContinuation(line.contextPrefix, line.content)
+      }
+
       if (index > 0 || hasRenderedPrefix(line.content, line.contextPrefix)) {
         return line.content
       }
@@ -368,6 +375,18 @@ export class HistoryCanvas {
     }
 
     return lines.length ? lines : ['No messages']
+  }
+
+  private addPageContinuation(prefix: string, content: string) {
+    if (prefix) {
+      const prefixContext = `${prefix}${ELLIPSIS}`
+      if (this.textFitsLine(prefixContext)) return prefixContext
+    }
+
+    const candidate = `${ELLIPSIS}${content}`
+    if (this.textFitsLine(candidate)) return candidate
+
+    return ELLIPSIS
   }
 
   private addPageContext(prefix: string, content: string) {
