@@ -408,6 +408,7 @@ function defaultCleanupPrompt() {
     'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
     'Always rewrite the misheard phrases "ling few", "lane view", and "lanefuse" as "Langfuse".',
     "Preserve the speaker's meaning and wording.",
+    'Do not remove command words after a routing target; keep "Wolf terminate session" as "Wolf terminate session", not "Wolf".',
     'Do not add facts, commands, explanations, or markdown.',
     'If uncertain, keep the original wording.',
     'Return only the cleaned transcript text.',
@@ -578,7 +579,9 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     return
   }
 
-  const route = routeWorkbenchTranscript(text, targetSocket)
+  const route = routeWorkbenchTranscript(text, targetSocket, {
+    rawText: context.rawText,
+  })
   if (route.skip) {
     console.log(`[workbench] skipped transcript: ${route.reason}`)
     sendSocketJson(targetSocket, {
@@ -593,6 +596,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
   const body = route.agent
     ? { agent: route.agent, message: route.message }
     : { message: route.message }
+
   const headers = { 'content-type': 'application/json' }
   if (workbenchConfig.token) headers.authorization = `Bearer ${workbenchConfig.token}`
 
@@ -659,12 +663,13 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
   }
 }
 
-function routeWorkbenchTranscript(text, targetSocket) {
+function routeWorkbenchTranscript(text, targetSocket, options = {}) {
   const cleaned = normalizeTranscript(text)
   if (!cleaned) return { skip: true, reason: 'empty_transcript' }
 
-  const parsed = parseWorkbenchAgentPrefix(cleaned, {
+  const parsed = parseWorkbenchIntent(cleaned, {
     includeAliases: !workbenchConfig.requireAgentPrefix,
+    rawText: options.rawText,
   })
 
   if (workbenchConfig.requireAgentPrefix) {
@@ -731,6 +736,40 @@ function routeWorkbenchTranscript(text, targetSocket) {
     skip: true,
     reason: 'missing_agent_prefix',
   }
+}
+
+function parseWorkbenchIntent(text, options = {}) {
+  const parsed = parseWorkbenchAgentPrefix(text, {
+    includeAliases: options.includeAliases,
+  })
+
+  if (!options.rawText) return parsed
+
+  const rawText = normalizeTranscript(options.rawText)
+  if (!rawText || rawText === text) return parsed
+
+  const rawParsed = parseWorkbenchAgentPrefix(rawText, {
+    includeAliases: options.includeAliases,
+  })
+  if (parsed?.agent && parsed.message) return parsed
+  if (rawParsed?.agent && rawParsed.message) return rawParsed
+  if (!parsed?.agent && rawParsed?.agent && !rawParsed.message) return rawParsed
+
+  return parsed
+}
+
+function preserveWorkbenchCommand(rawText, cleanedText) {
+  const cleaned = normalizeTranscript(cleanedText)
+  if (!cleaned) return cleaned
+
+  const cleanedParsed = parseWorkbenchAgentPrefix(cleaned, { includeAliases: true })
+  if (!cleanedParsed?.agent || cleanedParsed.message) return cleaned
+
+  const rawParsed = parseWorkbenchAgentPrefix(rawText, { includeAliases: true })
+  if (!rawParsed?.agent || !rawParsed.message) return cleaned
+  if (rawParsed.agent !== cleanedParsed.agent) return cleaned
+
+  return `${rawParsed.agent} ${rawParsed.message}`.trim()
 }
 
 function armPendingWorkbenchAgent(targetSocket, agent) {
@@ -1106,7 +1145,7 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
     }
 
     const content = body?.choices?.[0]?.message?.content ?? body?.choices?.[0]?.text ?? ''
-    const cleaned = stripCleanupDecorations(content)
+    const cleaned = preserveWorkbenchCommand(rawTranscript, stripCleanupDecorations(content))
 
     if (!cleaned) {
       throw new Error('cleanup model returned empty text')
@@ -1398,7 +1437,11 @@ async function flushRawTranscriptBatch(items) {
     cleanFile: basename(paths.cleanTxt),
     createdAt,
   })
-  await maybePostToWorkbench(cleanedTranscript, targetSocket, { jobId: lastItem.jobId, user })
+  await maybePostToWorkbench(cleanedTranscript, targetSocket, {
+    jobId: lastItem.jobId,
+    user,
+    rawText: rawTranscript,
+  })
   await maybePostToTerminal(cleanedTranscript)
 }
 

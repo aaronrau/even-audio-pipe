@@ -671,6 +671,7 @@ function defaultCleanupPrompt() {
     'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
     'Always rewrite the misheard phrases "ling few", "lane view", and "lanefuse" as "Langfuse".',
     "Preserve the speaker's meaning and wording.",
+    'Do not remove command words after a routing target; keep "Wolf terminate session" as "Wolf terminate session", not "Wolf".',
     'Do not add facts, commands, explanations, or markdown.',
     'If uncertain, keep the original wording.',
     'Return only the cleaned transcript text.',
