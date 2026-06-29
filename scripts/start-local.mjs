@@ -21,8 +21,10 @@ const transcriptQueueConfig = resolveTranscriptQueueConfig(config.transcriptQueu
 const transcriptCleanupConfig = resolveTranscriptCleanupConfig(config.transcriptCleanup)
 const workbenchConfig = resolveWorkbenchConfig(config.workbench)
 const vadConfig = resolveVadConfig(config.vad)
+const networkConfig = resolveNetworkConfig(config.network)
 
-const hostIp = process.env.EVEN_AUDIO_PIPE_HOST || detectHostIp()
+const configuredLanHost = process.env.EVEN_AUDIO_PIPE_HOST || networkConfig.lanHost
+const hostIp = configuredLanHost && configuredLanHost !== 'auto' ? configuredLanHost : detectHostIp()
 const appPort = Number(process.env.EVEN_AUDIO_PIPE_APP_PORT || 5173)
 const receiverPort = Number(process.env.EVEN_AUDIO_PIPE_RECEIVER_PORT || 8788)
 const asrPort = Number(process.env.EVEN_AUDIO_PIPE_ASR_PORT || 8790)
@@ -31,10 +33,14 @@ const asrWorkerUrl = process.env.ASR_WORKER_URL || `http://127.0.0.1:${asrPort}`
 const authConfig = resolveAuthConfig(config.auth)
 
 const appUrl = `http://${hostIp}:${appPort}`
-const qrUrl = authConfig.enabled ? withQueryParam(appUrl, 't', authConfig.token) : appUrl
 const wsUrl = `ws://${hostIp}:${receiverPort}/audio`
+const publicWsUrl = resolvePublicWsUrl(networkConfig)
+const qrUrl = withEndpointQueryParams(
+  authConfig.enabled ? withQueryParam(appUrl, 't', authConfig.token) : appUrl,
+)
 const receiverHttpOrigin = `http://${hostIp}:${receiverPort}`
 const receiverWsOrigin = `ws://${hostIp}:${receiverPort}`
+const publicOrigins = publicWsUrl ? publicNetworkOrigins(publicWsUrl) : []
 const workbenchSummaryWebhookUrl = `${receiverHttpOrigin}${workbenchConfig.summaryPath}`
 const workbenchSummaryWebhookLocalUrl = `http://127.0.0.1:${receiverPort}${workbenchConfig.summaryPath}`
 
@@ -50,7 +56,6 @@ if (!hostIp) {
 await ensureRequiredPortsAvailable()
 await ensureDependencies(receiverDir)
 await ensureDependencies(appDir)
-writeLocalEnv()
 updateAppManifest()
 
 if (transcriptCleanupConfig.enabled && transcriptCleanupConfig.llamaCpp.autoStart) {
@@ -90,7 +95,8 @@ console.log(`  QR auth:        ${authConfig.enabled ? 'enabled' : 'disabled'}`)
 if (authConfig.enabled) {
   console.log(`  QR auth mode:   ${authConfig.source}`)
 }
-console.log(`  Audio WS URL:   ${wsUrl}`)
+console.log(`  LAN Audio WS:   ${wsUrl}`)
+console.log(`  WAN Audio WS:   ${publicWsUrl || 'not configured'}`)
 console.log(`  Receiver health http://127.0.0.1:${receiverPort}/health`)
 console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
 console.log(`  VAD:            ${vadConfig.backend}`)
@@ -289,6 +295,67 @@ function authTokenSource({ derivedToken, configuredToken, tokenSecret, tokenUser
   if (tokenSecret) return 'uid-hmac unavailable: missing uid'
   if (configuredToken) return 'configured token'
   return 'random token'
+}
+
+function resolveNetworkConfig(network = {}) {
+  return {
+    lanHost: String(
+      process.env.EVEN_AUDIO_PIPE_LAN_HOST ||
+      network.lanHost ||
+      'auto',
+    ).trim(),
+    publicUrl: String(
+      process.env.EVEN_AUDIO_PIPE_PUBLIC_URL ||
+      process.env.EVEN_AUDIO_PUBLIC_URL ||
+      network.publicUrl ||
+      '',
+    ).trim(),
+    publicWsUrl: String(
+      process.env.EVEN_AUDIO_PIPE_PUBLIC_WS_URL ||
+      process.env.EVEN_AUDIO_PUBLIC_WS_URL ||
+      network.publicWsUrl ||
+      network.wanWsUrl ||
+      '',
+    ).trim(),
+  }
+}
+
+function resolvePublicWsUrl(networkConfig) {
+  const source = networkConfig.publicWsUrl || networkConfig.publicUrl
+  if (!source) return ''
+
+  try {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(source)
+      ? source
+      : `wss://${source}`
+    const parsed = new URL(withScheme)
+    if (parsed.protocol === 'http:') parsed.protocol = 'ws:'
+    if (parsed.protocol === 'https:') parsed.protocol = 'wss:'
+    if (parsed.pathname === '/' || !parsed.pathname) parsed.pathname = '/audio'
+    return parsed.toString()
+  } catch {
+    return ''
+  }
+}
+
+function publicNetworkOrigins(publicWsUrl) {
+  try {
+    const parsed = new URL(publicWsUrl)
+    const webProtocol = parsed.protocol === 'wss:' ? 'https:' : 'http:'
+    return uniqueStrings([
+      `${parsed.protocol}//${parsed.host}`,
+      `${webProtocol}//${parsed.host}`,
+    ])
+  } catch {
+    return []
+  }
+}
+
+function withEndpointQueryParams(url) {
+  const parsed = new URL(url)
+  parsed.searchParams.set('lan', wsUrl)
+  if (publicWsUrl) parsed.searchParams.set('wan', publicWsUrl)
+  return parsed.toString()
 }
 
 function resolveTranscriptQueueConfig(queue = {}) {
@@ -944,10 +1011,6 @@ function findPythonForVenv() {
   process.exit(1)
 }
 
-function writeLocalEnv() {
-  writeFileSync(join(appDir, '.env.local'), `VITE_AUDIO_WS_URL=${wsUrl}\n`)
-}
-
 function updateAppManifest() {
   const manifestPath = join(appDir, 'app.json')
   const manifestSourcePath = existsSync(manifestPath)
@@ -956,14 +1019,15 @@ function updateAppManifest() {
   const manifest = JSON.parse(readFileSync(manifestSourcePath, 'utf8'))
   const permissions = Array.isArray(manifest.permissions) ? manifest.permissions : []
   const network = permissions.find((permission) => permission?.name === 'network')
+  const networkWhitelist = uniqueStrings([receiverWsOrigin, receiverHttpOrigin, ...publicOrigins])
 
   if (network) {
-    network.whitelist = [receiverWsOrigin, receiverHttpOrigin]
+    network.whitelist = networkWhitelist
   } else {
     permissions.push({
       name: 'network',
       desc: 'Stream microphone PCM audio to your local receiver.',
-      whitelist: [receiverWsOrigin, receiverHttpOrigin],
+      whitelist: networkWhitelist,
     })
   }
 

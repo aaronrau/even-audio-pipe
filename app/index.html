@@ -57,6 +57,33 @@
         white-space: pre-wrap;
         min-height: 72px;
       }
+
+      .endpoint-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+
+      input,
+      button {
+        box-sizing: border-box;
+        width: 100%;
+        border-radius: 6px;
+        border: 1px solid #555;
+        background: #191919;
+        color: #ededed;
+        font: inherit;
+        padding: 8px 10px;
+      }
+
+      button {
+        background: #3c3c3c;
+        cursor: pointer;
+      }
+
+      button:active {
+        background: #4a4a4a;
+      }
     </style>
   </head>
   <body>
@@ -69,6 +96,26 @@
       <section class="panel">
         <div class="label">Receiver</div>
         <div id="url"></div>
+      </section>
+      <section class="panel">
+        <div class="label">Endpoints</div>
+        <div class="endpoint-grid">
+          <input
+            id="lan-address"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck="false"
+            placeholder="LAN address, e.g. 192.168.1.50:8788"
+          />
+          <input
+            id="wan-address"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck="false"
+            placeholder="WAN address, e.g. wss://even-audio.example.com/audio"
+          />
+          <button id="save-endpoints" type="button">Save Endpoints</button>
+        </div>
       </section>
       <section class="panel">
         <div class="label">Stream</div>

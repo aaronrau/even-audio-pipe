@@ -129,7 +129,7 @@ The launcher will:
 1. Detect a non-loopback IPv4 address for this computer.
 2. Install app and receiver npm dependencies if missing.
 3. Read local storage settings from `config.json` when present.
-4. Generate `app/.env.local` with the WebSocket URL.
+4. Add LAN/WAN audio endpoint hints to the Even Hub QR URL.
 5. Generate `app/app.json` from `app/app.example.json` with the correct network whitelist.
 6. Create/install the local ASR Python environment if needed.
 7. Start the ASR worker, receiver, and Vite dev server.
@@ -262,12 +262,13 @@ npm start
 
 ## Local QR Auth
 
-The launcher enables local access-token auth by default. It puts a token in the
-QR URL and passes the same token to the receiver. The app copies the launch
-token into the WebSocket URL:
+The launcher enables local access-token auth by default. It puts a token and
+the LAN/WAN audio endpoints in the QR URL, then passes the same token to the
+receiver. The app stores those endpoint hints locally and copies the launch
+token into whichever WebSocket URL it is currently trying:
 
 ```text
-QR URL:  http://YOUR_COMPUTER_IP:5173?t=TOKEN
+QR URL:  http://YOUR_COMPUTER_IP:5173?t=TOKEN&lan=ws://YOUR_COMPUTER_IP:8788/audio
 Audio:   ws://YOUR_COMPUTER_IP:8788/audio?t=TOKEN
 ```
 
@@ -608,18 +609,20 @@ The one-command launcher is preferred. For manual app work:
 
 ```bash
 cd app
-cp .env.example .env.local
 cp app.example.json app.json
 npm ci
 npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
-Update `app/.env.local` and `app/app.json` to use the computer address reachable
-from the phone, then run:
+Update `app/app.json` network whitelist to include the receiver origin reachable
+from the phone, then pass the LAN endpoint in the QR URL:
 
 ```bash
-npx evenhub qr --url http://YOUR_COMPUTER_IP:5173
+npx evenhub qr --url 'http://YOUR_COMPUTER_IP:5173?lan=ws://YOUR_COMPUTER_IP:8788/audio'
 ```
+
+The app also has LAN and WAN endpoint fields on the page. Values entered there
+are stored in browser storage and tried in LAN-first, WAN-second order.
 
 ## Validation
 
@@ -638,7 +641,6 @@ Generated config, dependency folders, Python environments, build output, and
 recordings are ignored:
 
 - `app/app.json`
-- `app/.env.local`
 - `app/dist/`
 - `config.json`
 - `data/`

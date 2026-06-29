@@ -13,6 +13,11 @@
     "transcriptDir": "data/transcripts",
     "transcriptsLog": "data/transcripts/transcripts.log"
   },
+  "network": {
+    "lanHost": "auto",
+    "publicUrl": "",
+    "publicWsUrl": ""
+  },
   "vad": {
     "backend": "silero",
     "model": "",

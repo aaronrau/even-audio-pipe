@@ -16,13 +16,27 @@ import {
 import { historyScrollDirectionFromEventType } from './historyInput'
 import { HistoryNavigator } from './historyNavigator'
 
-const BASE_AUDIO_WS_URL = import.meta.env.VITE_AUDIO_WS_URL as string | undefined
-const AUDIO_WS_URL = withLaunchToken(BASE_AUDIO_WS_URL)
+type AudioEndpoint = {
+  label: string
+  url: string
+}
+
+type AudioEndpointSettings = {
+  lanAddress: string
+  wanAddress: string
+}
+
+const LAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.lanAddress'
+const WAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.wanAddress'
+const AUDIO_WS_PATH = '/audio'
 
 const statusEl = document.getElementById('status')!
 const statsEl = document.getElementById('stats')!
 const urlEl = document.getElementById('url')!
 const transcriptEl = document.getElementById('transcript')!
+const lanAddressEl = document.getElementById('lan-address') as HTMLInputElement | null
+const wanAddressEl = document.getElementById('wan-address') as HTMLInputElement | null
+const saveEndpointsEl = document.getElementById('save-endpoints') as HTMLButtonElement | null
 
 function positiveNumber(value: string | undefined, fallback: number) {
   const parsed = Number(value)
@@ -53,6 +67,9 @@ let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
 let reconnectTimer: number | null = null
+let audioEndpointSettings = readAudioEndpointSettings()
+let audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
+let audioEndpointIndex = 0
 let clearTranscriptTimer: number | null = null
 let spinnerTimer: number | null = null
 let idleSpinnerIndex = 0
@@ -136,6 +153,108 @@ function launchToken() {
   return params.get('t') || params.get('token') || ''
 }
 
+function launchEndpointParam(keys: string[]) {
+  const params = new URLSearchParams(window.location.search)
+  for (const key of keys) {
+    const value = params.get(key)
+    if (value) return value.trim()
+  }
+  return ''
+}
+
+function storedValue(key: string) {
+  try {
+    return window.localStorage.getItem(key)?.trim() || ''
+  } catch {
+    return ''
+  }
+}
+
+function storeValue(key: string, value: string) {
+  try {
+    if (value) {
+      window.localStorage.setItem(key, value)
+    } else {
+      window.localStorage.removeItem(key)
+    }
+  } catch {
+    // Ignore storage failures in constrained WebView contexts.
+  }
+}
+
+function readAudioEndpointSettings(): AudioEndpointSettings {
+  const queryLanAddress = launchEndpointParam(['lan', 'lanAddress', 'lanWs', 'local', 'localWs'])
+  const queryWanAddress = launchEndpointParam(['wan', 'wanAddress', 'wanWs', 'public', 'publicWs'])
+  const lanAddress = queryLanAddress ||
+    storedValue(LAN_ENDPOINT_STORAGE_KEY)
+  const wanAddress = queryWanAddress ||
+    storedValue(WAN_ENDPOINT_STORAGE_KEY)
+
+  if (queryLanAddress || queryWanAddress) {
+    saveAudioEndpointSettings({ lanAddress, wanAddress })
+  }
+
+  return { lanAddress, wanAddress }
+}
+
+function saveAudioEndpointSettings(settings: AudioEndpointSettings) {
+  storeValue(LAN_ENDPOINT_STORAGE_KEY, settings.lanAddress.trim())
+  storeValue(WAN_ENDPOINT_STORAGE_KEY, settings.wanAddress.trim())
+}
+
+function setupEndpointForm() {
+  if (lanAddressEl) lanAddressEl.value = audioEndpointSettings.lanAddress
+  if (wanAddressEl) wanAddressEl.value = audioEndpointSettings.wanAddress
+
+  saveEndpointsEl?.addEventListener('click', () => {
+    audioEndpointSettings = {
+      lanAddress: lanAddressEl?.value.trim() || '',
+      wanAddress: wanAddressEl?.value.trim() || '',
+    }
+    saveAudioEndpointSettings(audioEndpointSettings)
+    audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
+    audioEndpointIndex = 0
+    setUiStatus('Endpoints saved, reconnecting...')
+    ws?.close()
+    if (!ws) connect()
+  })
+}
+
+function buildAudioWsEndpoints(settings: AudioEndpointSettings): AudioEndpoint[] {
+  const endpoints: AudioEndpoint[] = []
+  const seen = new Set<string>()
+
+  const addEndpoint = (label: string, url: string | undefined) => {
+    const normalized = withLaunchToken(normalizeWsEndpoint(url, label))
+    if (!normalized || seen.has(normalized)) return
+    seen.add(normalized)
+    endpoints.push({ label, url: normalized })
+  }
+
+  addEndpoint('LAN', settings.lanAddress)
+  addEndpoint('WAN', settings.wanAddress)
+  return endpoints
+}
+
+function normalizeWsEndpoint(value: string | undefined, label: string) {
+  const input = (value || '').trim()
+  if (!input) return ''
+
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(input)
+    ? input
+    : `${label === 'WAN' ? 'wss' : 'ws'}://${input}`
+
+  try {
+    const parsed = new URL(withScheme)
+    if (parsed.protocol === 'http:') parsed.protocol = 'ws:'
+    if (parsed.protocol === 'https:') parsed.protocol = 'wss:'
+    if (parsed.pathname === '/' || !parsed.pathname) parsed.pathname = AUDIO_WS_PATH
+    return parsed.toString()
+  } catch {
+    return input
+  }
+}
+
 function withLaunchToken(url: string | undefined) {
   const token = launchToken()
   if (!url || !token) return url
@@ -158,6 +277,15 @@ function displayWsUrl(url: string) {
   } catch {
     return url
   }
+}
+
+function currentAudioEndpoint() {
+  return audioWsEndpoints[audioEndpointIndex] ?? null
+}
+
+function advanceAudioEndpoint() {
+  if (audioWsEndpoints.length <= 1) return
+  audioEndpointIndex = (audioEndpointIndex + 1) % audioWsEndpoints.length
 }
 
 function stringValue(value: unknown) {
@@ -935,7 +1063,7 @@ async function setAudio(open: boolean) {
 }
 
 function scheduleReconnect() {
-  if (cleanedUp || reconnectTimer !== null || !AUDIO_WS_URL) return
+  if (cleanedUp || reconnectTimer !== null || audioWsEndpoints.length === 0) return
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null
     connect()
@@ -943,18 +1071,21 @@ function scheduleReconnect() {
 }
 
 function connect() {
-  if (!AUDIO_WS_URL) {
-    setUiStatus('Missing VITE_AUDIO_WS_URL')
+  const endpoint = currentAudioEndpoint()
+  if (!endpoint) {
+    setUiStatus('Missing audio WebSocket URL')
     return
   }
 
-  urlEl.textContent = displayWsUrl(AUDIO_WS_URL)
-  setUiStatus('Connecting to receiver...')
-  ws = new WebSocket(AUDIO_WS_URL)
+  urlEl.textContent = `${endpoint.label}: ${displayWsUrl(endpoint.url)}`
+  setUiStatus(`Connecting to ${endpoint.label} receiver...`)
+  ws = new WebSocket(endpoint.url)
   ws.binaryType = 'arraybuffer'
+  let opened = false
 
   ws.addEventListener('open', async () => {
     if (!ws) return
+    opened = true
     const startMessage: Record<string, unknown> = {
       type: 'start',
       source: 'g2',
@@ -969,7 +1100,7 @@ function connect() {
 
     ws.send(JSON.stringify(startMessage))
     await setAudio(true)
-    setUiStatus('Streaming G2 mic audio')
+    setUiStatus(`Streaming G2 mic audio via ${endpoint.label}`)
   })
 
   ws.addEventListener('message', event => {
@@ -983,14 +1114,22 @@ function connect() {
     clearSpeechProcessingState()
     await setAudio(false)
     if (!cleanedUp) {
-      setUiStatus('Receiver disconnected, retrying...')
+      if (opened) {
+        audioEndpointIndex = 0
+      } else {
+        advanceAudioEndpoint()
+      }
+      const nextEndpoint = currentAudioEndpoint()
+      setUiStatus(nextEndpoint
+        ? `Receiver disconnected, trying ${nextEndpoint.label}...`
+        : 'Receiver disconnected, retrying...')
       scheduleReconnect()
     }
   })
 
   ws.addEventListener('error', () => {
     speechDetected = false
-    setUiStatus('Receiver connection error')
+    setUiStatus(`${endpoint.label} receiver connection error`)
   })
 }
 
@@ -1063,5 +1202,6 @@ unsubscribe = bridge.onEvenHubEvent(event => {
 window.addEventListener('beforeunload', cleanup)
 
 setStats()
+setupEndpointForm()
 startIdleSpinner()
 connect()
