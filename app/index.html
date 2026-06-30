@@ -8,41 +8,140 @@
     />
     <title>Even Audio Pipe</title>
     <style>
+      :root {
+        color-scheme: light;
+        --bg: #f3f3f0;
+        --surface: #ffffff;
+        --surface-soft: #f9f9f7;
+        --line: #e2e2dd;
+        --line-strong: #d5d5cf;
+        --text: #161716;
+        --muted: #777a75;
+        --soft: #3a3c39;
+        --accent: #8eb85d;
+        --shadow: 0 10px 30px rgba(30, 32, 30, 0.08);
+      }
+
       html,
       body {
         margin: 0;
         height: 100%;
-        background: #202020;
-        color: #ededed;
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          "Avenir Next",
+          "SF Pro Display",
+          "Segoe UI",
+          system-ui,
+          sans-serif;
+      }
+
+      body::before {
+        display: none;
       }
 
       main {
         box-sizing: border-box;
         min-height: 100%;
-        padding: 20px;
+        width: min(560px, 100%);
+        margin: 0 auto;
+        padding: 18px;
         display: flex;
         flex-direction: column;
+        gap: 12px;
+        position: relative;
+      }
+
+      .hero {
+        padding: 8px 2px 4px;
+        display: grid;
+        grid-template-columns: 1fr auto;
         gap: 14px;
+        align-items: center;
       }
 
       h1 {
         margin: 0;
-        font-size: 20px;
+        font-size: 30px;
+        line-height: 1.04;
         font-weight: 650;
+        letter-spacing: 0;
+      }
+
+      .kicker {
+        margin: 0 0 8px;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 560;
+        letter-spacing: 0;
+      }
+
+      .subhead {
+        margin: 9px 0 0;
+        max-width: 420px;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.45;
+      }
+
+      .signal {
+        position: relative;
+        width: 48px;
+        height: 48px;
+        border: 1px solid var(--line);
+        border-radius: 50%;
+        display: grid;
+        place-items: center;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+
+      .signal::before,
+      .signal::after {
+        content: "";
+        position: absolute;
+        width: 18px;
+        height: 18px;
+        border: 1.4px solid var(--text);
+        border-radius: 50%;
+      }
+
+      .signal::after {
+        width: 30px;
+        height: 30px;
+        border-color: var(--line-strong);
       }
 
       .panel {
-        border: 1px solid #4a4a4a;
-        border-radius: 8px;
-        padding: 12px;
-        background: #2c2c2c;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+
+      .panel.primary {
+        background: var(--surface);
+        border-color: var(--line-strong);
+      }
+
+      .panel-row {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
       }
 
       .label {
-        color: #a7a7a7;
+        color: var(--muted);
         font-size: 12px;
-        margin-bottom: 4px;
+        font-weight: 560;
+        letter-spacing: 0;
+        margin-bottom: 8px;
+      }
+
+      .value {
+        font-size: 15px;
+        font-weight: 520;
       }
 
       #status,
@@ -50,53 +149,113 @@
       #url,
       #transcript {
         overflow-wrap: anywhere;
-        line-height: 1.4;
+        line-height: 1.45;
       }
 
       #transcript {
         white-space: pre-wrap;
-        min-height: 72px;
+        min-height: 88px;
+        color: var(--soft);
       }
 
       .endpoint-grid {
         display: grid;
         grid-template-columns: 1fr;
-        gap: 8px;
+        gap: 10px;
       }
 
       input,
       button {
         box-sizing: border-box;
         width: 100%;
-        border-radius: 6px;
-        border: 1px solid #555;
-        background: #191919;
-        color: #ededed;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: var(--surface-soft);
+        color: var(--text);
         font: inherit;
-        padding: 8px 10px;
+        padding: 12px;
+        outline: none;
+      }
+
+      input::placeholder {
+        color: #a0a29d;
+      }
+
+      input:focus {
+        border-color: var(--text);
       }
 
       button {
-        background: #3c3c3c;
+        border-color: var(--text);
+        background: var(--text);
+        color: #ffffff;
         cursor: pointer;
+        font-weight: 620;
+        letter-spacing: 0;
       }
 
       button:active {
-        background: #4a4a4a;
+        transform: translateY(1px);
+      }
+
+      @media (min-width: 680px) {
+        main {
+          padding: 28px 18px;
+        }
+
+        .panel-row {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .endpoint-grid {
+          grid-template-columns: 1fr 1fr auto;
+          align-items: center;
+        }
+
+        button {
+          min-width: 148px;
+        }
+      }
+
+      @media (max-width: 420px) {
+        main {
+          padding: 16px;
+        }
+
+        .hero {
+          grid-template-columns: 1fr;
+        }
+
+        .signal {
+          display: none;
+        }
       }
     </style>
   </head>
   <body>
     <main>
-      <h1>Even Audio Pipe</h1>
-      <section class="panel">
+      <header class="hero">
+        <div>
+          <p class="kicker">Even Realities</p>
+          <h1>Audio Pipe</h1>
+          <p class="subhead">Live microphone relay, transcript routing, and summaries for G-series glasses.</p>
+        </div>
+        <div class="signal" aria-hidden="true"></div>
+      </header>
+      <section class="panel primary">
         <div class="label">Status</div>
-        <div id="status">Starting...</div>
+        <div id="status" class="value">Starting...</div>
       </section>
-      <section class="panel">
-        <div class="label">Receiver</div>
-        <div id="url"></div>
-      </section>
+      <div class="panel-row">
+        <section class="panel">
+          <div class="label">Receiver</div>
+          <div id="url" class="value"></div>
+        </section>
+        <section class="panel">
+          <div class="label">Stream</div>
+          <div id="stats" class="value">0 chunks, 0 bytes</div>
+        </section>
+      </div>
       <section class="panel">
         <div class="label">Endpoints</div>
         <div class="endpoint-grid">
@@ -118,12 +277,8 @@
         </div>
       </section>
       <section class="panel">
-        <div class="label">Stream</div>
-        <div id="stats">0 chunks, 0 bytes</div>
-      </section>
-      <section class="panel">
         <div class="label">Transcript</div>
-        <div id="transcript">Listening...</div>
+        <div id="transcript" class="value">Listening...</div>
       </section>
     </main>
     <script type="module" src="/src/main.ts"></script>

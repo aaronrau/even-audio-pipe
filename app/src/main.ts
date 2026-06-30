@@ -72,17 +72,21 @@ let audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
 let audioEndpointIndex = 0
 let clearTranscriptTimer: number | null = null
 let spinnerTimer: number | null = null
-let idleSpinnerIndex = 0
-let waitingSpinnerIndex = 0
+let waveformFrameIndex = 0
 let unsubscribe: (() => void) | null = null
 let evenUserInfo: UserPayload | null = null
 
 const GLASSES_LINE_WIDTH = 52
 const GLASSES_MAX_LINES = 7
 const GLASSES_TEXT_LIMIT = GLASSES_LINE_WIDTH * GLASSES_MAX_LINES
-const TRANSCRIPT_CLEAR_MS = 5_000
-const DOT_SPINNER_FRAMES = ['.', '..', '...', '..']
-const WAITING_FRAMES = ['|', '||', '|||', '||']
+const TRANSCRIPT_CLEAR_MS = 12_000
+const SPEECH_WAVEFORM_FRAMES = [
+  '  |  ',
+  ' ||| ',
+  '|||||',
+  ' ||| ',
+]
+const BLANK_LIVE_CONTENT = ' '
 const SPINNER_INTERVAL_MS = 650
 const HISTORY_TOGGLE_DEBOUNCE_MS = 700
 const HISTORY_SCROLL_DEBOUNCE_MS = 350
@@ -97,6 +101,7 @@ const CANVAS_BORDER_WIDTH = 0
 const HISTORY_VISIBLE_LINES = positiveNumber(import.meta.env.VITE_HISTORY_VISIBLE_LINES, 9)
 const HISTORY_WRAP_WIDTH = positiveNumber(import.meta.env.VITE_HISTORY_WRAP_WIDTH, CANVAS_WIDTH)
 const TEXT_UPGRADE_LIMIT = 2000
+const HISTORY_DUPLICATE_WINDOW_MS = 10_000
 // Some host builds normalize ring clicks into source-less text events.
 const ALLOW_UNSOURCED_HISTORY_TOGGLE = true
 const SUMMARY_TEXT_FIELDS = ['text', 'summary', 'message', 'response'] as const
@@ -362,11 +367,28 @@ function replaceHistory(entries: HistoryEntry[]) {
 function pushHistory(label: string, text: string, detail = '') {
   const normalized = normalizeInlineText(text)
   if (!normalized) return
+  const now = Date.now()
+  let duplicate: HistoryEntry | undefined
+  for (let index = messageHistory.length - 1; index >= 0; index -= 1) {
+    const entry = messageHistory[index]
+    if (now - entry.receivedAt > HISTORY_DUPLICATE_WINDOW_MS) break
+    if (entry.label === label && entry.text === normalized) {
+      duplicate = entry
+      break
+    }
+  }
+  if (duplicate) {
+    if (detail && !duplicate.detail) {
+      const normalizedDetail = normalizeHistoryBlock(detail)
+      if (normalizedDetail) duplicate.detail = normalizedDetail
+    }
+    return
+  }
 
   const entry: HistoryEntry = {
     label,
     text: normalized,
-    receivedAt: Date.now(),
+    receivedAt: now,
   }
   const normalizedDetail = normalizeHistoryBlock(detail)
   if (normalizedDetail) {
@@ -402,19 +424,13 @@ async function scrollHistoryWindow(direction: HistoryScrollDirection) {
 }
 
 function currentLiveGlassesContent() {
-  if (isSpeechProcessingActive()) {
-    return currentWaitingFrame()
-  }
+  if (speechDetected) return currentSpeechWaveformFrame()
   if (transcriptText) return formatGlassesTranscript(transcriptText)
-  return currentIdleFrame()
+  return BLANK_LIVE_CONTENT
 }
 
-function currentIdleFrame() {
-  return DOT_SPINNER_FRAMES[idleSpinnerIndex % DOT_SPINNER_FRAMES.length]
-}
-
-function currentWaitingFrame() {
-  return WAITING_FRAMES[waitingSpinnerIndex % WAITING_FRAMES.length]
+function currentSpeechWaveformFrame() {
+  return SPEECH_WAVEFORM_FRAMES[waveformFrameIndex % SPEECH_WAVEFORM_FRAMES.length]
 }
 
 function isSpeechProcessingActive() {
@@ -549,6 +565,7 @@ async function flushHistoryWindowUpdate() {
 }
 
 async function showHistoryWindow() {
+  clearLiveTranscriptDisplay()
   const previousMode = glassesMode
   const result = historyNavigator.open()
   syncHistoryMode()
@@ -657,21 +674,31 @@ async function handleHistoryTap() {
 function clearSpeechProcessingState() {
   speechDetected = false
   queuedTranscriptText = ''
-  waitingSpinnerIndex = 0
+  waveformFrameIndex = 0
+  clearLiveTranscriptDisplay()
+  historyNavigator.clearPendingTranscript()
+  requestHistoryWindowUpdate()
+}
+
+function clearLiveTranscriptDisplay() {
   transcriptText = ''
   transcriptEl.textContent = 'Listening...'
   if (clearTranscriptTimer !== null) {
     window.clearTimeout(clearTranscriptTimer)
     clearTranscriptTimer = null
   }
+}
+
+function stopSpeechProcessingIndicator() {
+  speechDetected = false
+  queuedTranscriptText = ''
+  waveformFrameIndex = 0
   historyNavigator.clearPendingTranscript()
   requestHistoryWindowUpdate()
 }
 
 function startSpeechProcessingState() {
-  if (!isSpeechProcessingActive()) {
-    waitingSpinnerIndex = 0
-  }
+  if (!isSpeechProcessingActive()) waveformFrameIndex = 0
   speechDetected = true
 }
 
@@ -737,10 +764,8 @@ function startIdleSpinner() {
   if (spinnerTimer !== null) return
 
   spinnerTimer = window.setInterval(() => {
-    if (isSpeechProcessingActive()) {
-      waitingSpinnerIndex = (waitingSpinnerIndex + 1) % WAITING_FRAMES.length
-    } else if (!transcriptText) {
-      idleSpinnerIndex = (idleSpinnerIndex + 1) % DOT_SPINNER_FRAMES.length
+    if (speechDetected) {
+      waveformFrameIndex = (waveformFrameIndex + 1) % SPEECH_WAVEFORM_FRAMES.length
     }
     if (queuedTranscriptText) {
       historyNavigator.setPendingTranscript(queuedTranscriptText)
@@ -749,7 +774,7 @@ function startIdleSpinner() {
       }
     }
 
-    if (transcriptText && !queuedTranscriptText && !speechDetected) return
+    if (!speechDetected && !queuedTranscriptText) return
     void renderGlassesStatus()
   }, SPINNER_INTERVAL_MS)
 }
@@ -781,6 +806,7 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'transcript' && typeof payload.text === 'string') {
+    stopSpeechProcessingIndicator()
     appendTranscript(payload.text, 'You', '', { clearProcessing: false })
     setUiStatus('Streaming G2 mic audio')
     return
@@ -805,13 +831,13 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'agent_status' && payload.status === 'sent') {
-    clearSpeechProcessingState()
+    stopSpeechProcessingIndicator()
     setUiStatus('Waiting for agent summary...')
     return
   }
 
   if (payload.type === 'agent_status' && payload.status === 'agent_armed') {
-    clearSpeechProcessingState()
+    stopSpeechProcessingIndicator()
     const agent = typeof payload.agent === 'string' && payload.agent
       ? payload.agent
       : 'agent'
@@ -828,7 +854,7 @@ function handleReceiverMessage(raw: string) {
       payload.status === 'workbench_unconfigured'
     )
   ) {
-    clearSpeechProcessingState()
+    stopSpeechProcessingIndicator()
     setUiStatus('Listening for speech...')
     return
   }
@@ -855,13 +881,8 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'asr_status' && payload.status === 'queued') {
     speechDetected = false
-    const queuedText = typeof payload.queuedText === 'string'
-      ? payload.queuedText
-      : typeof payload.text === 'string'
-        ? payload.text
-        : ''
-    queuedTranscriptText = normalizeInlineText(queuedText)
-    historyNavigator.setPendingTranscript(queuedTranscriptText)
+    queuedTranscriptText = ''
+    historyNavigator.clearPendingTranscript()
     requestHistoryWindowUpdate()
     setUiStatus('Waiting for more speech...')
     return
@@ -869,13 +890,8 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'asr_status' && payload.status === 'cleaning') {
     speechDetected = false
-    const queuedText = typeof payload.queuedText === 'string'
-      ? payload.queuedText
-      : typeof payload.text === 'string'
-        ? payload.text
-        : queuedTranscriptText
-    queuedTranscriptText = normalizeInlineText(queuedText)
-    historyNavigator.setPendingTranscript(queuedTranscriptText)
+    queuedTranscriptText = ''
+    historyNavigator.clearPendingTranscript()
     requestHistoryWindowUpdate()
     setUiStatus('Cleaning transcript...')
     return
