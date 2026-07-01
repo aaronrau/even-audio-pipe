@@ -30,17 +30,23 @@ npm run start
   -> starts the ASR worker unless disabled
   -> starts the Vite thin-client app
   -> prints an Even Hub QR code
-  -> QR bootstraps lan=ws://LAN_IP:8788/audio
-  -> QR bootstraps wan=wss://PUBLIC/audio when configured
+  -> QR bootstraps private=LAN_IP:8788
+  -> QR bootstraps public=PUBLIC:PORT when configured
+  -> QR includes a legacy dev token when local auth is enabled
 ```
 
-The thin client stores the LAN and WAN addresses in browser storage. It attempts
-the LAN address first and then the WAN address if LAN cannot open. Users can
-also edit both addresses in the client page and save them without rebuilding the
-app.
+The thin client stores private IP, private port, public IP, public port, and the
+shared secret in Even/browser local storage. It attempts the private `ws://`
+receiver first and then the public `wss://` receiver if private cannot open.
+Users can also edit both endpoints in the client page and save them without
+rebuilding the app. Endpoint parsing/building is isolated in
+`app/src/audioEndpoints.ts`; the client still only handles endpoint setup, auth,
+audio streaming, and display/history rendering.
 
 `speech-agent-workbench` is not started by this repo. It still runs separately,
 and the receiver talks to it through the configured local workbench URL.
+Workbench command parsing/routing is server-side in
+`local-receiver/workbench-router.js`.
 
 ## Intent
 
@@ -75,7 +81,7 @@ Responsibilities:
   optionally the shared secret.
 - Connects to `ws://LAN:8788/audio` for local development or
   `wss://PUBLIC_DOMAIN/audio` for uploaded/private builds.
-- Authenticates after socket open.
+- Authenticates after socket open when shared-secret auth is configured.
 - Sends audio frames with sequence numbers.
 - Sends heartbeat pings and detects stale sockets.
 - Reconnects automatically with capped exponential backoff.
@@ -90,7 +96,7 @@ Responsibilities:
 
 - Binds locally, usually `0.0.0.0:8788`.
 - Advertises both LAN and public endpoints.
-- Prompts for or loads a shared secret.
+- Loads a token and/or shared secret from config/env.
 - Authenticates the WebSocket before accepting audio.
 - Tracks sessions, sequence numbers, display state, and replayable events.
 - Runs VAD / ASR / cleanup / workbench routing.
@@ -229,24 +235,23 @@ Workbench:
 The client should not send the raw secret. It also should not send a reusable
 plain hash as the only credential because that hash becomes the password.
 
-Preferred flow:
+Implemented shared-secret flow:
 
 1. Client opens the socket.
 2. Server sends a random nonce.
-3. Client derives a key from the typed secret.
-4. Client sends an HMAC proof.
+3. Client signs the nonce with `HMAC-SHA256` using the typed shared secret.
+4. Client sends the nonce and HMAC proof.
 5. Server verifies the proof.
-6. Server accepts audio only after `auth_ok`.
+6. Server accepts audio only after `auth_status` reports `accepted`.
 
 Server challenge:
 
 ```json
 {
   "type": "auth_challenge",
-  "nonce": "server-random-base64",
-  "salt": "configured-or-server-salt",
-  "kdf": "pbkdf2_sha256",
-  "iterations": 210000
+  "mode": "shared-secret",
+  "nonce": "server-random-base64url",
+  "algorithm": "hmac-sha256"
 }
 ```
 
@@ -255,9 +260,9 @@ Client auth:
 ```json
 {
   "type": "auth",
-  "clientId": "client_7f6c4f",
-  "timestampMs": 1782686726557,
-  "proof": "base64(hmac_sha256(derived_key, nonce + clientId + timestampMs))"
+  "nonce": "server-random-base64url",
+  "proof": "base64url(hmac_sha256(shared_secret, nonce))",
+  "algorithm": "hmac-sha256"
 }
 ```
 
@@ -265,9 +270,10 @@ Server accept:
 
 ```json
 {
-  "type": "auth_ok",
-  "sessionId": "sess_abc",
-  "serverSeq": 0
+  "type": "auth_status",
+  "status": "accepted",
+  "mode": "shared-secret",
+  "transport": true
 }
 ```
 
@@ -275,6 +281,7 @@ Rules:
 
 - Server rejects all messages except `auth` before authentication.
 - Server closes unauthenticated sockets after a short timeout.
+- Legacy QR/dev URLs may still authenticate with `?t=TOKEN`.
 - Server should use `wss://` for public/WAN use.
 - Local `ws://` is acceptable only for trusted LAN development.
 - Server can prompt for the secret at startup and keep it only in memory.
@@ -299,12 +306,15 @@ Client to server:
 Server to client:
 
 - `auth_challenge`
-- `auth_ok`
+- `auth_status`
+- `receiver_status`
 - `status`
 - `transcript`
 - `agent_summary`
+- `asr_status`
+- `agent_status`
 - `display`
-- `history`
+- `message_history`
 - `detail`
 - `resume_ack`
 - `pong`
@@ -751,7 +761,7 @@ Acceptance criteria:
 
 - Client can authenticate.
 - Server rejects unauthenticated audio.
-- Server sends `auth_ok`.
+- Server sends accepted `auth_status`.
 
 ### Milestone 2: Thin Client Split
 

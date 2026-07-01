@@ -160,8 +160,12 @@ workbench.
 
 **Local Auth**
 
-- The launcher enables QR token auth by default.
-- The receiver rejects `/audio` WebSocket upgrades without the matching token.
+- The launcher enables local auth by default.
+- QR/dev loading can use a legacy URL token.
+- Packaged apps can use shared-secret challenge auth; the raw shared secret is
+  not sent in the WebSocket URL.
+- The receiver rejects `/audio` WebSocket traffic without a valid token or
+  shared-secret proof.
 - Optional Even user UID allow-list is supported.
 
 **Speech Agent Workbench**
@@ -371,7 +375,7 @@ When `tokenSecret` and a UID are available, the launcher derives the audio token
 with `HMAC-SHA256(uid, tokenSecret)`. The receiver also receives Even user info
 from `bridge.getUserInfo()` and can restrict access by `allowedUserIds`.
 
-Disable local token auth:
+Disable local auth:
 
 ```bash
 EVEN_AUDIO_PIPE_AUTH=off npm start
