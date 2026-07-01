@@ -57,7 +57,8 @@ The launcher will:
 6. Include receiver endpoint hints and an auth secret in the QR URL.
 
 Scan the QR code with the Even app. The packaged app page also has editable
-private IP, public IP, and masked secret fields.
+private IP, public IP, and masked secret fields. Use the receiver port, usually
+`8788`; `5173` is only the local Vite app page.
 
 If the wrong network interface is detected:
 
@@ -504,7 +505,8 @@ npx evenhub qr --url 'http://YOUR_IP:5173?private=YOUR_IP:8788&public=PUBLIC_IP:
 ```
 
 The sideload page also has private IP, public IP, and secret fields. Values are
-stored in browser storage. The client tries `ws://PRIVATE/audio` first, then
+stored in browser storage. Use the receiver port, usually `8788`, not the Vite
+app port `5173`. The client tries `ws://PRIVATE/audio` first, then
 `wss://PUBLIC/audio`.
 
 ## Validation

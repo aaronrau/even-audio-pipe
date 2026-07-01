@@ -36,6 +36,7 @@ const appUrl = `http://${hostIp}:${appPort}`
 const wsUrl = `ws://${hostIp}:${receiverPort}/audio`
 const publicWsUrl = resolvePublicWsUrl(networkConfig)
 const receiverAddress = `${hostIp}:${receiverPort}`
+const publicReceiverAddress = publicWsUrl ? receiverAddressFromUrl(publicWsUrl) : ''
 const qrUrl = withEndpointQueryParams(
   authConfig.enabled ? withQueryParam(appUrl, 't', authConfig.token) : appUrl,
 )
@@ -101,6 +102,13 @@ if (authConfig.enabled) {
 console.log(`  LAN Audio WS:   ${wsUrl}`)
 console.log(`  WAN Audio WS:   ${publicWsUrl || 'not configured'}`)
 console.log(`  Receiver health http://127.0.0.1:${receiverPort}/health`)
+console.log('')
+console.log('Packaged app fields:')
+console.log(`  Private IP:port ${receiverAddress}`)
+console.log(`  Public IP:port  ${publicReceiverAddress || 'not configured'}`)
+console.log(`  Secret          ${authConfig.enabled ? 'use the t= value from the QR URL or config auth.token' : 'leave blank; auth disabled'}`)
+console.log(`  Note            enter receiver port ${receiverPort}, not app port ${appPort}`)
+console.log('')
 console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
 console.log(`  VAD:            ${vadConfig.backend}`)
 console.log(`  Audio dir:      ${displayPath(storageConfig.audioDir)}`)
@@ -354,10 +362,20 @@ function publicNetworkOrigins(publicWsUrl) {
   }
 }
 
+function receiverAddressFromUrl(value) {
+  try {
+    return new URL(value).host
+  } catch {
+    return String(value || '')
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+      .replace(/\/.*$/, '')
+  }
+}
+
 function withEndpointQueryParams(url) {
   const parsed = new URL(url)
   parsed.searchParams.set('private', receiverAddress)
-  if (publicWsUrl) parsed.searchParams.set('public', publicWsUrl)
+  if (publicReceiverAddress) parsed.searchParams.set('public', publicReceiverAddress)
   return parsed.toString()
 }
 

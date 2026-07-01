@@ -34,6 +34,9 @@ const LAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.lanAddress'
 const WAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.wanAddress'
 const AUTH_TOKEN_STORAGE_KEY = 'evenAudioPipe.authToken'
 const AUDIO_WS_PATH = '/audio'
+const DEFAULT_RECEIVER_PORT = '8788'
+const DEFAULT_APP_PORTS = new Set(['5173'])
+const CONNECT_TIMEOUT_MS = 5000
 
 const statusEl = document.getElementById('status')!
 const statsEl = document.getElementById('stats')!
@@ -285,6 +288,7 @@ function parseEndpointInput(value: string) {
   try {
     const parsed = new URL(withScheme)
     if (!['ws:', 'wss:', 'http:', 'https:'].includes(parsed.protocol)) return null
+    if (!parsed.port || DEFAULT_APP_PORTS.has(parsed.port)) parsed.port = DEFAULT_RECEIVER_PORT
     if (parsed.pathname === '/' || !parsed.pathname) parsed.pathname = AUDIO_WS_PATH
     return parsed
   } catch {
@@ -1132,9 +1136,18 @@ function connect() {
   ws = new WebSocket(endpoint.url)
   ws.binaryType = 'arraybuffer'
   let opened = false
+  let connectTimedOut = false
+  const connectTimeout = window.setTimeout(() => {
+    if (opened || ws !== connectingSocket) return
+    connectTimedOut = true
+    setUiStatus(`${endpoint.label} receiver timed out`)
+    ws.close()
+  }, CONNECT_TIMEOUT_MS)
+  const connectingSocket = ws
 
   ws.addEventListener('open', async () => {
     if (!ws) return
+    window.clearTimeout(connectTimeout)
     opened = true
     const startMessage: Record<string, unknown> = {
       type: 'start',
@@ -1160,6 +1173,7 @@ function connect() {
   })
 
   ws.addEventListener('close', async () => {
+    window.clearTimeout(connectTimeout)
     ws = null
     clearSpeechProcessingState()
     await setAudio(false)
@@ -1171,13 +1185,14 @@ function connect() {
       }
       const nextEndpoint = currentAudioEndpoint()
       setUiStatus(nextEndpoint
-        ? `Receiver disconnected, trying ${nextEndpoint.label}...`
+        ? `${connectTimedOut ? 'Receiver timed out' : 'Receiver disconnected'}, trying ${nextEndpoint.label}...`
         : 'Receiver disconnected, retrying...')
       scheduleReconnect()
     }
   })
 
   ws.addEventListener('error', () => {
+    window.clearTimeout(connectTimeout)
     speechDetected = false
     setUiStatus(`${endpoint.label} receiver connection error`)
   })
