@@ -35,11 +35,14 @@ const authConfig = resolveAuthConfig(config.auth)
 const appUrl = `http://${hostIp}:${appPort}`
 const wsUrl = `ws://${hostIp}:${receiverPort}/audio`
 const publicWsUrl = resolvePublicWsUrl(networkConfig)
+const receiverAddress = `${hostIp}:${receiverPort}`
 const qrUrl = withEndpointQueryParams(
   authConfig.enabled ? withQueryParam(appUrl, 't', authConfig.token) : appUrl,
 )
 const receiverHttpOrigin = `http://${hostIp}:${receiverPort}`
 const receiverWsOrigin = `ws://${hostIp}:${receiverPort}`
+const receiverHttpsOrigin = `https://${hostIp}:${receiverPort}`
+const receiverWssOrigin = `wss://${hostIp}:${receiverPort}`
 const publicOrigins = publicWsUrl ? publicNetworkOrigins(publicWsUrl) : []
 const workbenchSummaryWebhookUrl = `${receiverHttpOrigin}${workbenchConfig.summaryPath}`
 const workbenchSummaryWebhookLocalUrl = `http://127.0.0.1:${receiverPort}${workbenchConfig.summaryPath}`
@@ -353,8 +356,8 @@ function publicNetworkOrigins(publicWsUrl) {
 
 function withEndpointQueryParams(url) {
   const parsed = new URL(url)
-  parsed.searchParams.set('lan', wsUrl)
-  if (publicWsUrl) parsed.searchParams.set('wan', publicWsUrl)
+  parsed.searchParams.set('private', receiverAddress)
+  if (publicWsUrl) parsed.searchParams.set('public', publicWsUrl)
   return parsed.toString()
 }
 
@@ -1020,7 +1023,13 @@ function updateAppManifest() {
   const manifest = JSON.parse(readFileSync(manifestSourcePath, 'utf8'))
   const permissions = Array.isArray(manifest.permissions) ? manifest.permissions : []
   const network = permissions.find((permission) => permission?.name === 'network')
-  const networkWhitelist = uniqueStrings([receiverWsOrigin, receiverHttpOrigin, ...publicOrigins])
+  const networkWhitelist = uniqueStrings([
+    receiverWsOrigin,
+    receiverHttpOrigin,
+    receiverWssOrigin,
+    receiverHttpsOrigin,
+    ...publicOrigins,
+  ])
 
   if (network) {
     network.whitelist = networkWhitelist

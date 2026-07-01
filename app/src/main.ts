@@ -22,20 +22,27 @@ type AudioEndpoint = {
 }
 
 type AudioEndpointSettings = {
-  lanAddress: string
-  wanAddress: string
+  privateAddress: string
+  publicAddress: string
+  token: string
 }
 
+const RECEIVER_ADDRESS_STORAGE_KEY = 'evenAudioPipe.receiverAddress'
+const PRIVATE_ADDRESS_STORAGE_KEY = 'evenAudioPipe.privateAddress'
+const PUBLIC_ADDRESS_STORAGE_KEY = 'evenAudioPipe.publicAddress'
 const LAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.lanAddress'
 const WAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.wanAddress'
+const AUTH_TOKEN_STORAGE_KEY = 'evenAudioPipe.authToken'
 const AUDIO_WS_PATH = '/audio'
 
 const statusEl = document.getElementById('status')!
 const statsEl = document.getElementById('stats')!
 const urlEl = document.getElementById('url')!
 const transcriptEl = document.getElementById('transcript')!
-const lanAddressEl = document.getElementById('lan-address') as HTMLInputElement | null
-const wanAddressEl = document.getElementById('wan-address') as HTMLInputElement | null
+const privateAddressEl = document.getElementById('private-address') as HTMLInputElement | null
+const publicAddressEl = document.getElementById('public-address') as HTMLInputElement | null
+const authTokenEl = document.getElementById('auth-token') as HTMLInputElement | null
+const toggleAuthTokenEl = document.getElementById('toggle-auth-token') as HTMLButtonElement | null
 const saveEndpointsEl = document.getElementById('save-endpoints') as HTMLButtonElement | null
 
 function positiveNumber(value: string | undefined, fallback: number) {
@@ -55,7 +62,6 @@ let sentChunks = 0
 let sentBytes = 0
 let droppedChunks = 0
 let transcriptText = ''
-let queuedTranscriptText = ''
 let speechDetected = false
 let glassesMode: GlassesMode = 'live'
 let historyTransitioning = false
@@ -158,6 +164,10 @@ function launchToken() {
   return params.get('t') || params.get('token') || ''
 }
 
+function currentAuthToken() {
+  return audioEndpointSettings.token || launchToken()
+}
+
 function launchEndpointParam(keys: string[]) {
   const params = new URLSearchParams(window.location.search)
   for (const key of keys) {
@@ -188,33 +198,59 @@ function storeValue(key: string, value: string) {
 }
 
 function readAudioEndpointSettings(): AudioEndpointSettings {
+  const queryPrivateAddress = launchEndpointParam(['private', 'privateAddress', 'privateIp'])
+  const queryPublicAddress = launchEndpointParam(['public', 'publicAddress', 'publicIp'])
+  const queryAddress = launchEndpointParam(['address', 'receiver', 'endpoint', 'host'])
   const queryLanAddress = launchEndpointParam(['lan', 'lanAddress', 'lanWs', 'local', 'localWs'])
   const queryWanAddress = launchEndpointParam(['wan', 'wanAddress', 'wanWs', 'public', 'publicWs'])
-  const lanAddress = queryLanAddress ||
-    storedValue(LAN_ENDPOINT_STORAGE_KEY)
-  const wanAddress = queryWanAddress ||
+  const queryToken = launchToken()
+  const privateAddress = queryPrivateAddress ||
+    queryLanAddress ||
+    queryAddress ||
+    storedValue(PRIVATE_ADDRESS_STORAGE_KEY) ||
+    storedValue(LAN_ENDPOINT_STORAGE_KEY) ||
+    storedValue(RECEIVER_ADDRESS_STORAGE_KEY)
+  const publicAddress = queryPublicAddress ||
+    queryWanAddress ||
     storedValue(WAN_ENDPOINT_STORAGE_KEY)
+  const token = queryToken ||
+    storedValue(AUTH_TOKEN_STORAGE_KEY)
 
-  if (queryLanAddress || queryWanAddress) {
-    saveAudioEndpointSettings({ lanAddress, wanAddress })
+  if (queryPrivateAddress || queryPublicAddress || queryAddress || queryLanAddress || queryWanAddress || queryToken) {
+    saveAudioEndpointSettings({ privateAddress, publicAddress, token })
   }
 
-  return { lanAddress, wanAddress }
+  return { privateAddress, publicAddress, token }
 }
 
 function saveAudioEndpointSettings(settings: AudioEndpointSettings) {
-  storeValue(LAN_ENDPOINT_STORAGE_KEY, settings.lanAddress.trim())
-  storeValue(WAN_ENDPOINT_STORAGE_KEY, settings.wanAddress.trim())
+  storeValue(PRIVATE_ADDRESS_STORAGE_KEY, settings.privateAddress.trim())
+  storeValue(PUBLIC_ADDRESS_STORAGE_KEY, settings.publicAddress.trim())
+  storeValue(RECEIVER_ADDRESS_STORAGE_KEY, '')
+  storeValue(LAN_ENDPOINT_STORAGE_KEY, '')
+  storeValue(WAN_ENDPOINT_STORAGE_KEY, '')
+  storeValue(AUTH_TOKEN_STORAGE_KEY, settings.token.trim())
 }
 
 function setupEndpointForm() {
-  if (lanAddressEl) lanAddressEl.value = audioEndpointSettings.lanAddress
-  if (wanAddressEl) wanAddressEl.value = audioEndpointSettings.wanAddress
+  if (privateAddressEl) privateAddressEl.value = audioEndpointSettings.privateAddress
+  if (publicAddressEl) publicAddressEl.value = audioEndpointSettings.publicAddress
+  if (authTokenEl) authTokenEl.value = audioEndpointSettings.token
+
+  toggleAuthTokenEl?.addEventListener('click', () => {
+    if (!authTokenEl) return
+    const showing = authTokenEl.type === 'text'
+    authTokenEl.type = showing ? 'password' : 'text'
+    toggleAuthTokenEl.setAttribute('aria-pressed', String(!showing))
+    toggleAuthTokenEl.setAttribute('aria-label', showing ? 'Show secret' : 'Hide secret')
+    toggleAuthTokenEl.title = showing ? 'Show secret' : 'Hide secret'
+  })
 
   saveEndpointsEl?.addEventListener('click', () => {
     audioEndpointSettings = {
-      lanAddress: lanAddressEl?.value.trim() || '',
-      wanAddress: wanAddressEl?.value.trim() || '',
+      privateAddress: privateAddressEl?.value.trim() || '',
+      publicAddress: publicAddressEl?.value.trim() || '',
+      token: authTokenEl?.value.trim() || '',
     }
     saveAudioEndpointSettings(audioEndpointSettings)
     audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
@@ -229,39 +265,49 @@ function buildAudioWsEndpoints(settings: AudioEndpointSettings): AudioEndpoint[]
   const endpoints: AudioEndpoint[] = []
   const seen = new Set<string>()
 
-  const addEndpoint = (label: string, url: string | undefined) => {
-    const normalized = withLaunchToken(normalizeWsEndpoint(url, label))
+  const addEndpoint = (label: string, url: string | undefined, protocol: 'ws:' | 'wss:') => {
+    const normalized = withLaunchToken(normalizeWsEndpoint(url, protocol))
     if (!normalized || seen.has(normalized)) return
     seen.add(normalized)
     endpoints.push({ label, url: normalized })
   }
 
-  addEndpoint('LAN', settings.lanAddress)
-  addEndpoint('WAN', settings.wanAddress)
+  addEndpoint('Private', settings.privateAddress, 'ws:')
+  addEndpoint('Public', settings.publicAddress, 'wss:')
   return endpoints
 }
 
-function normalizeWsEndpoint(value: string | undefined, label: string) {
-  const input = (value || '').trim()
-  if (!input) return ''
-
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(input)
-    ? input
-    : `${label === 'WAN' ? 'wss' : 'ws'}://${input}`
+function parseEndpointInput(value: string) {
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
+    ? value
+    : `ws://${value}`
 
   try {
     const parsed = new URL(withScheme)
-    if (parsed.protocol === 'http:') parsed.protocol = 'ws:'
-    if (parsed.protocol === 'https:') parsed.protocol = 'wss:'
+    if (!['ws:', 'wss:', 'http:', 'https:'].includes(parsed.protocol)) return null
     if (parsed.pathname === '/' || !parsed.pathname) parsed.pathname = AUDIO_WS_PATH
-    return parsed.toString()
+    return parsed
   } catch {
-    return input
+    return null
   }
 }
 
+function endpointWithProtocol(endpoint: URL, protocol: 'ws:' | 'wss:') {
+  const next = new URL(endpoint.toString())
+  next.protocol = protocol
+  return next.toString()
+}
+
+function normalizeWsEndpoint(value: string | undefined, protocol: 'ws:' | 'wss:') {
+  const input = (value || '').trim()
+  if (!input) return ''
+
+  const parsed = parseEndpointInput(input)
+  return parsed ? endpointWithProtocol(parsed, protocol) : input
+}
+
 function withLaunchToken(url: string | undefined) {
-  const token = launchToken()
+  const token = currentAuthToken()
   if (!url || !token) return url
 
   try {
@@ -434,7 +480,7 @@ function currentSpeechWaveformFrame() {
 }
 
 function isSpeechProcessingActive() {
-  return speechDetected || Boolean(queuedTranscriptText)
+  return speechDetected
 }
 
 function makeStatusContainer(content: string, _isHistory: boolean) {
@@ -673,7 +719,6 @@ async function handleHistoryTap() {
 
 function clearSpeechProcessingState() {
   speechDetected = false
-  queuedTranscriptText = ''
   waveformFrameIndex = 0
   clearLiveTranscriptDisplay()
   historyNavigator.clearPendingTranscript()
@@ -691,7 +736,6 @@ function clearLiveTranscriptDisplay() {
 
 function stopSpeechProcessingIndicator() {
   speechDetected = false
-  queuedTranscriptText = ''
   waveformFrameIndex = 0
   historyNavigator.clearPendingTranscript()
   requestHistoryWindowUpdate()
@@ -764,17 +808,9 @@ function startIdleSpinner() {
   if (spinnerTimer !== null) return
 
   spinnerTimer = window.setInterval(() => {
-    if (speechDetected) {
-      waveformFrameIndex = (waveformFrameIndex + 1) % SPEECH_WAVEFORM_FRAMES.length
-    }
-    if (queuedTranscriptText) {
-      historyNavigator.setPendingTranscript(queuedTranscriptText)
-      if (isHistoryMode()) {
-        requestHistoryWindowUpdate()
-      }
-    }
+    if (!speechDetected) return
 
-    if (!speechDetected && !queuedTranscriptText) return
+    waveformFrameIndex = (waveformFrameIndex + 1) % SPEECH_WAVEFORM_FRAMES.length
     void renderGlassesStatus()
   }, SPINNER_INTERVAL_MS)
 }
@@ -881,7 +917,6 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'asr_status' && payload.status === 'queued') {
     speechDetected = false
-    queuedTranscriptText = ''
     historyNavigator.clearPendingTranscript()
     requestHistoryWindowUpdate()
     setUiStatus('Waiting for more speech...')
@@ -890,7 +925,6 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'asr_status' && payload.status === 'cleaning') {
     speechDetected = false
-    queuedTranscriptText = ''
     historyNavigator.clearPendingTranscript()
     requestHistoryWindowUpdate()
     setUiStatus('Cleaning transcript...')

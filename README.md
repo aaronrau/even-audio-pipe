@@ -1,124 +1,47 @@
 # Even Audio Pipe
 
-Even Audio Pipe is a local captioning prototype for Even Realities G2 glasses.
-It streams microphone PCM audio from an Even Hub WebView app to a local receiver,
-transcribes utterance chunks with a local ASR worker, and sends the latest
-transcript segment back to the glasses display.
+Even Audio Pipe turns Even Realities G-series glasses into a lightweight voice
+relay for local speech tools and coding agents. The sideloaded Even Hub app
+streams glasses microphone audio to a local receiver, the receiver transcribes
+speech, and final transcripts or agent summaries are sent back to the glasses.
 
-```text
-G2 mic
-  -> Even phone app
-  -> Even Hub WebView app
-  -> local WebSocket receiver
-  -> local ASR worker
-  -> transcript WebSocket event
-  -> glasses text container
-```
+This is a local-first developer tool. Audio, transcripts, ASR, cleanup, and
+agent routing stay on your machine unless you configure external endpoints.
 
-The glasses display intentionally behaves like live captions:
+## App Store Summary
 
-- Shows only the most recent final transcript segment.
-- Clears after 5 seconds without new transcript text.
-- Shows a small idle dot animation (`.`, `..`, `...`, `..`) while waiting.
+**Talk through your glasses. Route commands to your local agents. See the
+response without pulling out your phone.**
 
-## Runtime Flow
+Even Audio Pipe is a companion app for Even Realities glasses that captures
+short spoken utterances, transcribes them locally, and optionally forwards
+agent-prefixed commands to `speech-agent-workbench`.
 
-The receiver has two separate queues that are easy to mix up:
+**Highlights**
 
-- The STT batch queue combines raw transcript segments for cleanup, file
-  writes, and glasses display.
-- The workbench command queue decides when a command has been sent to
-  `speech-agent-workbench` and can be consumed.
+- Streams G-series microphone audio over one WebSocket.
+- Uses Silero VAD to detect speech and close utterances.
+- Runs local ASR through the included Python worker.
+- Shows a small waveform while speaking.
+- Shows final transcripts and agent summaries briefly, then clears the live view.
+- Keeps history available through the glasses tap menu.
+- Supports private `ws://` first, then public `wss://` reconnect behavior.
+- Can route commands such as `Flux check status` or `Wolf terminate session`.
+- Saves raw audio, WAV files, raw transcripts, cleaned transcripts, and metadata.
+- Supports optional transcript cleanup through an OpenAI-compatible local model.
 
-The current flow is:
+## What It Is
 
-```text
-G2 mic audio
-  -> WebSocket receiver
-  -> Silero VAD audio segment closes
-  -> ASR worker returns final text for that segment
-  -> non-empty STT text is appended to the STT batch queue
-  -> 3 seconds with no newer STT text or VAD speech
-  -> no active audio segment and no pending ASR job
-  -> or transcriptQueue.maxHoldMs is reached
-  -> queued raw text is combined
-  -> transcript cleanup runs once for the combined text
-  -> transcript files and transcripts.log are written
-  -> cleaned text is sent to the glasses
-  -> cleaned text is evaluated by the workbench command queue
-```
+Even Audio Pipe has two parts:
 
-VAD uses the Silero ONNX model from TypeScript/Node by default. Audio is sliced
-into recommended Silero frames, speech starts an utterance after the configured
-speech window, and about 240 ms of silence closes the segment.
-`ASR_SEGMENT_SECONDS` remains a hard safety cap for long utterances.
+- **Thin client:** a sideloaded Even Hub WebView app. It captures audio, displays
+  status/history on glasses, and reconnects to the receiver.
+- **Local receiver:** a Node server that receives PCM audio, runs VAD/ASR,
+  stores transcripts, routes commands, and sends summaries back to the client.
 
-The 3 second wait is based on the last non-empty STT result or later VAD speech
-activity. VAD silence and background audio below the speech threshold do not
-reset the timer. That wait only makes the queued text eligible to flush. The
-receiver still holds the queue if the same glasses connection has an open audio
-segment or an ASR job waiting/running, so a command is not sent while the user
-is still speaking into a segment that has not produced its transcript yet. To
-avoid getting stuck on noisy background audio, `transcriptQueue.maxHoldMs`
-caps how long VAD speech, active audio, or pending ASR can hold already queued
-transcript text.
-
-Workbench routing then behaves like this when `requireAgentPrefix` is enabled:
-
-```text
-Cleaned transcript starts with agent + message
-  -> POST /messages with { agent, message }
-  -> when the POST succeeds, flush/consume the workbench command state
-
-Cleaned transcript is exactly an agent name, for example "Pike"
-  -> do not POST yet
-  -> keep that agent armed in the workbench command queue
-
-Next flushed transcript arrives while an agent is armed
-  -> POST /messages with the armed agent and the new transcript as message
-  -> when the POST succeeds, flush/consume the armed agent
-
-Cleaned transcript has no agent and no armed agent
-  -> save/display transcript only
-  -> skip workbench POST
-
-Armed agent expires before a command is sent
-  -> clear the armed agent after agentArmTimeoutMs
-```
-
-This means `Pike update the heading` posts after the 3 second STT/VAD idle flush.
-`Pike` followed by `update the heading` also posts, but only if the second
-flushed transcript arrives before `agentArmTimeoutMs` expires. In both command
-cases, the workbench command queue is flushed when `/messages` succeeds. Ambient
-speech without an agent prefix is still saved and shown on the glasses, but it
-is not sent to the workbench.
-
-Workbench responses return on the separate summary webhook:
-
-```text
-speech-agent-workbench
-  -> POST /workbench/summary
-  -> receiver validates summaryToken when configured
-  -> summary/text is sent to connected glasses
-```
-
-## Requirements
-
-- Node.js 20 or newer.
-- npm.
-- Python 3.10 or newer with `venv`.
-- `ffmpeg` available on `PATH`.
-- Even app / Even Hub capable of loading a local development QR code.
-- Phone and computer on the same LAN, VPN, or tunnel-reachable network.
-
-The default ASR worker installs `onnx-asr[cpu,hub]`, `soundfile`, and `numpy`
-into `asr-worker/.venv` on first run. VAD runs in the local receiver with
-TypeScript/Node dependencies. ASR model files are downloaded by `onnx-asr`
-according to its own cache behavior.
+It does not run a cloud service, manage production auth, or replace the Even app.
 
 ## Quick Start
-
-From this folder:
 
 ```bash
 npm start
@@ -126,16 +49,17 @@ npm start
 
 The launcher will:
 
-1. Detect a non-loopback IPv4 address for this computer.
-2. Install app and receiver npm dependencies if missing.
-3. Read local storage settings from `config.json` when present.
-4. Add LAN/WAN audio endpoint hints to the Even Hub QR URL.
-5. Generate `app/app.json` from `app/app.example.json` with the correct network whitelist.
-6. Create/install the local ASR Python environment if needed.
-7. Start the ASR worker, receiver, and Vite dev server.
-8. Print an Even Hub QR code to scan in the Even app.
+1. Detect your LAN IP address.
+2. Install app and receiver dependencies if needed.
+3. Start the ASR worker, receiver, and Vite sideload app.
+4. Generate `app/app.json` with the right network whitelist.
+5. Print an Even Hub QR code.
+6. Include receiver endpoint hints and an auth secret in the QR URL.
 
-If auto-detection chooses the wrong interface:
+Scan the QR code with the Even app. The packaged app page also has editable
+private IP, public IP, and masked secret fields.
+
+If the wrong network interface is detected:
 
 ```bash
 EVEN_AUDIO_PIPE_HOST=192.168.1.100 npm start
@@ -150,18 +74,217 @@ EVEN_AUDIO_PIPE_ASR_PORT=8790 \
 npm start
 ```
 
-## Storage Configuration
+## Tutorial
 
-Local storage paths are configured in `config.json`. The file is ignored by git
-so users can set machine-specific paths without committing private locations.
+**1. Start the local stack**
 
-Create it from the tracked example:
+```bash
+npm start
+```
+
+Wait for the launcher to print:
+
+```text
+Even Audio Pipe
+  App URL:        http://YOUR_LAN_IP:5173
+  LAN Audio WS:   ws://YOUR_LAN_IP:8788/audio
+  Receiver health http://127.0.0.1:8788/health
+```
+
+**2. Scan the QR code**
+
+Open the Even app and scan the launcher QR. The sideload page should show the
+receiver URL and stream counters.
+
+**3. Speak**
+
+When speech is detected, the glasses show a compact waveform. Queued raw ASR
+text is not displayed. Only final transcript text is shown briefly, then the
+live view clears.
+
+**4. Open history**
+
+Tap the glasses history control to open recent transcripts and agent summaries.
+Tap an item to open detail. Tap again to return to the list. Opening history
+clears the transient live transcript display.
+
+**5. Route a command**
+
+Enable the workbench integration, then speak an agent-prefixed command:
+
+```text
+Flux pull latest changes
+Brock check the tests
+Wolf terminate session
+```
+
+The receiver sends:
+
+```json
+{ "agent": "Wolf", "message": "terminate session" }
+```
+
+Ambient speech without an agent prefix is saved and shown, but not sent to the
+workbench.
+
+## Features
+
+**Live Speech Relay**
+
+- Captures `pcm_s16le`, 16 kHz, mono audio from Even Hub.
+- Sends audio over `/audio` WebSocket.
+- Uses VAD to avoid fixed-length clipping.
+- Displays a waveform only while speech is active.
+
+**Final Transcript Display**
+
+- Final cleaned transcripts are displayed briefly on glasses.
+- Live text clears automatically after the hold period.
+- Queued ASR text is kept out of the live/history UI to avoid duplicate display.
+
+**History And Details**
+
+- Recent user transcripts and agent summaries are stored in JSONL.
+- Glasses tap navigation opens a list view and detail view.
+- Long details page by visual lines to fit the Even text container.
+
+**Private/Public Endpoint Failover**
+
+- The client stores private IP:port, public IP:port, and secret separately.
+- It tries private `ws://PRIVATE/audio` first.
+- It tries public `wss://PUBLIC/audio` second.
+- After a connected socket drops, reconnect starts from private `ws://` again.
+
+**Local Auth**
+
+- The launcher enables QR token auth by default.
+- The receiver rejects `/audio` WebSocket upgrades without the matching token.
+- Optional Even user UID allow-list is supported.
+
+**Speech Agent Workbench**
+
+- Final transcripts can be routed to `speech-agent-workbench`.
+- Agent names are parsed from the first few words.
+- Agent-only utterances arm the next transcript.
+- Summaries return through `/workbench/summary` and are pushed to glasses.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Glasses[Even G-series glasses]
+  Phone[Even phone app]
+  Client[Even Hub WebView thin client]
+  Receiver[Local receiver<br/>Node + ws]
+  VAD[Silero VAD]
+  ASR[Local ASR worker<br/>Python]
+  Cleanup[Optional transcript cleanup<br/>OpenAI-compatible endpoint]
+  Store[(Local files<br/>audio + transcripts)]
+  Workbench[speech-agent-workbench]
+
+  Glasses --> Phone
+  Phone --> Client
+  Client -- PCM audio --> Receiver
+  Receiver --> VAD
+  Receiver --> ASR
+  ASR --> Receiver
+  Receiver --> Cleanup
+  Receiver --> Store
+  Receiver -- transcript / summary events --> Client
+  Client --> Glasses
+  Receiver -- agent commands --> Workbench
+  Workbench -- summary webhook --> Receiver
+```
+
+## Sequence: Audio To Transcript
+
+```mermaid
+sequenceDiagram
+  participant G as Glasses
+  participant C as Thin client
+  participant R as Receiver
+  participant V as VAD
+  participant A as ASR worker
+  participant S as Storage
+
+  G->>C: microphone PCM frames
+  C->>R: binary PCM over WebSocket
+  R->>V: analyze frames
+  V-->>R: speech start / silence end
+  R->>A: WAV path
+  A-->>R: raw transcript
+  R->>R: queue raw transcript until idle
+  R->>R: optional cleanup
+  R->>S: write audio, transcript, metadata
+  R-->>C: final transcript event
+  C-->>G: display final text briefly
+```
+
+## Sequence: Workbench Command
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant R as Receiver
+  participant W as Workbench
+  participant C as Thin client
+  participant G as Glasses
+
+  User->>R: "Wolf terminate session"
+  R->>R: parse agent prefix
+  R->>W: POST /messages {agent, message}
+  W-->>R: accepts command
+  W-->>R: POST /workbench/summary
+  R-->>C: agent_summary event
+  C-->>G: display summary
+```
+
+## Sequence: Reconnect
+
+```mermaid
+sequenceDiagram
+  participant C as Thin client
+  participant Private as Private receiver
+  participant Public as Public receiver
+
+  C->>Private: connect ws://PRIVATE/audio
+  alt private available
+    Private-->>C: connected
+  else private unavailable
+    C->>Public: connect wss://PUBLIC/audio
+    Public-->>C: connected
+  end
+  Public--xC: socket closes
+  C->>Private: retry private first
+```
+
+## Design Decisions
+
+- **One socket for audio and responses:** The thin client sends binary PCM and
+  receives JSON control/results over the same WebSocket.
+- **Thin client stays thin:** ASR, cleanup, workbench tokens, and file writes are
+  server-side.
+- **Final text only:** The client does not display queued ASR text because it can
+  duplicate the final transcript.
+- **Private-first failover:** `ws://` is preferred for private LAN use. `wss://`
+  is the fallback for public WAN or tunnel access.
+- **History is pullable:** The client can request message history after
+  reconnect or when opening the menu.
+- **Text container safe:** Glasses output is paged and capped to fit Even text
+  container limits.
+
+## Configuration
+
+Create a local config:
 
 ```bash
 cp config.example.json config.json
 ```
 
-Default config:
+`config.json` is ignored by git. Paths may be relative to the repo root or
+absolute.
+
+Common sections:
 
 ```json
 {
@@ -170,80 +293,32 @@ Default config:
     "token": "",
     "tokenSecret": "",
     "tokenUserId": "",
-    "allowedUserIds": [],
-    "lastUser": null,
-    "scannedUsers": []
+    "allowedUserIds": []
   },
   "storage": {
     "audioDir": "data/audio",
     "transcriptDir": "data/transcripts",
     "transcriptsLog": "data/transcripts/transcripts.log"
   },
-  "vad": {
-    "backend": "silero",
-    "model": "",
-    "threshold": 0.5,
-    "frameMs": 30,
-    "frameSamples": 512,
-    "speechMs": 60,
-    "silenceMs": 240,
-    "preRollMs": 500,
-    "minUtteranceMs": 250
+  "network": {
+    "lanHost": "auto",
+    "publicUrl": "",
+    "publicWsUrl": ""
   },
   "workbench": {
     "enabled": false,
     "url": "http://127.0.0.1:8787",
-    "token": "",
-    "agent": "",
-    "agents": [
-      "Flux",
-      "Brock",
-      "Pike",
-      "Wolf"
-    ],
+    "agents": ["Flux", "Brock", "Pike", "Wolf"],
     "requireAgentPrefix": true,
-    "agentPrefixWordLimit": 3,
-    "agentArmTimeoutMs": 30000,
-    "timeoutMs": 15000,
     "summaryPath": "/workbench/summary",
     "summaryToken": ""
   },
   "transcriptQueue": {
     "idleMs": 3000,
     "maxHoldMs": 10000
-  },
-  "transcriptCleanup": {
-    "enabled": false,
-    "url": "http://127.0.0.1:8080/v1/chat/completions",
-    "model": "gemma-4-e4b-it-q4_0",
-    "temperature": 0,
-    "timeoutMs": 15000,
-    "required": false,
-    "prompt": "You clean short ASR transcript chunks from smart glasses. Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only. Always rewrite the misheard phrases \"ling few\", \"lane view\", and \"lanefuse\" as \"Langfuse\". Preserve the speaker's meaning and wording. Do not add facts, commands, explanations, or markdown. If uncertain, keep the original wording. Return only the cleaned transcript text.",
-    "llamaCpp": {
-      "autoStart": false,
-      "repoUrl": "https://github.com/ggml-org/llama.cpp.git",
-      "repoDir": "tools/llama.cpp",
-      "buildDir": "build-rocm",
-      "serverHost": "127.0.0.1",
-      "serverPort": 8080,
-      "hfModel": "google/gemma-4-E4B-it-qat-q4_0-gguf:Q4_0",
-      "alias": "gemma-4-e4b-it-q4_0",
-      "gpuLayers": 999,
-      "contextSize": 8192,
-      "parallel": 1,
-      "rocmArch": "",
-      "extraCmakeArgs": [],
-      "extraServerArgs": [],
-      "reuseUrls": []
-    }
   }
 }
 ```
-
-Paths may be relative to the repo root or absolute. `audioDir` stores `.pcm` and
-`.wav` files. `transcriptDir` stores per-segment `.txt` files. `transcriptsLog`
-stores the append-only transcript log.
 
 Use a different config file:
 
@@ -251,31 +326,28 @@ Use a different config file:
 EVEN_AUDIO_PIPE_CONFIG=/path/to/config.json npm start
 ```
 
-Environment variables override `config.json`:
+## Auth
 
-```bash
-AUDIO_DIR=/path/to/audio \
-TRANSCRIPT_DIR=/path/to/transcripts \
-TRANSCRIPTS_LOG=/path/to/transcripts/transcripts.log \
-npm start
-```
-
-## Local QR Auth
-
-The launcher enables local access-token auth by default. It puts a token and
-the LAN/WAN audio endpoints in the QR URL, then passes the same token to the
-receiver. The app stores those endpoint hints locally and copies the launch
-token into whichever WebSocket URL it is currently trying:
+The launcher adds a secret token to the QR URL and passes the same token to the
+receiver. The thin client can also store this value in its masked Secret field:
 
 ```text
-QR URL:  http://YOUR_COMPUTER_IP:5173?t=TOKEN&lan=ws://YOUR_COMPUTER_IP:8788/audio
-Audio:   ws://YOUR_COMPUTER_IP:8788/audio?t=TOKEN
+QR URL: http://YOUR_IP:5173?t=TOKEN&private=YOUR_IP:8788&public=PUBLIC_IP:8788
+Audio:  ws://YOUR_IP:8788/audio?t=TOKEN
 ```
 
-The receiver rejects `/audio` WebSocket connections without the matching token.
-This is local LAN protection; anyone who can see the QR URL can use the token.
+Use a stable token:
 
-Use a local UID hash token:
+```json
+{
+  "auth": {
+    "enabled": true,
+    "token": "change-me"
+  }
+}
+```
+
+Use a UID-derived token:
 
 ```json
 {
@@ -288,55 +360,9 @@ Use a local UID hash token:
 }
 ```
 
-When `auth.tokenSecret` and a UID are configured, the launcher uses
-`HMAC-SHA256(uid, tokenSecret)` as the QR/audio token. You can also pass the
-secret with `EVEN_AUDIO_PIPE_TOKEN_SECRET`. The UID is read from
-`EVEN_AUDIO_PIPE_AUTH_UID`, `auth.tokenUserId`, the first `auth.allowedUserIds`
-entry, or `auth.lastUser.uid`. This hash token takes precedence over
-`auth.token`.
-
-Use a stable token:
-
-```json
-{
-  "auth": {
-    "enabled": true,
-    "token": "change-me",
-    "allowedUserIds": [],
-    "lastUser": null,
-    "scannedUsers": []
-  }
-}
-```
-
-Restrict to specific Even users:
-
-```json
-{
-  "auth": {
-    "enabled": true,
-    "token": "change-me",
-    "allowedUserIds": ["12345"]
-  }
-}
-```
-
-The app sends `bridge.getUserInfo()` in the initial WebSocket `start` message.
-Even Hub currently documents `uid`, `name`, `avatar`, and `country`; it does
-not document an email field or a signed user token for plugin apps. The receiver
-logs the discovered user and saves it back into `config.json` as `auth.lastUser`
-and `auth.scannedUsers` on each QR/WebSocket startup:
-
-```text
-[auth] even user received: uid=12345
-[auth] accepted Even user: uid=12345
-```
-
-If `auth.allowedUserIds` is non-empty, the receiver closes the WebSocket unless
-the reported Even user `uid` matches. Email is not used for Even user
-authorization because the current SDK docs and observed runtime payload do not
-provide it. User info is not a signed token, so for internet proxying keep QR
-token auth enabled and use HTTPS/WSS at the proxy layer.
+When `tokenSecret` and a UID are available, the launcher derives the audio token
+with `HMAC-SHA256(uid, tokenSecret)`. The receiver also receives Even user info
+from `bridge.getUserInfo()` and can restrict access by `allowedUserIds`.
 
 Disable local token auth:
 
@@ -344,18 +370,23 @@ Disable local token auth:
 EVEN_AUDIO_PIPE_AUTH=off npm start
 ```
 
-## ASR Configuration
+## ASR And VAD
 
-Disable local ASR and record audio only:
+Default VAD:
+
+```bash
+ASR_CHUNK_MODE=vad \
+VAD_BACKEND=silero \
+SILERO_VAD_FRAME_SAMPLES=512 \
+SILERO_VAD_THRESHOLD=0.5 \
+VAD_SILENCE_MS=240 \
+npm start
+```
+
+Disable ASR and record audio only:
 
 ```bash
 EVEN_AUDIO_PIPE_ASR=off npm start
-```
-
-Use an existing Python environment:
-
-```bash
-EVEN_AUDIO_PIPE_ASR_PYTHON=/path/to/python npm start
 ```
 
 Use an external ASR worker:
@@ -364,80 +395,29 @@ Use an external ASR worker:
 ASR_WORKER_URL=http://127.0.0.1:8790 npm start
 ```
 
-Change the Parakeet ONNX model settings:
+Use a custom recognizer:
 
 ```bash
-PARAKEET_ONNX_MODEL=nemo-parakeet-tdt-0.6b-v3 \
-PARAKEET_ONNX_QUANTIZATION=int8 \
-npm start
+ASR_COMMAND='your-asr --input {wav}' npm start
+```
+
+`ASR_COMMAND` may use these placeholders:
+
+```text
+{pcm} raw PCM path
+{wav} converted WAV path
+{txt} transcript output path
+{rawTxt} raw transcript output path
+{cleanTxt} cleaned transcript output path
+{json} metadata path
 ```
 
 ## Transcript Cleanup
 
-Final ASR chunks are queued as raw transcript text before cleanup. Each new
-non-empty ASR result or later VAD speech activity resets `transcriptQueue.idleMs`;
-when no new STT transcript text or VAD speech arrives for 3 seconds by default
-and no audio segment or ASR job is still active, the queued raw text is
-combined, sent through transcript cleanup once, then forwarded to the workbench.
-If noisy background keeps VAD active, `transcriptQueue.maxHoldMs` defaults to
-10000 milliseconds and forces the queued text to flush after that cap.
+Cleanup is optional. It sends queued raw transcript text to an OpenAI-compatible
+chat completions endpoint, then writes both raw and cleaned transcript files.
 
-Transcript cleanup is an optional post-ASR stage. It sends each final ASR
-segment to an OpenAI-compatible chat completions endpoint, writes both the raw
-and cleaned transcript, and displays the cleaned text on the glasses.
-
-Enable Gemma 4 E4B QAT GGUF through llama.cpp:
-
-```json
-{
-  "transcriptCleanup": {
-    "enabled": true,
-    "prompt": "You clean short ASR transcript chunks from smart glasses...",
-    "llamaCpp": {
-      "autoStart": true,
-      "hfModel": "google/gemma-4-E4B-it-qat-q4_0-gguf:Q4_0",
-      "alias": "gemma-4-e4b-it-q4_0"
-    }
-  }
-}
-```
-
-When `autoStart` is enabled, `npm start` will:
-
-1. Reuse the configured cleanup endpoint when `/v1/models` is already reachable.
-2. Probe any `llamaCpp.reuseUrls` endpoints and reuse the first reachable server.
-3. Clone llama.cpp into `tools/llama.cpp` if no reusable server is found.
-4. Build `llama-server` with ROCm using CMake and `-DGGML_HIP=ON`.
-5. Start `llama-server` on the configured host and port.
-6. Wait for `http://127.0.0.1:8080/v1/models`.
-7. Send cleanup requests to `/v1/chat/completions`.
-
-If cleanup cannot be reused or started, the app keeps running with raw ASR
-transcripts unless `transcriptCleanup.required` is set to `true`.
-
-Changes to `transcriptCleanup.prompt` in `config.json` are picked up by the
-receiver on the next cleanup request. You do not need to restart for prompt-only
-edits.
-
-Prerequisites for the automatic llama.cpp path:
-
-- ROCm HIP SDK installed and `hipconfig` on `PATH`.
-- `cmake`, `git`, and a working C++ build toolchain.
-- Network access to Hugging Face, and access to the configured Gemma model.
-
-Set `llamaCpp.rocmArch` when auto-detection is wrong, for example:
-
-```json
-{
-  "transcriptCleanup": {
-    "llamaCpp": {
-      "rocmArch": "gfx1100"
-    }
-  }
-}
-```
-
-Use an existing cleanup server instead of the managed llama.cpp server:
+Example:
 
 ```json
 {
@@ -452,124 +432,30 @@ Use an existing cleanup server instead of the managed llama.cpp server:
 }
 ```
 
-Reuse one of several already-running llama.cpp servers before building:
+Prompt changes in `config.json` are picked up on the next cleanup request.
 
-```json
-{
-  "transcriptCleanup": {
-    "enabled": true,
-    "llamaCpp": {
-      "autoStart": true,
-      "reuseUrls": [
-        "http://127.0.0.1:18087/v1",
-        "http://127.0.0.1:18089/v1"
-      ]
-    }
-  }
-}
-```
-
-When a reusable server is found, the launcher uses the first model ID returned
-from `/v1/models` for cleanup requests.
-
-## Chunking
-
-By default, the receiver uses Silero VAD in the local TypeScript/Node receiver
-to close utterance chunks:
-
-```bash
-ASR_CHUNK_MODE=vad \
-VAD_BACKEND=silero \
-SILERO_VAD_FRAME_SAMPLES=512 \
-SILERO_VAD_THRESHOLD=0.5 \
-VAD_SILENCE_MS=240 \
-npm start
-```
-
-Use the RMS fallback explicitly when debugging or when the Node ONNX runtime is
-not available:
-
-```bash
-ASR_CHUNK_MODE=vad \
-VAD_BACKEND=rms \
-VAD_START_THRESHOLD=0.006 \
-VAD_RELEASE_THRESHOLD=0.0033 \
-VAD_SILENCE_MS=700 \
-npm start
-```
-
-Use fixed rolling chunks instead:
-
-```bash
-ASR_CHUNK_MODE=fixed ASR_SEGMENT_SECONDS=10 npm start
-```
-
-## Output Files
-
-Runtime artifacts are written to the configured storage paths:
-
-```text
-*.pcm              raw PCM s16le, 16 kHz, mono
-*.wav              converted WAV sent to ASR
-*.raw.txt          raw ASR transcript for that segment
-*.clean.txt        cleaned transcript for that segment
-*.txt              display transcript for that segment
-*.json             metadata with raw text, cleaned text, and cleanup status
-transcripts.log    append-only JSONL transcript log
-```
-
-These files can contain private audio and transcripts. They are ignored by
-`.gitignore` and should not be committed.
-
-## ASR Command Fallback
-
-For a custom recognizer, set `ASR_COMMAND`. The receiver replaces these
-placeholders:
-
-```text
-{pcm} raw PCM path
-{wav} converted WAV path
-{txt} transcript output path
-{rawTxt} raw transcript output path
-{cleanTxt} cleaned transcript output path
-{json} optional JSON output path
-```
-
-Example:
-
-```bash
-ASR_COMMAND='your-asr --input {wav}' npm start
-```
-
-The command must print the final transcript to stdout.
+The cleanup guard preserves commands when a model collapses an utterance such as
+`Wolf terminate session` into only `Wolf`.
 
 ## Speech Agent Workbench
 
-Final transcripts can be routed into
-[`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench)
-through its local `POST /messages` API. Agent summaries can be posted back to
-this receiver and displayed on the glasses.
-
-Example `config.json`:
+Enable command routing:
 
 ```json
 {
   "workbench": {
     "enabled": true,
     "url": "http://127.0.0.1:8787",
-    "token": "",
     "agents": ["Flux", "Brock", "Pike", "Wolf"],
     "requireAgentPrefix": true,
     "agentPrefixWordLimit": 3,
     "agentArmTimeoutMs": 30000,
-    "summaryPath": "/workbench/summary",
     "summaryToken": "summary-secret"
   }
 }
 ```
 
-`npm start` prints the exact workbench values to use. With the default receiver
-port, start the workbench with:
+Start `speech-agent-workbench` with the receiver webhook:
 
 ```bash
 VOICE_API_ENABLED=1 \
@@ -579,33 +465,30 @@ VOICE_TMUX_SUMMARY_WEBHOOK_TOKEN=summary-secret \
 ./run-auto.sh
 ```
 
-The receiver saves every cleaned transcript, but sends a transcript to
-`/messages` only when the cleaned text contains an exact configured agent name
-in the first `agentPrefixWordLimit` words. With the default config,
-`Flux pull latest`, `Hey Brock check status`, and `Pike push changes` route to
-the workbench; ambient speech without an agent prefix is skipped. A transcript
-that is exactly an agent name, such as `Pike`, arms the next flushed transcript
-for `agentArmTimeoutMs` milliseconds. Aliases such as "flex" or "brook" should
-be normalized by transcript cleanup before routing. The webhook body is expected
-to include `summary` or `text`; the receiver forwards that content to connected
-glasses as an agent summary.
+The receiver sends final commands to `/messages` only when an agent name appears
+within the configured prefix window. Agent summaries posted back to
+`/workbench/summary` are forwarded to connected glasses and saved in history.
 
-## even-terminal Forwarding
+## Output Files
 
-Final transcripts can also be sent to even-terminal:
+Runtime artifacts are written under `data/` by default:
 
-```bash
-EVEN_TERMINAL_URL=http://127.0.0.1:3456 \
-EVEN_TERMINAL_TOKEN=YOUR_TOKEN \
-npm start
+```text
+*.pcm              raw PCM s16le, 16 kHz, mono
+*.wav              converted WAV sent to ASR
+*.raw.txt          raw ASR transcript
+*.clean.txt        cleaned transcript
+*.txt              display transcript
+*.json             metadata
+transcripts.log    append-only transcript JSONL
+message-history/   glasses history JSONL
 ```
 
-Only final utterances are sent. Interim tokens are not generated by the default
-chunked ASR path.
+These files can contain private audio and transcripts. They are ignored by git.
 
 ## Manual App Development
 
-The one-command launcher is preferred. For manual app work:
+The one-command launcher is preferred. For app-only work:
 
 ```bash
 cd app
@@ -614,31 +497,34 @@ npm ci
 npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
-Update `app/app.json` network whitelist to include the receiver origin reachable
-from the phone, then pass the LAN endpoint in the QR URL:
+Pass receiver addresses in the QR URL:
 
 ```bash
-npx evenhub qr --url 'http://YOUR_COMPUTER_IP:5173?lan=ws://YOUR_COMPUTER_IP:8788/audio'
+npx evenhub qr --url 'http://YOUR_IP:5173?private=YOUR_IP:8788&public=PUBLIC_IP:8788'
 ```
 
-The app also has LAN and WAN endpoint fields on the page. Values entered there
-are stored in browser storage and tried in LAN-first, WAN-second order.
+The sideload page also has private IP, public IP, and secret fields. Values are
+stored in browser storage. The client tries `ws://PRIVATE/audio` first, then
+`wss://PUBLIC/audio`.
 
 ## Validation
-
-Run:
 
 ```bash
 npm run check
 ```
 
-This checks the launcher syntax, receiver syntax, TypeScript, and Vite build.
+For app-only changes:
 
-## Public Repo Hygiene
+```bash
+cd app
+npm run build
+npm run test:history
+```
 
-The repository is intended to track source, lockfiles, and examples only.
-Generated config, dependency folders, Python environments, build output, and
-recordings are ignored:
+## Repo Hygiene
+
+Tracked files are source, examples, lockfiles, and docs. Generated/private files
+are ignored:
 
 - `app/app.json`
 - `app/dist/`

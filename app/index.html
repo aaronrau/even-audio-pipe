@@ -164,6 +164,18 @@
         gap: 10px;
       }
 
+      .secret-row {
+        display: grid;
+        grid-template-columns: 1fr 44px;
+        gap: 8px;
+      }
+
+      .address-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+
       input,
       button {
         box-sizing: border-box;
@@ -198,6 +210,37 @@
         transform: translateY(1px);
       }
 
+      .icon-button {
+        min-width: 0;
+        height: 46px;
+        padding: 0;
+        display: grid;
+        place-items: center;
+        background: var(--surface-soft);
+        color: var(--text);
+        border-color: var(--line);
+      }
+
+      .eye-icon {
+        position: relative;
+        width: 20px;
+        height: 12px;
+        border: 1.7px solid currentColor;
+        border-radius: 50%;
+      }
+
+      .eye-icon::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: currentColor;
+        transform: translate(-50%, -50%);
+      }
+
       @media (min-width: 680px) {
         main {
           padding: 28px 18px;
@@ -208,12 +251,31 @@
         }
 
         .endpoint-grid {
-          grid-template-columns: 1fr 1fr auto;
+          grid-template-columns: 1fr auto;
           align-items: center;
+        }
+
+        .address-grid {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .address-grid,
+        .secret-row {
+          grid-column: 1;
         }
 
         button {
           min-width: 148px;
+        }
+
+        .icon-button {
+          min-width: 0;
+        }
+
+        #save-endpoints {
+          grid-column: 2;
+          grid-row: 1 / span 2;
+          align-self: stretch;
         }
       }
 
@@ -257,23 +319,45 @@
         </section>
       </div>
       <section class="panel">
-        <div class="label">Endpoints</div>
+        <div class="label">Connection</div>
         <div class="endpoint-grid">
-          <input
-            id="lan-address"
-            autocomplete="off"
-            autocapitalize="none"
-            spellcheck="false"
-            placeholder="LAN address, e.g. 192.168.1.50:8788"
-          />
-          <input
-            id="wan-address"
-            autocomplete="off"
-            autocapitalize="none"
-            spellcheck="false"
-            placeholder="WAN address, e.g. wss://even-audio.example.com/audio"
-          />
-          <button id="save-endpoints" type="button">Save Endpoints</button>
+          <div class="address-grid">
+            <input
+              id="private-address"
+              autocomplete="off"
+              autocapitalize="none"
+              spellcheck="false"
+              placeholder="Private IP:port, e.g. 192.168.1.50:8788"
+            />
+            <input
+              id="public-address"
+              autocomplete="off"
+              autocapitalize="none"
+              spellcheck="false"
+              placeholder="Public IP:port"
+            />
+          </div>
+          <div class="secret-row">
+            <input
+              id="auth-token"
+              type="password"
+              autocomplete="off"
+              autocapitalize="none"
+              spellcheck="false"
+              placeholder="Secret"
+            />
+            <button
+              id="toggle-auth-token"
+              class="icon-button"
+              type="button"
+              aria-label="Show secret"
+              aria-pressed="false"
+              title="Show secret"
+            >
+              <span class="eye-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+          <button id="save-endpoints" type="button">Save</button>
         </div>
       </section>
       <section class="panel">

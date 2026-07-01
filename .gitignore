@@ -17,6 +17,7 @@ models/
 *.pcm
 *.wav
 *.log
+*.ehpk
 
 # Python runtime artifacts
 asr-worker/.venv/
