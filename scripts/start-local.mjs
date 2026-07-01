@@ -155,6 +155,7 @@ spawnManaged('receiver', 'npm', ['start'], {
     SPEECH_WORKBENCH_SUMMARY_PATH: workbenchConfig.summaryPath,
     EVEN_AUDIO_PIPE_CONFIG_PATH: configPath,
     EVEN_AUDIO_PIPE_TOKEN: authConfig.enabled ? authConfig.token : '',
+    EVEN_AUDIO_PIPE_TOKEN_SECRET: authConfig.enabled ? authConfig.tokenSecret : '',
     VAD_BACKEND: vadConfig.backend,
     VAD_FRAME_MS: String(vadConfig.frameMs),
     VAD_SILENCE_MS: String(vadConfig.silenceMs),
@@ -276,6 +277,7 @@ function resolveAuthConfig(auth = {}) {
   return {
     enabled,
     token: enabled ? derivedToken || configuredToken || randomToken() : '',
+    tokenSecret,
     source: authTokenSource({ derivedToken, configuredToken, tokenSecret, tokenUserId }),
     tokenUserId,
   }
@@ -371,15 +373,45 @@ function receiverAddressFromUrl(value) {
 function printClientAppSettings() {
   console.log('')
   console.log('CLIENT APP SETTINGS - enter these in the packaged app')
-  console.log('  Private IP:port:')
-  console.log(`    ${receiverAddress}`)
-  console.log('  Public IP:port:')
-  console.log(`    ${publicReceiverAddress || '(leave blank)'}`)
+  console.log('  Private IP:')
+  console.log(`    ${hostIp}`)
+  console.log('  Private Port:')
+  console.log(`    ${receiverPort}`)
+  console.log('  Public IP:')
+  console.log(`    ${publicReceiverAddress ? publicReceiverAddressHost(publicReceiverAddress) : '(leave blank)'}`)
+  console.log('  Public Port:')
+  console.log(`    ${publicReceiverAddress ? publicReceiverAddressPort(publicReceiverAddress) || receiverPort : '(leave blank)'}`)
   console.log('  Secret:')
-  console.log(`    ${authConfig.enabled ? authConfig.token : '(leave blank; auth disabled)'}`)
+  console.log(`    ${clientAppSecretValue()}`)
   console.log('  Do not enter:')
   console.log(`    ${appUrl}  (this is the app page, not the receiver)`)
   console.log('')
+}
+
+function clientAppSecretValue() {
+  if (!authConfig.enabled) return '(leave blank; auth disabled)'
+  return authConfig.tokenSecret || '(set config.auth.tokenSecret)'
+}
+
+function publicReceiverAddressHost(value) {
+  const parsed = splitHostPort(value)
+  return parsed.host
+}
+
+function publicReceiverAddressPort(value) {
+  const parsed = splitHostPort(value)
+  return parsed.port
+}
+
+function splitHostPort(value) {
+  try {
+    const parsed = new URL(`wss://${value}`)
+    return { host: parsed.hostname, port: parsed.port }
+  } catch {
+    const match = String(value || '').match(/^(.+):(\d+)$/)
+    if (match) return { host: match[1], port: match[2] }
+    return { host: String(value || ''), port: '' }
+  }
 }
 
 function withEndpointQueryParams(url) {

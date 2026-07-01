@@ -170,10 +170,15 @@
         gap: 8px;
       }
 
-      .address-grid {
+      .address-grid,
+      .address-row {
         display: grid;
         grid-template-columns: 1fr;
         gap: 10px;
+      }
+
+      .address-row {
+        grid-template-columns: minmax(0, 1fr) minmax(78px, 108px);
       }
 
       input,
@@ -255,10 +260,6 @@
           align-items: center;
         }
 
-        .address-grid {
-          grid-template-columns: 1fr 1fr;
-        }
-
         .address-grid,
         .secret-row {
           grid-column: 1;
@@ -322,20 +323,44 @@
         <div class="label">Connection</div>
         <div class="endpoint-grid">
           <div class="address-grid">
-            <input
-              id="private-address"
-              autocomplete="off"
-              autocapitalize="none"
-              spellcheck="false"
-              placeholder="Private receiver IP:port, e.g. 192.168.1.50:8788"
-            />
-            <input
-              id="public-address"
-              autocomplete="off"
-              autocapitalize="none"
-              spellcheck="false"
-              placeholder="Public receiver IP:port"
-            />
+            <div class="address-row">
+              <input
+                id="private-ip"
+                autocomplete="off"
+                autocapitalize="none"
+                inputmode="decimal"
+                pattern="[0-9.]*"
+                spellcheck="false"
+                placeholder="Private IP"
+              />
+              <input
+                id="private-port"
+                autocomplete="off"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                spellcheck="false"
+                placeholder="Port"
+              />
+            </div>
+            <div class="address-row">
+              <input
+                id="public-ip"
+                autocomplete="off"
+                autocapitalize="none"
+                inputmode="decimal"
+                pattern="[0-9.]*"
+                spellcheck="false"
+                placeholder="Public IP"
+              />
+              <input
+                id="public-port"
+                autocomplete="off"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                spellcheck="false"
+                placeholder="Port"
+              />
+            </div>
           </div>
           <div class="secret-row">
             <input
@@ -344,7 +369,7 @@
               autocomplete="off"
               autocapitalize="none"
               spellcheck="false"
-              placeholder="Secret"
+              placeholder="Shared secret"
             />
             <button
               id="toggle-auth-token"

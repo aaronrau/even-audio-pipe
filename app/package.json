@@ -1,13 +1,14 @@
 {
   "name": "even-audio-pipe-app",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.1.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "pack": "evenhub pack",
+    "test:endpoints": "tsx test/audioEndpoints.test.ts",
     "test:history": "tsx test/historyCanvas.test.ts && tsx test/historyNavigator.test.ts",
     "test:history:current": "tsx test/historyCurrentData.test.ts",
     "simulate": "evenhub-simulator http://localhost:5173"

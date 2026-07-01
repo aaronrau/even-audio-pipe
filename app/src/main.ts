@@ -13,19 +13,15 @@ import {
   type HistoryEntry,
   type HistoryScrollDirection,
 } from './historyCanvas'
+import {
+  blankAudioEndpointSettings,
+  buildAudioWsEndpoints,
+  joinAddress,
+  splitAddress,
+  type AudioEndpointSettings,
+} from './audioEndpoints'
 import { historyScrollDirectionFromEventType } from './historyInput'
 import { HistoryNavigator } from './historyNavigator'
-
-type AudioEndpoint = {
-  label: string
-  url: string
-}
-
-type AudioEndpointSettings = {
-  privateAddress: string
-  publicAddress: string
-  token: string
-}
 
 const RECEIVER_ADDRESS_STORAGE_KEY = 'evenAudioPipe.receiverAddress'
 const PRIVATE_ADDRESS_STORAGE_KEY = 'evenAudioPipe.privateAddress'
@@ -33,17 +29,16 @@ const PUBLIC_ADDRESS_STORAGE_KEY = 'evenAudioPipe.publicAddress'
 const LAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.lanAddress'
 const WAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.wanAddress'
 const AUTH_TOKEN_STORAGE_KEY = 'evenAudioPipe.authToken'
-const AUDIO_WS_PATH = '/audio'
-const DEFAULT_RECEIVER_PORT = '8788'
-const DEFAULT_APP_PORTS = new Set(['5173'])
 const CONNECT_TIMEOUT_MS = 5000
 
 const statusEl = document.getElementById('status')!
 const statsEl = document.getElementById('stats')!
 const urlEl = document.getElementById('url')!
 const transcriptEl = document.getElementById('transcript')!
-const privateAddressEl = document.getElementById('private-address') as HTMLInputElement | null
-const publicAddressEl = document.getElementById('public-address') as HTMLInputElement | null
+const privateIpEl = document.getElementById('private-ip') as HTMLInputElement | null
+const privatePortEl = document.getElementById('private-port') as HTMLInputElement | null
+const publicIpEl = document.getElementById('public-ip') as HTMLInputElement | null
+const publicPortEl = document.getElementById('public-port') as HTMLInputElement | null
 const authTokenEl = document.getElementById('auth-token') as HTMLInputElement | null
 const toggleAuthTokenEl = document.getElementById('toggle-auth-token') as HTMLButtonElement | null
 const saveEndpointsEl = document.getElementById('save-endpoints') as HTMLButtonElement | null
@@ -75,8 +70,9 @@ let lastHistoryRenderedContent = ''
 let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
+let audioStreamStarted = false
 let reconnectTimer: number | null = null
-let audioEndpointSettings = readAudioEndpointSettings()
+let audioEndpointSettings = blankAudioEndpointSettings()
 let audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
 let audioEndpointIndex = 0
 let clearTranscriptTimer: number | null = null
@@ -167,8 +163,8 @@ function launchToken() {
   return params.get('t') || params.get('token') || ''
 }
 
-function currentAuthToken() {
-  return audioEndpointSettings.token || launchToken()
+function currentSharedSecret() {
+  return audioEndpointSettings.token
 }
 
 function launchEndpointParam(keys: string[]) {
@@ -200,7 +196,24 @@ function storeValue(key: string, value: string) {
   }
 }
 
-function readAudioEndpointSettings(): AudioEndpointSettings {
+async function bridgeStoredValue(key: string) {
+  try {
+    return (await bridge.getLocalStorage(key))?.trim() || storedValue(key)
+  } catch {
+    return storedValue(key)
+  }
+}
+
+async function storeBridgeValue(key: string, value: string) {
+  try {
+    await bridge.setLocalStorage(key, value)
+  } catch {
+    // Browser localStorage remains useful in simulator/dev contexts.
+  }
+  storeValue(key, value)
+}
+
+async function readAudioEndpointSettings(): Promise<AudioEndpointSettings> {
   const queryPrivateAddress = launchEndpointParam(['private', 'privateAddress', 'privateIp'])
   const queryPublicAddress = launchEndpointParam(['public', 'publicAddress', 'publicIp'])
   const queryAddress = launchEndpointParam(['address', 'receiver', 'endpoint', 'host'])
@@ -210,34 +223,40 @@ function readAudioEndpointSettings(): AudioEndpointSettings {
   const privateAddress = queryPrivateAddress ||
     queryLanAddress ||
     queryAddress ||
-    storedValue(PRIVATE_ADDRESS_STORAGE_KEY) ||
-    storedValue(LAN_ENDPOINT_STORAGE_KEY) ||
-    storedValue(RECEIVER_ADDRESS_STORAGE_KEY)
+    await bridgeStoredValue(PRIVATE_ADDRESS_STORAGE_KEY) ||
+    await bridgeStoredValue(LAN_ENDPOINT_STORAGE_KEY) ||
+    await bridgeStoredValue(RECEIVER_ADDRESS_STORAGE_KEY)
   const publicAddress = queryPublicAddress ||
     queryWanAddress ||
-    storedValue(WAN_ENDPOINT_STORAGE_KEY)
-  const token = queryToken ||
-    storedValue(AUTH_TOKEN_STORAGE_KEY)
+    await bridgeStoredValue(PUBLIC_ADDRESS_STORAGE_KEY) ||
+    await bridgeStoredValue(WAN_ENDPOINT_STORAGE_KEY)
+  const token = await bridgeStoredValue(AUTH_TOKEN_STORAGE_KEY)
 
   if (queryPrivateAddress || queryPublicAddress || queryAddress || queryLanAddress || queryWanAddress || queryToken) {
-    saveAudioEndpointSettings({ privateAddress, publicAddress, token })
+    await saveAudioEndpointSettings({ privateAddress, publicAddress, token })
   }
 
   return { privateAddress, publicAddress, token }
 }
 
-function saveAudioEndpointSettings(settings: AudioEndpointSettings) {
-  storeValue(PRIVATE_ADDRESS_STORAGE_KEY, settings.privateAddress.trim())
-  storeValue(PUBLIC_ADDRESS_STORAGE_KEY, settings.publicAddress.trim())
-  storeValue(RECEIVER_ADDRESS_STORAGE_KEY, '')
-  storeValue(LAN_ENDPOINT_STORAGE_KEY, '')
-  storeValue(WAN_ENDPOINT_STORAGE_KEY, '')
-  storeValue(AUTH_TOKEN_STORAGE_KEY, settings.token.trim())
+async function saveAudioEndpointSettings(settings: AudioEndpointSettings) {
+  await Promise.all([
+    storeBridgeValue(PRIVATE_ADDRESS_STORAGE_KEY, settings.privateAddress.trim()),
+    storeBridgeValue(PUBLIC_ADDRESS_STORAGE_KEY, settings.publicAddress.trim()),
+    storeBridgeValue(RECEIVER_ADDRESS_STORAGE_KEY, ''),
+    storeBridgeValue(LAN_ENDPOINT_STORAGE_KEY, ''),
+    storeBridgeValue(WAN_ENDPOINT_STORAGE_KEY, ''),
+    storeBridgeValue(AUTH_TOKEN_STORAGE_KEY, settings.token.trim()),
+  ])
 }
 
 function setupEndpointForm() {
-  if (privateAddressEl) privateAddressEl.value = audioEndpointSettings.privateAddress
-  if (publicAddressEl) publicAddressEl.value = audioEndpointSettings.publicAddress
+  const privateParts = splitAddress(audioEndpointSettings.privateAddress)
+  const publicParts = splitAddress(audioEndpointSettings.publicAddress)
+  if (privateIpEl) privateIpEl.value = privateParts.host
+  if (privatePortEl) privatePortEl.value = privateParts.port
+  if (publicIpEl) publicIpEl.value = publicParts.host
+  if (publicPortEl) publicPortEl.value = publicParts.port
   if (authTokenEl) authTokenEl.value = audioEndpointSettings.token
 
   toggleAuthTokenEl?.addEventListener('click', () => {
@@ -250,77 +269,53 @@ function setupEndpointForm() {
   })
 
   saveEndpointsEl?.addEventListener('click', () => {
-    audioEndpointSettings = {
-      privateAddress: privateAddressEl?.value.trim() || '',
-      publicAddress: publicAddressEl?.value.trim() || '',
-      token: authTokenEl?.value.trim() || '',
-    }
-    saveAudioEndpointSettings(audioEndpointSettings)
-    audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
-    audioEndpointIndex = 0
-    setUiStatus('Endpoints saved, reconnecting...')
-    ws?.close()
-    if (!ws) connect()
+    void saveEndpointForm()
   })
 }
 
-function buildAudioWsEndpoints(settings: AudioEndpointSettings): AudioEndpoint[] {
-  const endpoints: AudioEndpoint[] = []
-  const seen = new Set<string>()
-
-  const addEndpoint = (label: string, url: string | undefined, protocol: 'ws:' | 'wss:') => {
-    const normalized = withLaunchToken(normalizeWsEndpoint(url, protocol))
-    if (!normalized || seen.has(normalized)) return
-    seen.add(normalized)
-    endpoints.push({ label, url: normalized })
-  }
-
-  addEndpoint('Private', settings.privateAddress, 'ws:')
-  addEndpoint('Public', settings.publicAddress, 'wss:')
-  return endpoints
-}
-
-function parseEndpointInput(value: string) {
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
-    ? value
-    : `ws://${value}`
-
+async function saveEndpointForm() {
   try {
-    const parsed = new URL(withScheme)
-    if (!['ws:', 'wss:', 'http:', 'https:'].includes(parsed.protocol)) return null
-    if (!parsed.port || DEFAULT_APP_PORTS.has(parsed.port)) parsed.port = DEFAULT_RECEIVER_PORT
-    if (parsed.pathname === '/' || !parsed.pathname) parsed.pathname = AUDIO_WS_PATH
-    return parsed
-  } catch {
-    return null
+    audioEndpointSettings = {
+      privateAddress: joinAddress(privateIpEl?.value || '', privatePortEl?.value || ''),
+      publicAddress: joinAddress(publicIpEl?.value || '', publicPortEl?.value || ''),
+      token: authTokenEl?.value.trim() || '',
+    }
+    setUiStatus('Saving connection settings...')
+    await saveAudioEndpointSettings(audioEndpointSettings)
+    audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings, launchToken())
+    audioEndpointIndex = 0
+    setUiStatus('Connection settings saved, reconnecting...')
+    ws?.close()
+    if (!ws) connect()
+  } catch (err) {
+    console.error(err)
+    setUiStatus('Could not save connection settings')
   }
 }
 
-function endpointWithProtocol(endpoint: URL, protocol: 'ws:' | 'wss:') {
-  const next = new URL(endpoint.toString())
-  next.protocol = protocol
-  return next.toString()
+async function sharedSecretProof(secret: string, nonce: string) {
+  const key = await window.crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const signature = await window.crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(nonce),
+  )
+  return base64Url(new Uint8Array(signature))
 }
 
-function normalizeWsEndpoint(value: string | undefined, protocol: 'ws:' | 'wss:') {
-  const input = (value || '').trim()
-  if (!input) return ''
-
-  const parsed = parseEndpointInput(input)
-  return parsed ? endpointWithProtocol(parsed, protocol) : input
-}
-
-function withLaunchToken(url: string | undefined) {
-  const token = currentAuthToken()
-  if (!url || !token) return url
-
-  try {
-    const parsed = new URL(url)
-    parsed.searchParams.set('t', token)
-    return parsed.toString()
-  } catch {
-    return url
-  }
+function base64Url(bytes: Uint8Array) {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
 }
 
 function displayWsUrl(url: string) {
@@ -830,6 +825,11 @@ function handleReceiverMessage(raw: string) {
   if (!message || typeof message !== 'object') return
   const payload = message as Record<string, unknown>
 
+  if (payload.type === 'auth_challenge' && typeof payload.nonce === 'string') {
+    void answerAuthChallenge(payload.nonce)
+    return
+  }
+
   if (payload.type === 'message_history' && Array.isArray(payload.entries)) {
     const entries = payload.entries
       .map(sanitizeHistoryEntry)
@@ -942,7 +942,42 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'receiver_status') {
-    setUiStatus('Receiver connected')
+    setUiStatus(payload.status === 'auth_required'
+      ? 'Authenticating receiver...'
+      : 'Receiver connected')
+    return
+  }
+
+  if (payload.type === 'auth_status') {
+    if (payload.status === 'accepted') {
+      void startAudioStream()
+    } else if (payload.status === 'rejected') {
+      setUiStatus('Authentication rejected')
+    }
+    return
+  }
+}
+
+async function answerAuthChallenge(nonce: string) {
+  const secret = currentSharedSecret()
+  if (!secret) {
+    setUiStatus('Missing shared secret')
+    return
+  }
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+
+  try {
+    const proof = await sharedSecretProof(secret, nonce)
+    ws.send(JSON.stringify({
+      type: 'auth',
+      nonce,
+      proof,
+      algorithm: 'hmac-sha256',
+    }))
+  } catch (err) {
+    setUiStatus('Could not hash shared secret')
+    console.error(err)
   }
 }
 
@@ -1081,6 +1116,8 @@ function logInputEvent(event: EvenHubEvent) {
 }
 
 const bridge = await waitForEvenAppBridge()
+audioEndpointSettings = await readAudioEndpointSettings()
+audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings, launchToken())
 evenUserInfo = await loadUserInfo()
 
 const statusContainer = makeStatusContainer('Starting audio pipe...', false)
@@ -1096,6 +1133,27 @@ const created = await bridge.createStartUpPageContainer(
 if (created !== 0) {
   setUiStatus(`Startup page failed: ${created}`)
   throw new Error(`createStartUpPageContainer failed: ${created}`)
+}
+
+async function startAudioStream() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || audioStreamStarted) return
+  audioStreamStarted = true
+  const endpoint = currentAudioEndpoint()
+  const startMessage: Record<string, unknown> = {
+    type: 'start',
+    source: 'g2',
+    encoding: 'pcm_s16le',
+    sampleRate: 16000,
+    channels: 1,
+  }
+
+  if (evenUserInfo) {
+    startMessage.user = evenUserInfo
+  }
+
+  ws.send(JSON.stringify(startMessage))
+  await setAudio(true)
+  setUiStatus(`Streaming G2 mic audio${endpoint ? ` via ${endpoint.label}` : ''}`)
 }
 
 async function renderGlassesStatus() {
@@ -1133,6 +1191,7 @@ function connect() {
 
   urlEl.textContent = `${endpoint.label}: ${displayWsUrl(endpoint.url)}`
   setUiStatus(`Connecting to ${endpoint.label} receiver...`)
+  audioStreamStarted = false
   ws = new WebSocket(endpoint.url)
   ws.binaryType = 'arraybuffer'
   let opened = false
@@ -1149,21 +1208,11 @@ function connect() {
     if (!ws) return
     window.clearTimeout(connectTimeout)
     opened = true
-    const startMessage: Record<string, unknown> = {
-      type: 'start',
-      source: 'g2',
-      encoding: 'pcm_s16le',
-      sampleRate: 16000,
-      channels: 1,
+    if (currentSharedSecret()) {
+      setUiStatus(`Authenticating ${endpoint.label} receiver...`)
+      return
     }
-
-    if (evenUserInfo) {
-      startMessage.user = evenUserInfo
-    }
-
-    ws.send(JSON.stringify(startMessage))
-    await setAudio(true)
-    setUiStatus(`Streaming G2 mic audio via ${endpoint.label}`)
+    await startAudioStream()
   })
 
   ws.addEventListener('message', event => {

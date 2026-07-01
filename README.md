@@ -56,9 +56,10 @@ The launcher will:
 5. Print an Even Hub QR code.
 6. Include receiver endpoint hints and an auth secret in the QR URL.
 
-Scan the QR code with the Even app. The packaged app page also has editable
-private IP, public IP, and masked secret fields. Use the receiver port, usually
-`8788`; `5173` is only the local Vite app page.
+Scan the QR code with the Even app. The packaged app page also has separate
+private IP, private port, public IP, public port, and masked shared-secret
+fields. Use the receiver port, usually `8788`; `5173` is only the local Vite
+app page.
 
 If the wrong network interface is detected:
 
@@ -151,7 +152,8 @@ workbench.
 
 **Private/Public Endpoint Failover**
 
-- The client stores private IP:port, public IP:port, and secret separately.
+- The client stores private IP, private port, public IP, public port, and the
+  raw shared secret.
 - It tries private `ws://PRIVATE/audio` first.
 - It tries public `wss://PUBLIC/audio` second.
 - After a connected socket drops, reconnect starts from private `ws://` again.
@@ -329,8 +331,12 @@ EVEN_AUDIO_PIPE_CONFIG=/path/to/config.json npm start
 
 ## Auth
 
-The launcher adds a secret token to the QR URL and passes the same token to the
-receiver. The thin client can also store this value in its masked Secret field:
+For the packaged app, put `config.auth.tokenSecret` in the masked Shared Secret
+field. The raw secret is not sent over the WebSocket. The receiver sends a nonce,
+the client replies with `HMAC-SHA256(nonce, tokenSecret)`, and the receiver
+compares the proof.
+
+The launcher still adds a legacy token to the QR URL for local QR/dev loading:
 
 ```text
 QR URL: http://YOUR_IP:5173?t=TOKEN&private=YOUR_IP:8788&public=PUBLIC_IP:8788
@@ -504,10 +510,10 @@ Pass receiver addresses in the QR URL:
 npx evenhub qr --url 'http://YOUR_IP:5173?private=YOUR_IP:8788&public=PUBLIC_IP:8788'
 ```
 
-The sideload page also has private IP, public IP, and secret fields. Values are
-stored in browser storage. Use the receiver port, usually `8788`, not the Vite
-app port `5173`. The client tries `ws://PRIVATE/audio` first, then
-`wss://PUBLIC/audio`.
+The sideload page also has separate private IP, private port, public IP, public
+port, and secret fields. Values are stored in browser storage. Use the receiver
+port, usually `8788`, not the Vite app port `5173`. The client tries
+`ws://PRIVATE:PORT/audio` first, then `wss://PUBLIC:PORT/audio`.
 
 ## Validation
 

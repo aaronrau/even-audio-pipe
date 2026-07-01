@@ -1,10 +1,12 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { appendFileSync, createWriteStream, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 import { VadEndpoint } from './vad-endpoint.js'
 import { createSileroFrameVad } from './silero-vad.ts'
+import { createWorkbenchRouter } from './workbench-router.js'
 
 const port = Number(process.env.PORT || 8788)
 const audioDir = process.env.AUDIO_DIR || process.env.OUT_DIR || 'recordings'
@@ -30,6 +32,7 @@ const workbenchConfig = {
   summaryToken: process.env.SPEECH_WORKBENCH_SUMMARY_TOKEN || '',
   summaryPath: normalizeHttpPath(process.env.SPEECH_WORKBENCH_SUMMARY_PATH || '/workbench/summary'),
 }
+const workbenchRouter = createWorkbenchRouter(workbenchConfig)
 const minAsrBytes = Number(process.env.MIN_ASR_BYTES || 6400)
 const segmentSeconds = Number(process.env.ASR_SEGMENT_SECONDS || 20)
 const bytesPerSecond = 16_000 * 2
@@ -73,6 +76,8 @@ const detailTextFields = [
   'detailed response',
 ]
 const accessToken = process.env.EVEN_AUDIO_PIPE_TOKEN || ''
+const accessTokenSecret = process.env.EVEN_AUDIO_PIPE_TOKEN_SECRET || ''
+const transportAuthTimeoutMs = Number(process.env.EVEN_AUDIO_PIPE_AUTH_TIMEOUT_MS || 8_000)
 const runtimeConfigPath = process.env.EVEN_AUDIO_PIPE_CONFIG_PATH || ''
 const transcriptCleanupEnv = {
   enabled: !isDisabled(process.env.TRANSCRIPT_CLEANUP_ENABLED || '0'),
@@ -96,7 +101,6 @@ let runtimeConfigCache = {
   warned: false,
 }
 const audioSockets = new Set()
-const pendingWorkbenchAgents = new WeakMap()
 const transcriptQueues = new WeakMap()
 let sileroVad = null
 let sileroVadStartPromise = null
@@ -138,12 +142,14 @@ server.on('upgrade', (req, socket, head) => {
     return
   }
 
-  if (!isAuthorizedAudioRequest(url)) {
+  const transportAuth = audioTransportAuthForRequest(url)
+  if (transportAuth.rejected) {
     console.warn(`[auth] rejected audio websocket from ${req.socket.remoteAddress}`)
     rejectUpgrade(socket, 401, 'Unauthorized')
     return
   }
 
+  req.audioTransportAuth = transportAuth
   wss.handleUpgrade(req, socket, head, ws => {
     wss.emit('connection', ws, req)
   })
@@ -384,14 +390,6 @@ function textFromFields(record, fields) {
   return ''
 }
 
-function normalizeCommandText(text) {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
 function stripCleanupDecorations(text) {
   return normalizeTranscript(text)
     .replace(/^```(?:text)?/i, '')
@@ -432,6 +430,53 @@ function stringList(value) {
 function isAuthorizedAudioRequest(url) {
   if (!accessToken) return true
   return url.searchParams.get('t') === accessToken || url.searchParams.get('token') === accessToken
+}
+
+function audioTransportAuthForRequest(url) {
+  if (accessToken && isAuthorizedAudioRequest(url)) {
+    return {
+      accepted: true,
+      mode: 'url-token',
+      rejected: false,
+      challenge: false,
+    }
+  }
+
+  if (!accessToken && !accessTokenSecret) {
+    return {
+      accepted: true,
+      mode: 'disabled',
+      rejected: false,
+      challenge: false,
+    }
+  }
+
+  if (accessTokenSecret) {
+    return {
+      accepted: false,
+      mode: 'shared-secret',
+      rejected: false,
+      challenge: true,
+    }
+  }
+
+  return {
+    accepted: false,
+    mode: 'url-token',
+    rejected: true,
+    challenge: false,
+  }
+}
+
+function authProof(secret, nonce) {
+  return createHmac('sha256', secret).update(nonce).digest('base64url')
+}
+
+function isValidAuthProof(secret, nonce, proof) {
+  if (!secret || !nonce || !proof) return false
+  const expected = Buffer.from(authProof(secret, nonce))
+  const received = Buffer.from(String(proof))
+  return expected.length === received.length && timingSafeEqual(expected, received)
 }
 
 function isAuthorizedBearerRequest(req, token) {
@@ -579,7 +624,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     return
   }
 
-  const route = routeWorkbenchTranscript(text, targetSocket, {
+  const route = workbenchRouter.routeTranscript(text, targetSocket, {
     rawText: context.rawText,
   })
   if (route.skip) {
@@ -634,7 +679,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     }
 
     console.log(`[workbench] posted transcript to ${baseUrl}/messages`)
-    if (route.clearPendingAgentOnSent) clearPendingWorkbenchAgent(targetSocket, route.agent)
+    if (route.clearPendingAgentOnSent) workbenchRouter.clearPendingAgent(targetSocket, route.agent)
     sendSocketJson(targetSocket, {
       type: 'agent_status',
       status: 'sent',
@@ -661,250 +706,6 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
   } finally {
     clearTimeout(timeout)
   }
-}
-
-function routeWorkbenchTranscript(text, targetSocket, options = {}) {
-  const cleaned = normalizeTranscript(text)
-  if (!cleaned) return { skip: true, reason: 'empty_transcript' }
-
-  const parsed = parseWorkbenchIntent(cleaned, {
-    includeAliases: !workbenchConfig.requireAgentPrefix,
-    rawText: options.rawText,
-  })
-
-  if (workbenchConfig.requireAgentPrefix) {
-    if (parsed?.agent && parsed.message) {
-      clearPendingWorkbenchAgent(targetSocket)
-      return parsed
-    }
-
-    if (parsed?.agent && !parsed.message) {
-      armPendingWorkbenchAgent(targetSocket, parsed.agent)
-      return {
-        skip: true,
-        reason: 'agent_armed',
-        agent: parsed.agent,
-      }
-    }
-
-    const pendingAgent = getPendingWorkbenchAgent(targetSocket)
-    if (pendingAgent) {
-      return {
-        agent: pendingAgent,
-        message: cleaned,
-        clearPendingAgentOnSent: true,
-      }
-    }
-
-    return {
-      skip: true,
-      reason: 'missing_agent_prefix',
-    }
-  }
-
-  if (workbenchConfig.agent) {
-    return {
-      agent: workbenchConfig.agent,
-      message: cleaned,
-    }
-  }
-
-  if (parsed?.agent && parsed.message) {
-    clearPendingWorkbenchAgent(targetSocket)
-    return parsed
-  }
-
-  if (parsed?.agent && !parsed.message) {
-    armPendingWorkbenchAgent(targetSocket, parsed.agent)
-    return {
-      skip: true,
-      reason: 'agent_armed',
-      agent: parsed.agent,
-    }
-  }
-
-  const pendingAgent = getPendingWorkbenchAgent(targetSocket)
-  if (pendingAgent) {
-    return {
-      agent: pendingAgent,
-      message: cleaned,
-      clearPendingAgentOnSent: true,
-    }
-  }
-
-  return {
-    skip: true,
-    reason: 'missing_agent_prefix',
-  }
-}
-
-function parseWorkbenchIntent(text, options = {}) {
-  const parsed = parseWorkbenchAgentPrefix(text, {
-    includeAliases: options.includeAliases,
-  })
-
-  if (!options.rawText) return parsed
-
-  const rawText = normalizeTranscript(options.rawText)
-  if (!rawText || rawText === text) return parsed
-
-  const rawParsed = parseWorkbenchAgentPrefix(rawText, {
-    includeAliases: options.includeAliases,
-  })
-  if (parsed?.agent && parsed.message) return parsed
-  if (rawParsed?.agent && rawParsed.message) return rawParsed
-  if (!parsed?.agent && rawParsed?.agent && !rawParsed.message) return rawParsed
-
-  return parsed
-}
-
-function preserveWorkbenchCommand(rawText, cleanedText) {
-  const cleaned = normalizeTranscript(cleanedText)
-  if (!cleaned) return cleaned
-
-  const cleanedParsed = parseWorkbenchAgentPrefix(cleaned, { includeAliases: true })
-  if (!cleanedParsed?.agent || cleanedParsed.message) return cleaned
-
-  const rawParsed = parseWorkbenchAgentPrefix(rawText, { includeAliases: true })
-  if (!rawParsed?.agent || !rawParsed.message) return cleaned
-  if (rawParsed.agent !== cleanedParsed.agent) return cleaned
-
-  return `${rawParsed.agent} ${rawParsed.message}`.trim()
-}
-
-function armPendingWorkbenchAgent(targetSocket, agent) {
-  if (!targetSocket || !agent) return
-
-  const timeoutMs = workbenchAgentArmTimeoutMs()
-  pendingWorkbenchAgents.set(targetSocket, {
-    agent,
-    expiresAt: timeoutMs > 0 ? Date.now() + timeoutMs : 0,
-  })
-
-  const waitDescription = timeoutMs > 0
-    ? `up to ${(timeoutMs / 1000).toFixed(1)}s`
-    : 'until the next transcript chunk'
-  console.log(`[workbench] armed agent ${agent}; waiting ${waitDescription}`)
-}
-
-function getPendingWorkbenchAgent(targetSocket) {
-  if (!targetSocket) return ''
-
-  const pending = pendingWorkbenchAgents.get(targetSocket)
-  if (!pending) return ''
-
-  const agent = typeof pending === 'string' ? pending : pending.agent
-  const expiresAt = typeof pending === 'string' ? 0 : pending.expiresAt
-
-  if (expiresAt > 0 && expiresAt <= Date.now()) {
-    pendingWorkbenchAgents.delete(targetSocket)
-    console.log(`[workbench] armed agent ${agent} expired before next transcript chunk`)
-    return ''
-  }
-
-  return agent || ''
-}
-
-function clearPendingWorkbenchAgent(targetSocket, agent = '') {
-  if (!targetSocket) return
-
-  if (!agent) {
-    pendingWorkbenchAgents.delete(targetSocket)
-    return
-  }
-
-  const pendingAgent = getPendingWorkbenchAgent(targetSocket)
-  if (pendingAgent === agent) pendingWorkbenchAgents.delete(targetSocket)
-}
-
-function workbenchAgentArmTimeoutMs() {
-  return Number.isFinite(workbenchConfig.agentArmTimeoutMs)
-    ? Math.max(0, workbenchConfig.agentArmTimeoutMs)
-    : 30_000
-}
-
-function workbenchRouteDescription() {
-  if (!workbenchConfig.enabled) return 'disabled'
-  if (!workbenchConfig.requireAgentPrefix) return 'default/pending agent allowed'
-
-  return `agent in first ${workbenchAgentPrefixWordLimit()} words required; agent-only arms next transcript for ${(workbenchAgentArmTimeoutMs() / 1000).toFixed(1)}s`
-}
-
-function parseWorkbenchAgentPrefix(text, options = {}) {
-  const candidates = workbenchAgentCandidates(options)
-  if (!candidates.length) return null
-
-  const originalWords = String(text || '').trim().split(/\s+/).filter(Boolean)
-  if (!originalWords.length) return null
-
-  const normalizedWords = originalWords.map(word => normalizeCommandText(word))
-  if (!normalizedWords.some(Boolean)) return null
-
-  let best = null
-  const wordLimit = workbenchAgentPrefixWordLimit()
-  for (const candidate of candidates) {
-    const normalizedAlias = normalizeCommandText(candidate.alias)
-    if (!normalizedAlias) continue
-    const aliasWords = normalizedAlias.split(' ').filter(Boolean)
-    if (!aliasWords.length) continue
-
-    const maxStartIndex = Math.min(wordLimit, normalizedWords.length) - 1
-    for (let startIndex = 0; startIndex <= maxStartIndex; startIndex += 1) {
-      const words = normalizedWords.slice(startIndex, startIndex + aliasWords.length)
-      if (words.length !== aliasWords.length) continue
-      if (words.join(' ') !== normalizedAlias) continue
-      if (
-        !best ||
-        startIndex < best.startIndex ||
-        (startIndex === best.startIndex && normalizedAlias.length > best.normalizedAlias.length)
-      ) {
-        best = { ...candidate, normalizedAlias, startIndex, aliasWordCount: aliasWords.length }
-      }
-    }
-  }
-  if (!best) return null
-
-  const message = originalWords
-    .slice(best.startIndex + best.aliasWordCount)
-    .join(' ')
-    .replace(/^[\s.,:;+\-]+/, '')
-    .trim()
-
-  return {
-    agent: best.agent,
-    message,
-  }
-}
-
-function workbenchAgentPrefixWordLimit() {
-  return Number.isFinite(workbenchConfig.agentPrefixWordLimit)
-    ? Math.max(1, Math.floor(workbenchConfig.agentPrefixWordLimit))
-    : 3
-}
-
-function workbenchAgentCandidates(options = {}) {
-  const includeAliases = options.includeAliases !== false
-  const agents = workbenchConfig.agents.length
-    ? workbenchConfig.agents
-    : ['Flux', 'Brock', 'Pike', 'Wolf']
-  const aliases = []
-  for (const agent of agents) {
-    aliases.push({ agent, alias: agent })
-    if (!includeAliases) continue
-    for (const alias of defaultAgentAliases(agent)) {
-      aliases.push({ agent, alias })
-    }
-  }
-  return aliases
-}
-
-function defaultAgentAliases(agent) {
-  const normalized = normalizeCommandText(agent)
-  if (normalized === 'flux') return ['flex']
-  if (normalized === 'brock') return ['brook', 'block', 'rock']
-  if (normalized === 'pike') return ['pipe']
-  if (normalized === 'wolf') return ['wolfe']
-  return []
 }
 
 async function transcribeWithWorker(wavPath) {
@@ -1145,7 +946,7 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
     }
 
     const content = body?.choices?.[0]?.message?.content ?? body?.choices?.[0]?.text ?? ''
-    const cleaned = preserveWorkbenchCommand(rawTranscript, stripCleanupDecorations(content))
+    const cleaned = workbenchRouter.preserveCommand(rawTranscript, stripCleanupDecorations(content))
 
     if (!cleaned) {
       throw new Error('cleanup model returned empty text')
@@ -1635,12 +1436,20 @@ async function resetSileroVadState() {
 wss.on('connection', (socket, req) => {
   audioSockets.add(socket)
   const connectionStamp = stamp()
+  const transportAuth = req.audioTransportAuth || {
+    accepted: !accessToken && !accessTokenSecret,
+    challenge: false,
+    mode: 'disabled',
+  }
+  const authNonce = transportAuth.challenge ? randomBytes(18).toString('base64url') : ''
+  let transportAuthenticated = Boolean(transportAuth.accepted)
   let currentSegment = null
   let segmentIndex = 0
   let bytes = 0
   let chunks = 0
   let userAuthenticated = false
   let evenUser = null
+  let authTimer = null
   const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
   let audioQueue = Promise.resolve()
   const endpoint = useVad
@@ -1661,9 +1470,35 @@ wss.on('connection', (socket, req) => {
     })
     : null
 
+  if (transportAuth.challenge) {
+    sendSocketJson(socket, {
+      type: 'auth_challenge',
+      mode: 'shared-secret',
+      nonce: authNonce,
+      algorithm: 'hmac-sha256',
+    })
+    authTimer = setTimeout(() => {
+      if (transportAuthenticated || socket.readyState !== WebSocket.OPEN) return
+      console.warn('[auth] shared-secret auth timed out')
+      sendSocketJson(socket, {
+        type: 'auth_status',
+        status: 'rejected',
+        reason: 'timeout',
+      })
+      socket.close(1008, 'shared-secret auth timed out')
+    }, transportAuthTimeoutMs)
+  } else if (transportAuthenticated) {
+    sendSocketJson(socket, {
+      type: 'auth_status',
+      status: 'accepted',
+      mode: transportAuth.mode,
+      transport: true,
+    })
+  }
+
   sendSocketJson(socket, {
     type: 'receiver_status',
-    status: 'connected',
+    status: transportAuthenticated ? 'connected' : 'auth_required',
     asrConfigured: Boolean(asrWorkerUrl || asrCommand),
     chunkMode: useVad ? 'vad' : 'fixed',
     vadBackend: useVad ? vadBackend : 'off',
@@ -1683,6 +1518,36 @@ wss.on('connection', (socket, req) => {
     if (!isBinary) {
       const text = data.toString()
       const control = parseControlMessage(text)
+
+      if (control?.type === 'auth') {
+        if (isValidAuthProof(accessTokenSecret, authNonce, control.proof)) {
+          transportAuthenticated = true
+          if (authTimer) clearTimeout(authTimer)
+          authTimer = null
+          sendSocketJson(socket, {
+            type: 'auth_status',
+            status: 'accepted',
+            mode: 'shared-secret',
+            transport: true,
+          })
+        } else {
+          console.warn('[auth] rejected shared-secret proof')
+          sendSocketJson(socket, {
+            type: 'auth_status',
+            status: 'rejected',
+            reason: 'bad_proof',
+          })
+          socket.close(1008, 'shared-secret auth failed')
+        }
+        return
+      }
+
+      if (!transportAuthenticated) {
+        console.warn('[auth] rejected control before transport auth')
+        socket.close(1008, 'transport auth required')
+        return
+      }
+
       if (control?.type === 'start') {
         evenUser = normalizeUser(control.user)
         const auth = currentUserAuthConfig()
@@ -1711,6 +1576,12 @@ wss.on('connection', (socket, req) => {
       if (control?.type === 'get_message_history') {
         sendMessageHistory(socket)
       }
+      return
+    }
+
+    if (!transportAuthenticated) {
+      console.warn('[auth] rejected audio before transport auth')
+      socket.close(1008, 'transport auth required')
       return
     }
 
@@ -1747,6 +1618,7 @@ wss.on('connection', (socket, req) => {
   })
 
   socket.on('close', () => {
+    if (authTimer) clearTimeout(authTimer)
     audioSockets.delete(socket)
     audioQueue = audioQueue
       .catch(() => {})
@@ -1864,11 +1736,11 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Transcript directory: ${transcriptDirPath}`)
   console.log(`[server] Transcript log: ${transcriptsLog}`)
   console.log(`[server] Message history directory: ${messageHistoryDirPath}`)
-  console.log(`[server] Audio auth: ${accessToken ? 'enabled' : 'disabled'}`)
+  console.log(`[server] Audio auth: ${audioAuthDescription()}`)
   console.log(
     `[server] Workbench forwarding: ${workbenchConfig.enabled ? `${workbenchConfig.url.replace(/\/$/, '')}/messages` : 'disabled'}`,
   )
-  console.log(`[server] Workbench route: ${workbenchRouteDescription()}`)
+  console.log(`[server] Workbench route: ${workbenchRouter.routeDescription()}`)
   console.log(`[server] Workbench summary webhook: http://0.0.0.0:${port}${workbenchConfig.summaryPath}`)
   console.log(`[server] Workbench summary auth: ${workbenchConfig.summaryToken ? 'enabled' : 'disabled'}`)
   console.log(`[server] Even user allowlist: ${startupUserAuthConfig.required ? 'enabled' : 'disabled'}`)
@@ -1889,3 +1761,10 @@ server.listen(port, '0.0.0.0', () => {
     console.log(`[server] Cleanup prompt hot reload: ${runtimeConfigPath}`)
   }
 })
+
+function audioAuthDescription() {
+  if (accessTokenSecret && accessToken) return 'shared-secret challenge + legacy URL token'
+  if (accessTokenSecret) return 'shared-secret challenge'
+  if (accessToken) return 'legacy URL token'
+  return 'disabled'
+}
