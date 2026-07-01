@@ -102,13 +102,7 @@ if (authConfig.enabled) {
 console.log(`  LAN Audio WS:   ${wsUrl}`)
 console.log(`  WAN Audio WS:   ${publicWsUrl || 'not configured'}`)
 console.log(`  Receiver health http://127.0.0.1:${receiverPort}/health`)
-console.log('')
-console.log('Packaged app fields:')
-console.log(`  Private IP:port ${receiverAddress}`)
-console.log(`  Public IP:port  ${publicReceiverAddress || 'not configured'}`)
-console.log(`  Secret          ${authConfig.enabled ? 'use the t= value from the QR URL or config auth.token' : 'leave blank; auth disabled'}`)
-console.log(`  Note            enter receiver port ${receiverPort}, not app port ${appPort}`)
-console.log('')
+printClientAppSettings()
 console.log(`  ASR:            ${asrEnabled ? asrWorkerUrl : 'disabled'}`)
 console.log(`  VAD:            ${vadConfig.backend}`)
 console.log(`  Audio dir:      ${displayPath(storageConfig.audioDir)}`)
@@ -184,6 +178,8 @@ if (asrEnabled) {
   await waitForHttp(`${asrWorkerUrl}/health`, 'asr-worker', 300_000)
 }
 
+console.log('')
+printClientAppSettings()
 console.log('')
 console.log('Scan this QR with the Even app:')
 console.log('')
@@ -370,6 +366,20 @@ function receiverAddressFromUrl(value) {
       .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
       .replace(/\/.*$/, '')
   }
+}
+
+function printClientAppSettings() {
+  console.log('')
+  console.log('CLIENT APP SETTINGS - enter these in the packaged app')
+  console.log('  Private IP:port:')
+  console.log(`    ${receiverAddress}`)
+  console.log('  Public IP:port:')
+  console.log(`    ${publicReceiverAddress || '(leave blank)'}`)
+  console.log('  Secret:')
+  console.log(`    ${authConfig.enabled ? authConfig.token : '(leave blank; auth disabled)'}`)
+  console.log('  Do not enter:')
+  console.log(`    ${appUrl}  (this is the app page, not the receiver)`)
+  console.log('')
 }
 
 function withEndpointQueryParams(url) {
