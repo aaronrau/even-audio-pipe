@@ -15,7 +15,8 @@ response without pulling out your phone.**
 
 Even Audio Pipe is a companion app for Even Realities glasses that captures
 short spoken utterances, transcribes them locally, and optionally forwards
-agent-prefixed commands to `speech-agent-workbench`.
+agent-prefixed commands to
+[`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench).
 
 **Highlights**
 
@@ -170,7 +171,8 @@ workbench.
 
 **Speech Agent Workbench**
 
-- Final transcripts can be routed to `speech-agent-workbench`.
+- Final transcripts can be routed to
+  [`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench).
 - Agent names are parsed from the first few words.
 - Agent-only utterances arm the next transcript.
 - Summaries return through `/workbench/summary` and are pushed to glasses.
@@ -450,6 +452,9 @@ The cleanup guard preserves commands when a model collapses an utterance such as
 
 ## Speech Agent Workbench
 
+This repo can forward agent-prefixed speech to
+[`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench).
+
 Enable command routing:
 
 ```json
@@ -466,7 +471,9 @@ Enable command routing:
 }
 ```
 
-Start `speech-agent-workbench` with the receiver webhook:
+Start
+[`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench)
+with the receiver webhook:
 
 ```bash
 VOICE_API_ENABLED=1 \
