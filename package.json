@@ -2,6 +2,7 @@
   "name": "even-audio-pipe",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "start": "node scripts/start-local.mjs",
