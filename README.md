@@ -86,6 +86,27 @@ EVEN_AUDIO_PIPE_ASR_PORT=8790 \
 npm start
 ```
 
+## Network Whitelist
+
+The app's network whitelist is for the receiver endpoint only. By default that
+means your local LAN receiver, for example:
+
+```text
+ws://192.168.1.100:8788/audio
+```
+
+`app/app.example.json` uses a sample LAN address as a template. `npm start`
+generates the ignored local `app/app.json` with the detected LAN IP, receiver
+port, and exact `/audio` WebSocket URLs used by the client. The origin entries
+are included next to `/audio` so the manifest works with host-level and
+path-level whitelist checks.
+
+If you do not configure `network.publicUrl` or `network.publicWsUrl`, the
+generated whitelist stays local. If you do configure a public tunnel, the
+launcher adds only that tunnel's receiver origin and `/audio` WebSocket URL.
+Documentation links, GitHub URLs, and other string literals are not app network
+calls and should not be added to the manifest.
+
 ## Tutorial
 
 **1. Start the local stack**
