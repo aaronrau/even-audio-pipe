@@ -107,6 +107,13 @@ launcher adds only that tunnel's receiver origin and `/audio` WebSocket URL.
 Documentation links, GitHub URLs, and other string literals are not app network
 calls and should not be added to the manifest.
 
+## Manifest Identity
+
+Even Hub uploads are tied to the manifest `package_id`, so this project keeps
+the original package id stable for resubmissions. The user-facing app name in
+the manifest and UI is `Agent Audio Pipe`; the legacy package id and EHPK
+filename are upload identifiers, not the displayed app name.
+
 ## Tutorial
 
 **1. Start the local stack**
