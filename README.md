@@ -8,6 +8,12 @@ speech, and final transcripts or agent summaries are sent back to the glasses.
 This is a local-first developer tool. Audio, transcripts, ASR, cleanup, and
 agent routing stay on your machine unless you configure external endpoints.
 
+## Screenshots
+
+![Even Audio Pipe app running in the EvenHub simulator](screenshots/even-audio-pipe-simulator-app.png)
+
+![Glasses history list with mocked transcript and agent responses](screenshots/even-audio-pipe-simulator-history.png)
+
 ## App Store Summary
 
 **Talk through your glasses. Route commands to your local agents. See the
