@@ -43,7 +43,7 @@ async function waitForHealth(port, child) {
 
 async function startReceiver(env = {}) {
   const port = await freePort()
-  const dir = mkdtempSync(join(tmpdir(), 'even-audio-pipe-auth-'))
+  const dir = mkdtempSync(join(tmpdir(), 'agent-audio-pipe-auth-'))
   const child = spawn(
     process.execPath,
     ['--import', 'tsx', 'server.js'],

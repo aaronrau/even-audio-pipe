@@ -1,7 +1,7 @@
 {
-  "package_id": "com.example.evenaudiopipe",
+  "package_id": "com.aaronrau.agentaudiopipe",
   "edition": "202601",
-  "name": "Even Audio Pipe",
+  "name": "Agent Audio Pipe",
   "version": "0.1.7",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
@@ -16,8 +16,10 @@
       "desc": "Stream microphone PCM audio to your local receiver.",
       "whitelist": [
         "ws://192.168.1.100:8788",
+        "ws://192.168.1.100:8788/audio",
         "http://192.168.1.100:8788",
         "wss://192.168.1.100:8788",
+        "wss://192.168.1.100:8788/audio",
         "https://192.168.1.100:8788"
       ]
     }

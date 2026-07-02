@@ -44,7 +44,9 @@ const receiverHttpOrigin = `http://${hostIp}:${receiverPort}`
 const receiverWsOrigin = `ws://${hostIp}:${receiverPort}`
 const receiverHttpsOrigin = `https://${hostIp}:${receiverPort}`
 const receiverWssOrigin = `wss://${hostIp}:${receiverPort}`
-const publicOrigins = publicWsUrl ? publicNetworkOrigins(publicWsUrl) : []
+const receiverWsAudioUrl = `${receiverWsOrigin}/audio`
+const receiverWssAudioUrl = `${receiverWssOrigin}/audio`
+const publicWhitelist = publicWsUrl ? publicNetworkWhitelist(publicWsUrl) : []
 const workbenchSummaryWebhookUrl = `${receiverHttpOrigin}${workbenchConfig.summaryPath}`
 const workbenchSummaryWebhookLocalUrl = `http://127.0.0.1:${receiverPort}${workbenchConfig.summaryPath}`
 
@@ -93,7 +95,7 @@ if (asrEnabled && !process.env.ASR_WORKER_URL) {
 }
 
 console.log('')
-console.log('Even Audio Pipe')
+console.log('Agent Audio Pipe')
 console.log(`  App URL:        ${appUrl}`)
 console.log(`  QR auth:        ${authConfig.enabled ? 'enabled' : 'disabled'}`)
 if (authConfig.enabled) {
@@ -347,12 +349,15 @@ function resolvePublicWsUrl(networkConfig) {
   }
 }
 
-function publicNetworkOrigins(publicWsUrl) {
+function publicNetworkWhitelist(publicWsUrl) {
   try {
     const parsed = new URL(publicWsUrl)
     const webProtocol = parsed.protocol === 'wss:' ? 'https:' : 'http:'
+    const wsOrigin = `${parsed.protocol}//${parsed.host}`
     return uniqueStrings([
-      `${parsed.protocol}//${parsed.host}`,
+      wsOrigin,
+      `${wsOrigin}/audio`,
+      publicWsUrl,
       `${webProtocol}//${parsed.host}`,
     ])
   } catch {
@@ -1085,10 +1090,12 @@ function updateAppManifest() {
   const network = permissions.find((permission) => permission?.name === 'network')
   const networkWhitelist = uniqueStrings([
     receiverWsOrigin,
+    receiverWsAudioUrl,
     receiverHttpOrigin,
     receiverWssOrigin,
+    receiverWssAudioUrl,
     receiverHttpsOrigin,
-    ...publicOrigins,
+    ...publicWhitelist,
   ])
 
   if (network) {
@@ -1142,7 +1149,7 @@ async function ensureRequiredPortsAvailable() {
   }
 
   if (duplicatePorts.length) {
-    console.error('Cannot start Even Audio Pipe because required ports overlap:')
+    console.error('Cannot start Agent Audio Pipe because required ports overlap:')
     for (const duplicate of duplicatePorts) console.error(`  ${duplicate}`)
     process.exit(1)
   }
@@ -1155,12 +1162,12 @@ async function ensureRequiredPortsAvailable() {
 
   if (!unavailable.length) return
 
-  console.error('Cannot start Even Audio Pipe because required port(s) are already in use:')
+  console.error('Cannot start Agent Audio Pipe because required port(s) are already in use:')
   for (const check of unavailable) {
     console.error(`  ${check.label}: ${check.host}:${check.port}`)
   }
   console.error('')
-  console.error('Stop the existing Even Audio Pipe process, or use alternate ports, for example:')
+  console.error('Stop the existing Agent Audio Pipe process, or use alternate ports, for example:')
   console.error(`  ${unavailable.map(check => `${check.env}=<free-port>`).join(' ')} npm start`)
   console.error('')
   console.error('To inspect current owners:')

@@ -1,5 +1,5 @@
 {
-  "name": "even-audio-pipe-app",
+  "name": "agent-audio-pipe-app",
   "private": true,
   "version": "0.1.7",
   "license": "MIT",
@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "pack": "evenhub pack app.json dist -o even-audio-pipe-$npm_package_version.ehpk",
+    "pack": "evenhub pack app.json dist -o agent-audio-pipe-$npm_package_version.ehpk",
     "test:endpoints": "tsx test/audioEndpoints.test.ts",
     "test:history": "tsx test/historyCanvas.test.ts && tsx test/historyNavigator.test.ts",
     "test:history:current": "tsx test/historyCurrentData.test.ts",

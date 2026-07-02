@@ -129,7 +129,7 @@ const server = createServer((req, res) => {
   }
 
   res.writeHead(200, { 'content-type': 'text/plain' })
-  res.end(`Even Audio Pipe receiver. WebSocket path: /audio. Workbench summary path: ${workbenchConfig.summaryPath}\n`)
+  res.end(`Agent Audio Pipe receiver. WebSocket path: /audio. Workbench summary path: ${workbenchConfig.summaryPath}\n`)
 })
 
 const wss = new WebSocketServer({ noServer: true })

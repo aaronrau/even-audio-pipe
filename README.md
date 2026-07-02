@@ -1,6 +1,6 @@
-# Even Audio Pipe
+# Agent Audio Pipe
 
-Even Audio Pipe turns Even Realities G-series glasses into a lightweight voice
+Agent Audio Pipe turns Even Realities G-series glasses into a lightweight voice
 relay for local speech tools and coding agents. The sideloaded Even Hub app
 streams glasses microphone audio to a local receiver, the receiver transcribes
 speech, and final transcripts or agent summaries are sent back to the glasses.
@@ -10,20 +10,20 @@ agent routing stay on your machine unless you configure external endpoints.
 
 ## Screenshots
 
-![Even Audio Pipe app running in the EvenHub simulator](screenshots/even-audio-pipe-simulator-app.png)
+![Agent Audio Pipe app running in the EvenHub simulator](screenshots/agent-audio-pipe-simulator-app.png)
 
-![Glasses history list with mocked transcript and agent responses](screenshots/even-audio-pipe-simulator-history.png)
+![Glasses history list with mocked transcript and agent responses](screenshots/agent-audio-pipe-simulator-history.png)
 
-![Glasses detail view with a mocked LLM response](screenshots/even-audio-pipe-simulator-response-detail.png)
+![Glasses detail view with a mocked LLM response](screenshots/agent-audio-pipe-simulator-response-detail.png)
 
 ## App Store Summary
 
-**Talk through your glasses. Route commands to your local agents. See the
-response without pulling out your phone.**
+**Talk through your glasses. Route commands to named local coding agents. See
+the response without pulling out your phone or using the ring.**
 
-Even Audio Pipe is a companion app for Even Realities glasses that captures
+Agent Audio Pipe is a companion app for Even Realities glasses that captures
 short spoken utterances, transcribes them locally, and optionally forwards
-agent-prefixed commands to
+agent-prefixed commands to named Claude, Codex, or other terminal sessions via
 [`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench).
 
 **Highlights**
@@ -35,13 +35,14 @@ agent-prefixed commands to
 - Shows final transcripts and agent summaries briefly, then clears the live view.
 - Keeps history available through the glasses tap menu.
 - Supports private `ws://` first, then public `wss://` reconnect behavior.
-- Can route commands such as `Flux check status` or `Wolf terminate session`.
+- Can route commands to multiple named terminal sessions, such as `Flux check
+  status` or `Wolf terminate session`.
 - Saves raw audio, WAV files, raw transcripts, cleaned transcripts, and metadata.
 - Supports optional transcript cleanup through an OpenAI-compatible local model.
 
 ## What It Is
 
-Even Audio Pipe has two parts:
+Agent Audio Pipe has two parts:
 
 - **Thin client:** a sideloaded Even Hub WebView app. It captures audio, displays
   status/history on glasses, and reconnects to the receiver.
@@ -96,7 +97,7 @@ npm start
 Wait for the launcher to print:
 
 ```text
-Even Audio Pipe
+Agent Audio Pipe
   App URL:        http://YOUR_LAN_IP:5173
   LAN Audio WS:   ws://YOUR_LAN_IP:8788/audio
   Receiver health http://127.0.0.1:8788/health
