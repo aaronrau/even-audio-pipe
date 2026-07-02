@@ -14,6 +14,8 @@ agent routing stay on your machine unless you configure external endpoints.
 
 ![Glasses history list with mocked transcript and agent responses](screenshots/even-audio-pipe-simulator-history.png)
 
+![Glasses detail view with a mocked LLM response](screenshots/even-audio-pipe-simulator-response-detail.png)
+
 ## App Store Summary
 
 **Talk through your glasses. Route commands to your local agents. See the
