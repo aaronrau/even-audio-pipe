@@ -25,7 +25,7 @@
       html,
       body {
         margin: 0;
-        height: 100%;
+        min-height: 100%;
         background: var(--bg);
         color: var(--text);
         font-family:
@@ -34,6 +34,11 @@
           "Segoe UI",
           system-ui,
           sans-serif;
+      }
+
+      body {
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
       }
 
       body::before {
@@ -45,43 +50,43 @@
         min-height: 100%;
         width: min(560px, 100%);
         margin: 0 auto;
-        padding: 18px;
+        padding: 12px;
         display: flex;
         flex-direction: column;
-        gap: 12px;
+        gap: 8px;
         position: relative;
       }
 
       .hero {
-        padding: 8px 2px 4px;
+        padding: 2px 2px 0;
         display: grid;
         grid-template-columns: 1fr auto;
-        gap: 14px;
+        gap: 10px;
         align-items: center;
       }
 
       h1 {
         margin: 0;
-        font-size: 30px;
-        line-height: 1.04;
+        font-size: 23px;
+        line-height: 1.08;
         font-weight: 650;
         letter-spacing: 0;
       }
 
       .kicker {
-        margin: 0 0 8px;
+        margin: 0 0 4px;
         color: var(--muted);
-        font-size: 13px;
+        font-size: 12px;
         font-weight: 560;
         letter-spacing: 0;
       }
 
       .subhead {
-        margin: 9px 0 0;
+        margin: 5px 0 0;
         max-width: 420px;
         color: var(--muted);
-        font-size: 14px;
-        line-height: 1.45;
+        font-size: 12px;
+        line-height: 1.35;
       }
 
       .signal {
@@ -114,8 +119,8 @@
 
       .panel {
         border: 1px solid var(--line);
-        border-radius: 12px;
-        padding: 14px;
+        border-radius: 8px;
+        padding: 10px;
         background: var(--surface);
         box-shadow: var(--shadow);
       }
@@ -125,23 +130,31 @@
         border-color: var(--line-strong);
       }
 
-      .panel-row {
-        display: grid;
-        grid-template-columns: 1fr;
-        gap: 12px;
-      }
-
       .label {
         color: var(--muted);
         font-size: 12px;
         font-weight: 560;
         letter-spacing: 0;
-        margin-bottom: 8px;
+        margin-bottom: 5px;
       }
 
       .value {
-        font-size: 15px;
+        font-size: 14px;
         font-weight: 520;
+      }
+
+      .status-stack {
+        display: grid;
+        gap: 6px;
+      }
+
+      .status-detail {
+        display: grid;
+        gap: 2px;
+      }
+
+      .status-detail .label {
+        margin-bottom: 0;
       }
 
       #status,
@@ -154,14 +167,14 @@
 
       #transcript {
         white-space: pre-wrap;
-        min-height: 88px;
+        min-height: 56px;
         color: var(--soft);
       }
 
       .endpoint-grid {
         display: grid;
         grid-template-columns: 1fr;
-        gap: 10px;
+        gap: 8px;
       }
 
       .secret-row {
@@ -170,11 +183,55 @@
         gap: 8px;
       }
 
+      .setup-list {
+        display: grid;
+        gap: 6px;
+        margin-top: 2px;
+      }
+
+      .setup-item {
+        display: grid;
+        grid-template-columns: 22px 1fr;
+        gap: 6px;
+        align-items: start;
+        color: var(--soft);
+        font-size: 13px;
+        line-height: 1.3;
+      }
+
+      .setup-mark {
+        color: var(--accent);
+        font-weight: 700;
+      }
+
+      .setup-link {
+        color: var(--text);
+        font-weight: 620;
+        overflow-wrap: anywhere;
+      }
+
+      .setup-command {
+        margin-top: 7px;
+        padding: 8px;
+        border-radius: 8px;
+        background: var(--surface-soft);
+        border: 1px solid var(--line);
+        color: var(--soft);
+        font-family:
+          "SFMono-Regular",
+          Consolas,
+          monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        white-space: nowrap;
+        overflow-x: auto;
+      }
+
       .address-grid,
       .address-row {
         display: grid;
         grid-template-columns: 1fr;
-        gap: 10px;
+        gap: 8px;
       }
 
       .address-row {
@@ -190,7 +247,7 @@
         background: var(--surface-soft);
         color: var(--text);
         font: inherit;
-        padding: 12px;
+        padding: 10px;
         outline: none;
       }
 
@@ -217,7 +274,7 @@
 
       .icon-button {
         min-width: 0;
-        height: 46px;
+        height: 42px;
         padding: 0;
         display: grid;
         place-items: center;
@@ -248,11 +305,7 @@
 
       @media (min-width: 680px) {
         main {
-          padding: 28px 18px;
-        }
-
-        .panel-row {
-          grid-template-columns: 1fr 1fr;
+          padding: 16px 14px;
         }
 
         .endpoint-grid {
@@ -282,11 +335,11 @@
 
       @media (max-width: 420px) {
         main {
-          padding: 16px;
+          padding: 10px;
         }
 
         .hero {
-          grid-template-columns: 1fr;
+          grid-template-columns: 1fr auto;
         }
 
         .signal {
@@ -300,25 +353,29 @@
       <header class="hero">
         <div>
           <p class="kicker">Local agent control</p>
-          <h1>Agent Audio Pipe</h1>
           <p class="subhead">Live microphone relay, transcript routing, and named agent sessions for G-series glasses.</p>
         </div>
         <div class="signal" aria-hidden="true"></div>
       </header>
-      <section class="panel primary">
-        <div class="label">Status</div>
-        <div id="status" class="value">Starting...</div>
+      <section class="panel">
+        <div class="label">Setup checklist</div>
+        <div class="setup-list">
+          <div class="setup-item">
+            <span class="setup-mark" aria-hidden="true">1</span>
+            <span>Run the receiver on your computer.</span>
+          </div>
+          <div class="setup-item">
+            <span class="setup-mark" aria-hidden="true">2</span>
+            <span id="setup-receiver">No receiver IP set.</span>
+          </div>
+          <div class="setup-item">
+            <span class="setup-mark" aria-hidden="true">3</span>
+            <span>Save, then speak through the glasses.</span>
+          </div>
+        </div>
+        <div class="setup-command" id="setup-command"></div>
+        <a class="setup-link" id="setup-repo-link" target="_blank" rel="noreferrer"></a>
       </section>
-      <div class="panel-row">
-        <section class="panel">
-          <div class="label">Receiver</div>
-          <div id="url" class="value"></div>
-        </section>
-        <section class="panel">
-          <div class="label">Stream</div>
-          <div id="stats" class="value">0 chunks, 0 bytes</div>
-        </section>
-      </div>
       <section class="panel">
         <div class="label">Connection</div>
         <div class="endpoint-grid">
@@ -383,6 +440,22 @@
             </button>
           </div>
           <button id="save-endpoints" type="button">Save</button>
+        </div>
+      </section>
+      <section class="panel primary">
+        <div class="status-stack">
+          <div class="status-detail">
+            <div class="label">Status</div>
+            <div id="status" class="value">Starting...</div>
+          </div>
+          <div class="status-detail">
+            <div class="label">Receiver</div>
+            <div id="url" class="value"></div>
+          </div>
+          <div class="status-detail">
+            <div class="label">Stream</div>
+            <div id="stats" class="value">0 chunks, 0 bytes</div>
+          </div>
         </div>
       </section>
       <section class="panel">

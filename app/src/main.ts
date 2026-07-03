@@ -22,6 +22,7 @@ import {
 } from './audioEndpoints'
 import { historyScrollDirectionFromEventType } from './historyInput'
 import { HistoryNavigator } from './historyNavigator'
+import { nextStartupPromptVisible, startupLiveContent } from './startupPrompt'
 
 const RECEIVER_ADDRESS_STORAGE_KEY = 'evenAudioPipe.receiverAddress'
 const PRIVATE_ADDRESS_STORAGE_KEY = 'evenAudioPipe.privateAddress'
@@ -42,6 +43,9 @@ const publicPortEl = document.getElementById('public-port') as HTMLInputElement 
 const authTokenEl = document.getElementById('auth-token') as HTMLInputElement | null
 const toggleAuthTokenEl = document.getElementById('toggle-auth-token') as HTMLButtonElement | null
 const saveEndpointsEl = document.getElementById('save-endpoints') as HTMLButtonElement | null
+const setupReceiverEl = document.getElementById('setup-receiver') as HTMLElement | null
+const setupRepoLinkEl = document.getElementById('setup-repo-link') as HTMLAnchorElement | null
+const setupCommandEl = document.getElementById('setup-command') as HTMLElement | null
 
 function positiveNumber(value: string | undefined, fallback: number) {
   const parsed = Number(value)
@@ -80,6 +84,7 @@ let spinnerTimer: number | null = null
 let waveformFrameIndex = 0
 let unsubscribe: (() => void) | null = null
 let evenUserInfo: UserPayload | null = null
+let startupPromptVisible = true
 
 const GLASSES_LINE_WIDTH = 52
 const GLASSES_MAX_LINES = 7
@@ -258,6 +263,11 @@ function setupEndpointForm() {
   if (publicIpEl) publicIpEl.value = publicParts.host
   if (publicPortEl) publicPortEl.value = publicParts.port
   if (authTokenEl) authTokenEl.value = audioEndpointSettings.token
+  updateSetupChecklist()
+
+  for (const input of [privateIpEl, privatePortEl, publicIpEl, publicPortEl]) {
+    input?.addEventListener('input', updateSetupChecklist)
+  }
 
   toggleAuthTokenEl?.addEventListener('click', () => {
     if (!authTokenEl) return
@@ -284,6 +294,7 @@ async function saveEndpointForm() {
     await saveAudioEndpointSettings(audioEndpointSettings)
     audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings, launchToken())
     audioEndpointIndex = 0
+    updateSetupChecklist()
     setUiStatus('Connection settings saved, reconnecting...')
     ws?.close()
     if (!ws) connect()
@@ -327,6 +338,39 @@ function displayWsUrl(url: string) {
   } catch {
     return url
   }
+}
+
+function repoUrl() {
+  return ['https:', '', 'github.com', 'aaronrau', 'agent-audio-pipe'].join('/')
+}
+
+function repoDisplayUrl() {
+  return ['github.com', 'aaronrau', 'agent-audio-pipe'].join('/')
+}
+
+function cloneCommand() {
+  return ['git clone', repoUrl(), '&& cd agent-audio-pipe && npm start'].join(' ')
+}
+
+function formReceiverAddress() {
+  return joinAddress(privateIpEl?.value || '', privatePortEl?.value || '') ||
+    joinAddress(publicIpEl?.value || '', publicPortEl?.value || '')
+}
+
+function updateSetupChecklist() {
+  const receiverAddress = formReceiverAddress()
+  if (setupReceiverEl) {
+    setupReceiverEl.textContent = receiverAddress
+      ? `✅ ${receiverAddress}`
+      : 'No receiver IP set.'
+  }
+  if (setupRepoLinkEl) {
+    setupRepoLinkEl.href = repoUrl()
+    setupRepoLinkEl.textContent = repoDisplayUrl()
+  }
+  if (setupCommandEl) setupCommandEl.textContent = cloneCommand()
+
+  if (startupPromptVisible) void renderGlassesStatus()
 }
 
 function currentAudioEndpoint() {
@@ -469,6 +513,7 @@ async function scrollHistoryWindow(direction: HistoryScrollDirection) {
 }
 
 function currentLiveGlassesContent() {
+  if (startupPromptVisible) return startupLiveContent(audioEndpointSettings)
   if (speechDetected) return currentSpeechWaveformFrame()
   if (transcriptText) return formatGlassesTranscript(transcriptText)
   return BLANK_LIVE_CONTENT
@@ -745,6 +790,13 @@ function startSpeechProcessingState() {
   speechDetected = true
 }
 
+function dismissStartupPrompt() {
+  startupPromptVisible = nextStartupPromptVisible(startupPromptVisible, {
+    type: 'asr_status',
+    status: 'vad_detected',
+  })
+}
+
 function appendTranscript(
   text: string,
   label = 'Message',
@@ -914,6 +966,7 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'asr_status' && payload.status === 'vad_detected') {
+    dismissStartupPrompt()
     startSpeechProcessingState()
     void renderGlassesStatus()
     return
@@ -1120,7 +1173,7 @@ audioEndpointSettings = await readAudioEndpointSettings()
 audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings, launchToken())
 evenUserInfo = await loadUserInfo()
 
-const statusContainer = makeStatusContainer('Starting audio pipe...', false)
+const statusContainer = makeStatusContainer(currentLiveGlassesContent(), false)
 const eventCaptureContainer = makeEventCaptureContainer()
 
 const created = await bridge.createStartUpPageContainer(
