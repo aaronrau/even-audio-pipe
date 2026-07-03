@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import {
   STARTUP_READY_CONTENT,
   STARTUP_SETUP_CONTENT,
+  backendStartupPromptContent,
   hasReceiverAddress,
   nextStartupPromptVisible,
   startupLiveContent,
@@ -31,6 +32,14 @@ assert.equal(hasReceiverAddress({ privateAddress: '', publicAddress: '' }), fals
 assert.equal(hasReceiverAddress({ privateAddress: '192.168.1.96:8788', publicAddress: '' }), true)
 assert.equal(startupLiveContent({ privateAddress: '', publicAddress: '' }), STARTUP_SETUP_CONTENT)
 assert.equal(startupLiveContent({ privateAddress: '192.168.1.96:8788', publicAddress: '' }), STARTUP_READY_CONTENT)
+assert.equal(
+  backendStartupPromptContent('Say something to get started.'),
+  [
+    ' ||| ',
+    'Say something to get started.',
+  ].join('\n'),
+)
+assert.equal(backendStartupPromptContent(''), STARTUP_READY_CONTENT)
 
 assert.equal(
   nextStartupPromptVisible(true, { type: 'receiver_status', status: 'connected' }),

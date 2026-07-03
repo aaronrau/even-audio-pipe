@@ -74,7 +74,10 @@ async function startReceiver(env = {}) {
     },
   )
   child.stderrText = ''
-  child.stdout.on('data', () => {})
+  child.stdoutText = ''
+  child.stdout.on('data', chunk => {
+    child.stdoutText += chunk.toString()
+  })
   child.stderr.on('data', chunk => {
     child.stderrText += chunk.toString()
   })
@@ -137,6 +140,86 @@ function waitForJson(ws, predicate) {
     ws.on('error', onError)
   })
 }
+
+function collectJson(ws, durationMs) {
+  const messages = []
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup()
+      resolve(messages)
+    }, durationMs)
+
+    function cleanup() {
+      clearTimeout(timeout)
+      ws.off('message', onMessage)
+      ws.off('error', onError)
+    }
+
+    function onMessage(data) {
+      try {
+        messages.push(JSON.parse(data.toString()))
+      } catch {
+      }
+    }
+
+    function onError(err) {
+      cleanup()
+      reject(err)
+    }
+
+    ws.on('message', onMessage)
+    ws.on('error', onError)
+  })
+}
+
+async function waitForOutput(child, predicate) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (predicate(child.stdoutText)) return
+    await delay(50)
+  }
+  throw new Error(`timed out waiting for receiver output: ${child.stdoutText}`)
+}
+
+test('receiver sends onboarding prompt after app start and logs audio stream', async () => {
+  const { child, dir, port } = await startReceiver()
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'mock-user' },
+    }))
+
+    const prompt = await waitForJson(ws, message => message.type === 'onboarding_prompt')
+    assert.equal(prompt.message, 'Say something to get started.')
+
+    const duplicateMessages = collectJson(ws, 150)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'mock-user' },
+    }))
+    assert.equal(
+      (await duplicateMessages).some(message => message.type === 'onboarding_prompt'),
+      false,
+    )
+
+    ws.send(Buffer.alloc(320))
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('shared-secret websocket auth accepts a valid HMAC proof', async () => {
   const secret = 'local-test-secret'

@@ -1457,6 +1457,8 @@ wss.on('connection', (socket, req) => {
   let userAuthenticated = false
   let evenUser = null
   let authTimer = null
+  let onboardingPromptSent = false
+  let firstAudioChunkLogged = false
   const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
   let audioQueue = Promise.resolve()
   const endpoint = useVad
@@ -1521,6 +1523,15 @@ wss.on('connection', (socket, req) => {
     console.log('[audio] recording one file until the socket closes')
   }
 
+  function sendOnboardingPrompt() {
+    if (onboardingPromptSent || !transportAuthenticated || !userAuthenticated) return
+    onboardingPromptSent = true
+    sendSocketJson(socket, {
+      type: 'onboarding_prompt',
+      message: 'Say something to get started.',
+    })
+  }
+
   socket.on('message', (data, isBinary) => {
     if (!isBinary) {
       const text = data.toString()
@@ -1579,6 +1590,7 @@ wss.on('connection', (socket, req) => {
           user: evenUser,
           restricted: auth.required,
         })
+        sendOnboardingPrompt()
       }
       if (control?.type === 'get_message_history') {
         sendMessageHistory(socket)
@@ -1605,6 +1617,10 @@ wss.on('connection', (socket, req) => {
     const chunk = toBuffer(data)
     chunks += 1
     bytes += chunk.byteLength
+    if (!firstAudioChunkLogged) {
+      firstAudioChunkLogged = true
+      console.log('[audio] stream started: receiving G2 mic chunks')
+    }
 
     if (useVad) {
       audioQueue = audioQueue

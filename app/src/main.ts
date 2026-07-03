@@ -22,7 +22,7 @@ import {
 } from './audioEndpoints'
 import { historyScrollDirectionFromEventType } from './historyInput'
 import { HistoryNavigator } from './historyNavigator'
-import { nextStartupPromptVisible, startupLiveContent } from './startupPrompt'
+import { backendStartupPromptContent, nextStartupPromptVisible, startupLiveContent } from './startupPrompt'
 
 const RECEIVER_ADDRESS_STORAGE_KEY = 'evenAudioPipe.receiverAddress'
 const PRIVATE_ADDRESS_STORAGE_KEY = 'evenAudioPipe.privateAddress'
@@ -85,6 +85,7 @@ let waveformFrameIndex = 0
 let unsubscribe: (() => void) | null = null
 let evenUserInfo: UserPayload | null = null
 let startupPromptVisible = true
+let backendStartupPrompt = ''
 
 const GLASSES_LINE_WIDTH = 52
 const GLASSES_MAX_LINES = 7
@@ -513,6 +514,9 @@ async function scrollHistoryWindow(direction: HistoryScrollDirection) {
 }
 
 function currentLiveGlassesContent() {
+  if (startupPromptVisible && backendStartupPrompt) {
+    return backendStartupPromptContent(backendStartupPrompt)
+  }
   if (startupPromptVisible) return startupLiveContent(audioEndpointSettings)
   if (speechDetected) return currentSpeechWaveformFrame()
   if (transcriptText) return formatGlassesTranscript(transcriptText)
@@ -897,6 +901,13 @@ function handleReceiverMessage(raw: string) {
     return
   }
 
+  if (payload.type === 'onboarding_prompt' && typeof payload.message === 'string') {
+    backendStartupPrompt = payload.message
+    setUiStatus(payload.message)
+    void renderGlassesStatus()
+    return
+  }
+
   if (payload.type === 'transcript' && typeof payload.text === 'string') {
     stopSpeechProcessingIndicator()
     appendTranscript(payload.text, 'You', '', { clearProcessing: false })
@@ -1206,7 +1217,9 @@ async function startAudioStream() {
 
   ws.send(JSON.stringify(startMessage))
   await setAudio(true)
-  setUiStatus(`Streaming G2 mic audio${endpoint ? ` via ${endpoint.label}` : ''}`)
+  if (!backendStartupPrompt) {
+    setUiStatus(`Streaming G2 mic audio${endpoint ? ` via ${endpoint.label}` : ''}`)
+  }
 }
 
 async function renderGlassesStatus() {

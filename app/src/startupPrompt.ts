@@ -17,6 +17,16 @@ export const STARTUP_READY_CONTENT = [
   'Tap R1 for history.',
 ].join('\n')
 
+export function backendStartupPromptContent(message: string) {
+  const normalized = message.trim()
+  if (!normalized) return STARTUP_READY_CONTENT
+
+  return [
+    ' ||| ',
+    normalized,
+  ].join('\n')
+}
+
 export function hasReceiverAddress(settings: EndpointSettings) {
   return Boolean(settings.privateAddress?.trim() || settings.publicAddress?.trim())
 }
