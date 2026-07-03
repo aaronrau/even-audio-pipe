@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "pack": "evenhub pack app.json dist -o even-audio-pipe-$npm_package_version.ehpk",
     "test:endpoints": "tsx test/audioEndpoints.test.ts",
+    "test:bundle-urls": "node test/bundleUrls.test.mjs",
     "test:history": "tsx test/historyCanvas.test.ts && tsx test/historyNavigator.test.ts",
     "test:history:current": "tsx test/historyCurrentData.test.ts",
     "simulate": "evenhub-simulator http://localhost:5173"

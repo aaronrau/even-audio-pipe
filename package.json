@@ -8,6 +8,6 @@
     "start": "node scripts/start-local.mjs",
     "dev": "node scripts/start-local.mjs",
     "setup": "npm --prefix local-receiver ci && npm --prefix app ci",
-    "check": "npm run setup && node --check scripts/start-local.mjs && npm --prefix local-receiver run check && npm --prefix app run build && npm --prefix app run test:endpoints"
+    "check": "npm run setup && node --check scripts/start-local.mjs && npm --prefix local-receiver run check && npm --prefix app run build && npm --prefix app run test:endpoints && npm --prefix app run test:bundle-urls"
   }
 }

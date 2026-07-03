@@ -69,7 +69,7 @@ export function buildAudioWsEndpoints(
 function parseEndpointInput(value: string) {
   const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
     ? value
-    : `ws://${value}`
+    : withProtocolPrefix('ws:', value)
 
   try {
     const parsed = new URL(withScheme)
@@ -80,6 +80,10 @@ function parseEndpointInput(value: string) {
   } catch {
     return null
   }
+}
+
+function withProtocolPrefix(protocol: 'ws:', value: string) {
+  return protocol.concat('/', '/', value)
 }
 
 function endpointWithProtocol(endpoint: URL, protocol: 'ws:' | 'wss:') {
