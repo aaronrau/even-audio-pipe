@@ -6,6 +6,11 @@ import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 import { VadEndpoint } from './vad-endpoint.js'
 import { createSileroFrameVad } from './silero-vad.ts'
+import {
+  markQueuedTranscriptActivity,
+  queuedTranscriptActivityAt,
+  transcriptQueueMaxHoldReached as transcriptQueueMaxHoldReachedSinceActivity,
+} from './transcript-queue.js'
 import { createWorkbenchRouter } from './workbench-router.js'
 
 const port = Number(process.env.PORT || 8788)
@@ -1053,16 +1058,16 @@ function getTranscriptQueue(targetSocket) {
 
 function markTranscriptQueueActivity(targetSocket) {
   const queue = targetSocket ? transcriptQueues.get(targetSocket) : null
-  if (!queue || !queue.items.length) return
-  if (transcriptQueueMaxHoldReached(queue)) return
-
-  queue.lastActivityAt = Date.now()
-  scheduleTranscriptQueueFlush(targetSocket)
+  if (!markQueuedTranscriptActivity(queue)) return
+  if (!transcriptQueueMaxHoldReached(queue)) scheduleTranscriptQueueFlush(targetSocket)
 }
 
 function markAudioSegmentStarted(targetSocket) {
   const queue = getTranscriptQueue(targetSocket)
-  if (queue) queue.activeSegments += 1
+  if (!queue) return
+
+  queue.activeSegments += 1
+  markTranscriptQueueActivity(targetSocket)
 }
 
 function markAudioSegmentFinished(targetSocket) {
@@ -1070,12 +1075,16 @@ function markAudioSegmentFinished(targetSocket) {
   if (!queue) return
 
   queue.activeSegments = Math.max(0, queue.activeSegments - 1)
+  markTranscriptQueueActivity(targetSocket)
   scheduleTranscriptQueueFlush(targetSocket)
 }
 
 function markAsrJobQueued(targetSocket) {
   const queue = getTranscriptQueue(targetSocket)
-  if (queue) queue.pendingAsrJobs += 1
+  if (!queue) return
+
+  queue.pendingAsrJobs += 1
+  markTranscriptQueueActivity(targetSocket)
 }
 
 function markAsrJobFinished(targetSocket) {
@@ -1083,6 +1092,7 @@ function markAsrJobFinished(targetSocket) {
   if (!queue) return
 
   queue.pendingAsrJobs = Math.max(0, queue.pendingAsrJobs - 1)
+  markTranscriptQueueActivity(targetSocket)
   scheduleTranscriptQueueFlush(targetSocket)
 }
 
@@ -1123,7 +1133,7 @@ function scheduleTranscriptQueueFlush(targetSocket, retryMs = null) {
   if (!queue || !queue.items.length) return
 
   if (queue.timer) clearTimeout(queue.timer)
-  const lastActivityAt = queue.lastActivityAt || queue.lastTranscriptAt
+  const lastActivityAt = queuedTranscriptActivityAt(queue)
   const elapsedMs = lastActivityAt ? Date.now() - lastActivityAt : transcriptQueueIdleMs
   const waitMs = retryMs === null
     ? Math.max(0, transcriptQueueIdleMs - elapsedMs)
@@ -1142,7 +1152,7 @@ async function flushTranscriptQueue(targetSocket) {
   if (!queue || !queue.items.length) return
 
   const maxHoldReached = transcriptQueueMaxHoldReached(queue)
-  const lastActivityAt = queue.lastActivityAt || queue.lastTranscriptAt
+  const lastActivityAt = queuedTranscriptActivityAt(queue)
   const elapsedMs = Date.now() - lastActivityAt
   if (!maxHoldReached && elapsedMs < transcriptQueueIdleMs) {
     scheduleTranscriptQueueFlush(targetSocket)
@@ -1169,10 +1179,7 @@ async function flushTranscriptQueue(targetSocket) {
 }
 
 function transcriptQueueMaxHoldReached(queue) {
-  if (!Number.isFinite(transcriptQueueMaxHoldMs) || transcriptQueueMaxHoldMs <= 0) return false
-  if (!queue?.lastTranscriptAt) return false
-
-  return Date.now() - queue.lastTranscriptAt >= transcriptQueueMaxHoldMs
+  return transcriptQueueMaxHoldReachedSinceActivity(queue, transcriptQueueMaxHoldMs)
 }
 
 async function flushRawTranscriptBatch(items) {
