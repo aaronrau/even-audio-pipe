@@ -1459,6 +1459,10 @@ wss.on('connection', (socket, req) => {
   let authTimer = null
   let onboardingPromptSent = false
   let firstAudioChunkLogged = false
+  let lastAudioAt = 0
+  let idleLogged = false
+  let idleIndicatorEnabled = false
+  let idleIndicatorFrame = 0
   const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
   let audioQueue = Promise.resolve()
   const endpoint = useVad
@@ -1478,6 +1482,30 @@ wss.on('connection', (socket, req) => {
       onSegmentEnd: finishVadSegment,
     })
     : null
+
+  console.log(`[audio] connected: stamp=${connectionStamp} remote=${req.socket.remoteAddress || 'unknown'}`)
+  const idleTimer = setInterval(() => {
+    if (socket.readyState !== WebSocket.OPEN) return
+
+    if (idleIndicatorEnabled) {
+      sendSocketJson(socket, {
+        type: 'receiver_idle',
+        frame: idleIndicatorFrame % 2 === 0 ? ' - ' : '- -',
+      })
+      idleIndicatorFrame += 1
+    }
+
+    if (!lastAudioAt || idleLogged) return
+
+    const idleMs = Date.now() - lastAudioAt
+    if (idleMs < 5_000) return
+
+    idleLogged = true
+    console.log(
+      `[audio] idle: no chunks for ${(idleMs / 1000).toFixed(1)}s, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
+    )
+  }, 1_000)
+  idleTimer.unref?.()
 
   if (transportAuth.challenge) {
     sendSocketJson(socket, {
@@ -1617,9 +1645,11 @@ wss.on('connection', (socket, req) => {
     const chunk = toBuffer(data)
     chunks += 1
     bytes += chunk.byteLength
+    lastAudioAt = Date.now()
+    idleLogged = false
     if (!firstAudioChunkLogged) {
       firstAudioChunkLogged = true
-      console.log('[audio] stream started: receiving G2 mic chunks')
+      console.log(`[audio] stream started: receiving G2 mic chunks, stamp=${connectionStamp}`)
     }
 
     if (useVad) {
@@ -1640,8 +1670,9 @@ wss.on('connection', (socket, req) => {
     }
   })
 
-  socket.on('close', () => {
+  socket.on('close', (code, reason) => {
     if (authTimer) clearTimeout(authTimer)
+    clearInterval(idleTimer)
     audioSockets.delete(socket)
     audioQueue = audioQueue
       .catch(() => {})
@@ -1651,7 +1682,10 @@ wss.on('connection', (socket, req) => {
         } else {
           closeCurrentSegment('socket close')
         }
-        console.log(`[audio] closed: ${bytes} bytes total`)
+        const reasonText = reason?.toString() || ''
+        console.log(
+          `[audio] closed: code=${code} reason=${reasonText || 'none'} stamp=${connectionStamp}, ${bytes} bytes total, ${chunks} chunks`,
+        )
       })
   })
 
@@ -1715,6 +1749,7 @@ wss.on('connection', (socket, req) => {
     if (!segment || segment.vadDetectedSent) return
 
     segment.vadDetectedSent = true
+    idleIndicatorEnabled = true
     const rmsText = Number.isFinite(decision.rms) ? ` rms=${decision.rms.toFixed(4)}` : ''
     const backendText = decision.backend ? ` backend=${decision.backend}` : ''
     console.log(`[audio] VAD detected speech${backendText}${rmsText}`)

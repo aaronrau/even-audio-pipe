@@ -65,6 +65,7 @@ let sentBytes = 0
 let droppedChunks = 0
 let transcriptText = ''
 let speechDetected = false
+let backendIdleFrame = ''
 let glassesMode: GlassesMode = 'live'
 let historyTransitioning = false
 let historyUpdateInFlight = false
@@ -75,6 +76,8 @@ let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
 let audioStreamStarted = false
+let receiverState = 'disconnected'
+let lastReceiverClose = ''
 let reconnectTimer: number | null = null
 let audioEndpointSettings = blankAudioEndpointSettings()
 let audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
@@ -161,7 +164,7 @@ function setUiStatus(text: string) {
 
 function setStats() {
   statsEl.textContent =
-    `${sentChunks} chunks, ${sentBytes} bytes, ${droppedChunks} dropped`
+    `${receiverState}, audio ${audioOpen ? 'on' : 'off'}, ${sentChunks} chunks, ${sentBytes} bytes, ${droppedChunks} dropped${lastReceiverClose ? `, last close: ${lastReceiverClose}` : ''}`
 }
 
 function launchToken() {
@@ -520,6 +523,7 @@ function currentLiveGlassesContent() {
   if (startupPromptVisible) return startupLiveContent(audioEndpointSettings)
   if (speechDetected) return currentSpeechWaveformFrame()
   if (transcriptText) return formatGlassesTranscript(transcriptText)
+  if (backendIdleFrame) return backendIdleFrame
   return BLANK_LIVE_CONTENT
 }
 
@@ -928,6 +932,14 @@ function handleReceiverMessage(raw: string) {
     return
   }
 
+  if (payload.type === 'receiver_idle' && typeof payload.frame === 'string') {
+    backendIdleFrame = payload.frame
+    if (!startupPromptVisible && !speechDetected && !transcriptText) {
+      void renderGlassesStatus()
+    }
+    return
+  }
+
   if (payload.type === 'agent_status' && payload.status === 'sending') {
     setUiStatus('Sending to workbench...')
     return
@@ -1231,10 +1243,12 @@ async function renderGlassesStatus() {
 async function setAudio(open: boolean) {
   if (audioOpen === open) return
   audioOpen = open
+  setStats()
   try {
     await bridge.audioControl(open)
   } catch (err) {
     audioOpen = !open
+    setStats()
     setUiStatus(`audioControl(${String(open)}) failed`)
     console.error(err)
   }
@@ -1257,6 +1271,9 @@ function connect() {
 
   urlEl.textContent = `${endpoint.label}: ${displayWsUrl(endpoint.url)}`
   setUiStatus(`Connecting to ${endpoint.label} receiver...`)
+  receiverState = 'connecting'
+  backendIdleFrame = ''
+  setStats()
   audioStreamStarted = false
   ws = new WebSocket(endpoint.url)
   ws.binaryType = 'arraybuffer'
@@ -1274,6 +1291,9 @@ function connect() {
     if (!ws) return
     window.clearTimeout(connectTimeout)
     opened = true
+    receiverState = 'open'
+    lastReceiverClose = ''
+    setStats()
     if (currentSharedSecret()) {
       setUiStatus(`Authenticating ${endpoint.label} receiver...`)
       return
@@ -1287,9 +1307,13 @@ function connect() {
     }
   })
 
-  ws.addEventListener('close', async () => {
+  ws.addEventListener('close', async event => {
     window.clearTimeout(connectTimeout)
     ws = null
+    receiverState = 'closed'
+    backendIdleFrame = ''
+    lastReceiverClose = `${event.code}${event.reason ? ` ${event.reason}` : ''}${event.wasClean ? ' clean' : ' unclean'}`
+    setStats()
     clearSpeechProcessingState()
     await setAudio(false)
     if (!cleanedUp) {
@@ -1308,6 +1332,9 @@ function connect() {
 
   ws.addEventListener('error', () => {
     window.clearTimeout(connectTimeout)
+    receiverState = 'error'
+    backendIdleFrame = ''
+    setStats()
     speechDetected = false
     setUiStatus(`${endpoint.label} receiver connection error`)
   })
@@ -1316,6 +1343,7 @@ function connect() {
 function cleanup() {
   if (cleanedUp) return
   cleanedUp = true
+  backendIdleFrame = ''
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
   if (clearTranscriptTimer !== null) window.clearTimeout(clearTranscriptTimer)
   if (spinnerTimer !== null) window.clearInterval(spinnerTimer)
