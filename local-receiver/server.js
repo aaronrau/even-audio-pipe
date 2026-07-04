@@ -64,6 +64,7 @@ const sileroVadModel = process.env.SILERO_VAD_MODEL || ''
 const sileroVadThreshold = Number(process.env.SILERO_VAD_THRESHOLD || 0.5)
 const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 3_000)
 const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
+const receiverIdleAudioFreshMs = Number(process.env.RECEIVER_IDLE_AUDIO_FRESH_MS || 2_500)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const messageHistoryDirPath = resolve(process.env.MESSAGE_HISTORY_DIR || join(transcriptDirPath, 'message-history'))
 const messageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || 0)
@@ -1462,6 +1463,7 @@ wss.on('connection', (socket, req) => {
   let lastAudioAt = 0
   let idleLogged = false
   let idleIndicatorEnabled = false
+  let idleIndicatorClearSent = true
   let idleIndicatorFrame = 0
   const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
   let audioQueue = Promise.resolve()
@@ -1487,12 +1489,20 @@ wss.on('connection', (socket, req) => {
   const idleTimer = setInterval(() => {
     if (socket.readyState !== WebSocket.OPEN) return
 
-    if (idleIndicatorEnabled) {
+    const audioFresh = lastAudioAt && Date.now() - lastAudioAt <= receiverIdleAudioFreshMs
+    if (idleIndicatorEnabled && audioFresh) {
       sendSocketJson(socket, {
         type: 'receiver_idle',
         frame: idleIndicatorFrame % 2 === 0 ? ' - ' : '- -',
       })
       idleIndicatorFrame += 1
+      idleIndicatorClearSent = false
+    } else if (idleIndicatorEnabled && !idleIndicatorClearSent) {
+      sendSocketJson(socket, {
+        type: 'receiver_idle',
+        frame: '',
+      })
+      idleIndicatorClearSent = true
     }
 
     if (!lastAudioAt || idleLogged) return
@@ -1647,6 +1657,7 @@ wss.on('connection', (socket, req) => {
     bytes += chunk.byteLength
     lastAudioAt = Date.now()
     idleLogged = false
+    idleIndicatorEnabled = true
     if (!firstAudioChunkLogged) {
       firstAudioChunkLogged = true
       console.log(`[audio] stream started: receiving G2 mic chunks, stamp=${connectionStamp}`)
@@ -1749,7 +1760,6 @@ wss.on('connection', (socket, req) => {
     if (!segment || segment.vadDetectedSent) return
 
     segment.vadDetectedSent = true
-    idleIndicatorEnabled = true
     const rmsText = Number.isFinite(decision.rms) ? ` rms=${decision.rms.toFixed(4)}` : ''
     const backendText = decision.backend ? ` backend=${decision.backend}` : ''
     console.log(`[audio] VAD detected speech${backendText}${rmsText}`)
