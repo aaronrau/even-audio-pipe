@@ -45,7 +45,8 @@
     "agentArmTimeoutMs": 30000,
     "timeoutMs": 15000,
     "summaryPath": "/workbench/summary",
-    "summaryToken": ""
+    "summaryToken": "",
+    "progressStaleMs": 180000
   },
   "transcriptQueue": {
     "idleMs": 3000,

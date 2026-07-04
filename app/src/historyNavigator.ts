@@ -17,13 +17,15 @@ export type HistoryNavigatorAction =
   | 'closed_seen'
   | 'opened_detail'
   | 'closed_detail'
+  | 'peek_progress'
   | 'selected'
   | 'detail_scrolled'
 
-export type HistoryItemKind = 'agent' | 'transcript' | 'queued' | 'error'
+export type HistoryItemKind = 'agent' | 'transcript' | 'queued' | 'error' | 'progress'
 
 export type HistoryNavigatorResult = {
   action: HistoryNavigatorAction
+  agent?: string
   mode: HistoryNavigatorMode
   content: string
   debug: HistoryNavigatorDebug
@@ -145,6 +147,14 @@ function uniqueLabels(labels: string[]) {
   ))
 }
 
+function normalizedLabelKey(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 function stripLeadingLabels(text: string, labels: string[]) {
   return uniqueLabels(labels)
     .sort((a, b) => b.length - a.length)
@@ -179,6 +189,7 @@ export class HistoryNavigator {
   private readonly maxContentLength: number
   private readonly detailCanvas: HistoryCanvas
   private entries: HistoryEntry[] = []
+  private progressAgents: string[] = []
   private pendingTranscript = ''
   private mode: HistoryNavigatorMode = 'closed'
   private selectedItemId: string | null = BACK_ROW_ID
@@ -245,6 +256,11 @@ export class HistoryNavigator {
       return this.result('none')
     }
 
+    if (item.kind === 'progress') {
+      this.openDetail(item)
+      return this.result('peek_progress', item.label)
+    }
+
     this.seenDetailIds.add(item.id)
     this.openDetail(item)
     return this.result('opened_detail')
@@ -269,7 +285,7 @@ export class HistoryNavigator {
   }
 
   replaceEntries(entries: HistoryEntry[]) {
-    const previousNewestId = this.currentItems()[0]?.id
+    const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
 
@@ -277,8 +293,13 @@ export class HistoryNavigator {
     this.reconcileSelection(wasNewestSelected)
   }
 
+  replaceProgressAgents(agents: string[]) {
+    this.progressAgents = uniqueLabels(agents)
+    this.reconcileSelection(false)
+  }
+
   appendEntry(entry: HistoryEntry) {
-    const previousNewestId = this.currentItems()[0]?.id
+    const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
 
@@ -286,8 +307,25 @@ export class HistoryNavigator {
     this.reconcileSelection(wasNewestSelected)
   }
 
+  openLatestDetailForAgent(agent: string): HistoryNavigatorResult {
+    const key = normalizedLabelKey(agent)
+    if (!key || this.mode === 'closed') return this.result('none')
+
+    const item = this.currentEntryItems()
+      .find(candidate => (
+        candidate.kind === 'agent' &&
+        normalizedLabelKey(candidate.label) === key
+      ))
+    if (!item) return this.result('none')
+
+    this.selectedItemId = item.id
+    this.seenDetailIds.add(item.id)
+    this.openDetail(item)
+    return this.result('opened_detail', item.label)
+  }
+
   setPendingTranscript(text: string, _frame = '') {
-    const previousNewestId = this.currentItems()[0]?.id
+    const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
 
@@ -323,23 +361,52 @@ export class HistoryNavigator {
     }
   }
 
-  private result(action: HistoryNavigatorAction): HistoryNavigatorResult {
+  private result(action: HistoryNavigatorAction, agent = ''): HistoryNavigatorResult {
     const content = this.content()
-    return {
+    const result: HistoryNavigatorResult = {
       action,
       mode: this.mode,
       content,
       debug: this.debug(content),
     }
+    if (agent) result.agent = agent
+    return result
   }
 
   private currentItems() {
+    return [
+      ...this.progressAgents.map(agent => this.progressAgentItem(agent)),
+      ...this.currentEntryItems(),
+    ]
+  }
+
+  private currentEntryItems() {
     const items = this.entries
       .map((entry, index) => ({ entry, index }))
       .sort(compareEntryRecords)
       .map(({ entry, index }) => this.entryItem(entry, index))
 
     return this.groupAdjacentTranscripts(items)
+  }
+
+  private progressAgentItem(agent: string): HistoryItem {
+    const id = `progress:${hashString(agent)}`
+    const detailEntry: HistoryEntry = {
+      id,
+      label: agent,
+      text: 'Checking...',
+      receivedAt: Date.now(),
+    }
+
+    return {
+      id,
+      kind: 'progress',
+      label: agent,
+      listText: '(...)',
+      detailText: 'Checking...',
+      detailEntries: [detailEntry],
+      receivedAt: 0,
+    }
   }
 
   private entryItem(entry: HistoryEntry, index: number): HistoryItem {
@@ -437,7 +504,7 @@ export class HistoryNavigator {
   private reconcileSelection(selectNewest: boolean) {
     const items = this.currentItems()
     if (selectNewest) {
-      this.selectedItemId = items[0]?.id ?? BACK_ROW_ID
+      this.selectedItemId = this.currentEntryItems()[0]?.id ?? items[0]?.id ?? BACK_ROW_ID
     } else if (
       this.selectedItemId !== BACK_ROW_ID
       && !items.some(item => item.id === this.selectedItemId)
@@ -511,6 +578,10 @@ export class HistoryNavigator {
   private itemListBodyLines(item: HistoryItem) {
     if (item.kind === 'queued') {
       return [`Queued: ${item.listText}`]
+    }
+
+    if (item.kind === 'progress') {
+      return [`${item.label} ${item.listText}`]
     }
 
     const listText = this.listPreviewText(item)

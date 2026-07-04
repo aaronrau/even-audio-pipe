@@ -36,6 +36,7 @@ const workbenchConfig = {
   timeoutMs: Number(process.env.SPEECH_WORKBENCH_TIMEOUT_MS || 15_000),
   summaryToken: process.env.SPEECH_WORKBENCH_SUMMARY_TOKEN || '',
   summaryPath: normalizeHttpPath(process.env.SPEECH_WORKBENCH_SUMMARY_PATH || '/workbench/summary'),
+  progressStaleMs: Number(process.env.SPEECH_WORKBENCH_PROGRESS_STALE_MS || 180_000),
 }
 const workbenchRouter = createWorkbenchRouter(workbenchConfig)
 const minAsrBytes = Number(process.env.MIN_ASR_BYTES || 6400)
@@ -108,6 +109,8 @@ let runtimeConfigCache = {
 }
 const audioSockets = new Set()
 const transcriptQueues = new WeakMap()
+const activeWorkbenchAgents = new Map()
+const recentWorkbenchSummaries = new Map()
 let sileroVad = null
 let sileroVadStartPromise = null
 let sileroVadUnavailable = false
@@ -433,6 +436,122 @@ function stringList(value) {
   return String(value || '').split(/[,\n]/).map(item => item.trim()).filter(Boolean)
 }
 
+function normalizeAgentName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function workbenchAgentNames() {
+  return workbenchConfig.agents.length
+    ? workbenchConfig.agents
+    : ['Flux', 'Brock', 'Pike', 'Wolf']
+}
+
+function canonicalWorkbenchAgent(agent) {
+  const requested = normalizeAgentName(agent)
+  if (!requested) return ''
+
+  return workbenchAgentNames()
+    .find(candidate => normalizeAgentName(candidate) === requested) || ''
+}
+
+function activeWorkbenchAgentNames() {
+  return Array.from(activeWorkbenchAgents.values()).map(state => state.label)
+}
+
+function workbenchStatus() {
+  return {
+    enabled: workbenchConfig.enabled,
+    agents: workbenchAgentNames(),
+    activeAgents: activeWorkbenchAgentNames(),
+  }
+}
+
+function broadcastWorkbenchStatus() {
+  broadcastSocketJson({
+    type: 'workbench_status',
+    workbench: workbenchStatus(),
+  })
+}
+
+function configuredWorkbenchProgressStaleMs() {
+  const staleMs = Number(workbenchConfig.progressStaleMs)
+  return Number.isFinite(staleMs) ? Math.max(0, Math.floor(staleMs)) : 180_000
+}
+
+function clearWorkbenchProgressTimer(state) {
+  if (!state?.timer) return
+  clearTimeout(state.timer)
+  delete state.timer
+}
+
+function scheduleWorkbenchProgressExpiry(key) {
+  const state = activeWorkbenchAgents.get(key)
+  if (!state) return
+
+  clearWorkbenchProgressTimer(state)
+
+  const staleMs = configuredWorkbenchProgressStaleMs()
+  if (staleMs <= 0) return
+
+  const delayMs = Math.max(1, state.updatedAt + staleMs - Date.now())
+  state.timer = setTimeout(() => {
+    const current = activeWorkbenchAgents.get(key)
+    if (!current) return
+
+    const elapsedMs = Date.now() - current.updatedAt
+    if (elapsedMs < configuredWorkbenchProgressStaleMs()) {
+      scheduleWorkbenchProgressExpiry(key)
+      return
+    }
+
+    clearWorkbenchProgressTimer(current)
+    activeWorkbenchAgents.delete(key)
+    console.log(
+      `[workbench] cleared stale progress for ${current.label}: no new content for ${(elapsedMs / 1000).toFixed(1)}s`,
+    )
+    broadcastWorkbenchStatus()
+  }, delayMs)
+  state.timer.unref?.()
+}
+
+function setWorkbenchAgentInProgress(agent, inProgress, options = {}) {
+  const label = canonicalWorkbenchAgent(agent) || stringValue(agent)
+  const key = normalizeAgentName(label)
+  if (!key) return false
+
+  const previous = activeWorkbenchAgents.get(key)
+  if (inProgress) {
+    const signature = stringValue(options.signature)
+    const activityChanged = !previous ||
+      options.forceActivity === true ||
+      !signature ||
+      previous.signature !== signature
+    if (!activityChanged && previous.label === label) return false
+
+    clearWorkbenchProgressTimer(previous)
+    const state = {
+      label,
+      signature: signature || previous?.signature || '',
+      updatedAt: Number.isFinite(options.updatedAt) ? options.updatedAt : Date.now(),
+    }
+    activeWorkbenchAgents.set(key, state)
+    scheduleWorkbenchProgressExpiry(key)
+    if (previous?.label === label) return true
+  } else if (previous) {
+    clearWorkbenchProgressTimer(previous)
+    activeWorkbenchAgents.delete(key)
+  } else {
+    return false
+  }
+
+  broadcastWorkbenchStatus()
+  return true
+}
+
 function isAuthorizedAudioRequest(url) {
   if (!accessToken) return true
   return url.searchParams.get('t') === accessToken || url.searchParams.get('token') === accessToken
@@ -530,24 +649,66 @@ async function readJsonRequest(req, limitBytes = 65_536) {
   }
 }
 
-async function handleWorkbenchSummary(req, res) {
-  if (!isAuthorizedBearerRequest(req, workbenchConfig.summaryToken)) {
-    sendHttpJson(res, 401, { ok: false, error: 'unauthorized' })
-    return
-  }
-
-  const payload = await readJsonRequest(req)
+function detailTextFromWorkbenchPayload(payload) {
   const detail = normalizeTranscript(textFromFields(payload, detailTextFields))
-  const summary = normalizeTranscript(textFromFields(payload, summaryTextFields) || detail)
-  if (!summary) {
-    sendHttpJson(res, 400, { ok: false, error: 'missing_summary' })
-    return
+  if (detail) return detail
+
+  const detailLines = payload?.detail_lines || payload?.detailLines
+  if (!Array.isArray(detailLines)) return ''
+
+  return normalizeTranscript(detailLines.map(stringValue).join('\n'))
+}
+
+function pruneRecentWorkbenchSummaries(now = Date.now()) {
+  const windowMs = 5_000
+  for (const [key, receivedAt] of recentWorkbenchSummaries) {
+    if (now - receivedAt > windowMs) recentWorkbenchSummaries.delete(key)
   }
+}
+
+function workbenchSummaryDuplicateKey(agent, summary, detail, phase, isFinal) {
+  return JSON.stringify({
+    agent: normalizeAgentName(agent),
+    summary,
+    detail,
+    phase,
+    isFinal,
+  })
+}
+
+function publishWorkbenchSummary(payload, options = {}) {
+  const detail = options.detail !== undefined
+    ? normalizeTranscript(options.detail)
+    : detailTextFromWorkbenchPayload(payload)
+  const summary = normalizeTranscript(textFromFields(payload, summaryTextFields) || detail)
+  if (!summary) return null
 
   const agent = stringValue(payload.agent)
   const command = stringValue(payload.command)
+  const phase = stringValue(payload.phase || (payload.is_final ? 'final' : 'in_progress'))
+  const isFinal = payload.is_final === true || phase === 'final'
   const timestamp = payload.timestamp ?? Date.now() / 1000
   const createdAt = new Date().toISOString()
+  const now = Date.now()
+  pruneRecentWorkbenchSummaries(now)
+  const duplicateKey = workbenchSummaryDuplicateKey(agent, summary, detail, phase, isFinal)
+  if (recentWorkbenchSummaries.has(duplicateKey)) {
+    console.log(`[workbench] duplicate summary ignored${agent ? ` from ${agent}` : ''}: ${summary}`)
+    return {
+      delivered: 0,
+      duplicate: true,
+      summary,
+      detail,
+      agent,
+      command,
+      phase,
+      isFinal,
+    }
+  }
+  recentWorkbenchSummaries.set(duplicateKey, now)
+  setWorkbenchAgentInProgress(agent, !isFinal, {
+    signature: detail || summary,
+  })
   appendMessageHistory({
     label: agent || 'Agent',
     text: summary,
@@ -562,12 +723,30 @@ async function handleWorkbenchSummary(req, res) {
     detail_response: detail,
     agent,
     command,
+    is_final: isFinal,
+    phase,
     timestamp,
     createdAt,
   })
 
   console.log(`[workbench] summary received${agent ? ` from ${agent}` : ''}: ${summary}`)
-  sendHttpJson(res, 200, { ok: true, delivered })
+  return { delivered, summary, detail, agent, command, phase, isFinal }
+}
+
+async function handleWorkbenchSummary(req, res) {
+  if (!isAuthorizedBearerRequest(req, workbenchConfig.summaryToken)) {
+    sendHttpJson(res, 401, { ok: false, error: 'unauthorized' })
+    return
+  }
+
+  const payload = await readJsonRequest(req)
+  const published = publishWorkbenchSummary(payload)
+  if (!published) {
+    sendHttpJson(res, 400, { ok: false, error: 'missing_summary' })
+    return
+  }
+
+  sendHttpJson(res, 200, { ok: true, delivered: published.delivered })
 }
 
 async function maybePostToTerminal(text) {
@@ -686,10 +865,15 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
 
     console.log(`[workbench] posted transcript to ${baseUrl}/messages`)
     if (route.clearPendingAgentOnSent) workbenchRouter.clearPendingAgent(targetSocket, route.agent)
+    const sentAgent = responseBody.agent || route.agent || workbenchConfig.agent || ''
+    setWorkbenchAgentInProgress(sentAgent, true, {
+      signature: route.message,
+      forceActivity: true,
+    })
     sendSocketJson(targetSocket, {
       type: 'agent_status',
       status: 'sent',
-      agent: responseBody.agent || workbenchConfig.agent || '',
+      agent: sentAgent,
       message: responseBody.message || route.message,
       jobId: context.jobId,
     })
@@ -708,6 +892,136 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
       error,
       agent: route.agent || workbenchConfig.agent,
       jobId: context.jobId,
+    })
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function postWorkbenchLocalSummary(agent, targetSocket, context = {}) {
+  const requestedAgent = canonicalWorkbenchAgent(agent)
+  if (!requestedAgent) {
+    const error = `unknown workbench agent: ${stringValue(agent) || 'none'}`
+    console.warn(`[workbench] ${error}`)
+    sendSocketJson(targetSocket, {
+      type: 'agent_error',
+      error,
+      agent: stringValue(agent),
+      availableAgents: workbenchAgentNames(),
+      jobId: context.jobId,
+    })
+    return
+  }
+
+  if (!workbenchConfig.enabled) {
+    console.log('[workbench] skipped local summary: workbench_disabled')
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: 'workbench_disabled',
+      agent: requestedAgent,
+      jobId: context.jobId,
+      requestType: 'local',
+    })
+    return
+  }
+
+  const baseUrl = workbenchConfig.url.replace(/\/$/, '')
+  if (!baseUrl) {
+    console.warn('[workbench] enabled but SPEECH_WORKBENCH_URL is empty')
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: 'workbench_unconfigured',
+      agent: requestedAgent,
+      jobId: context.jobId,
+      requestType: 'local',
+    })
+    return
+  }
+
+  const headers = { 'content-type': 'application/json' }
+  if (workbenchConfig.token) headers.authorization = `Bearer ${workbenchConfig.token}`
+
+  sendSocketJson(targetSocket, {
+    type: 'agent_status',
+    status: 'sending',
+    agent: requestedAgent,
+    jobId: context.jobId,
+    requestType: 'local',
+  })
+  console.log(`[workbench] requesting local progress summary for ${requestedAgent}`)
+
+  const controller = new AbortController()
+  const timeoutMs = Number.isFinite(workbenchConfig.timeoutMs) ? workbenchConfig.timeoutMs : 15_000
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  timeout.unref?.()
+
+  try {
+    const res = await fetch(`${baseUrl}/messages`, {
+      method: 'POST',
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify({
+        type: 'local',
+        agent: requestedAgent,
+        message: 'progress_summary',
+      }),
+    })
+    const bodyText = await res.text()
+    let responseBody = {}
+    try {
+      responseBody = bodyText ? JSON.parse(bodyText) : {}
+    } catch {
+      responseBody = { error: bodyText }
+    }
+
+    if (!res.ok || responseBody?.ok === false) {
+      const detail = responseBody?.error || bodyText || `HTTP ${res.status}`
+      throw new Error(`workbench local summary failed: ${detail}`)
+    }
+
+    sendSocketJson(targetSocket, {
+      type: 'agent_status',
+      status: 'sent',
+      agent: responseBody.agent || requestedAgent,
+      message: responseBody.message || 'progress_summary',
+      jobId: context.jobId,
+      requestType: 'local',
+    })
+
+    const responseDetail = detailTextFromWorkbenchPayload(responseBody)
+    const responseSummary = normalizeTranscript(
+      stringValue(responseBody.summary) ||
+      stringValue(responseBody.text) ||
+      stringValue(responseBody.response) ||
+      responseDetail,
+    )
+    if (responseSummary) {
+      publishWorkbenchSummary({
+        agent: responseBody.agent || requestedAgent,
+        command: responseBody.command,
+        detail: responseDetail,
+        is_final: responseBody.is_final === true,
+        phase: responseBody.phase || 'in_progress',
+        response: responseSummary,
+        timestamp: responseBody.timestamp,
+      })
+    }
+  } catch (err) {
+    const error = err?.name === 'AbortError'
+      ? `workbench local summary timed out after ${timeoutMs}ms`
+      : err?.message || String(err)
+    console.error(`[workbench] ${error}`)
+    appendMessageHistory({
+      label: 'Error',
+      text: error,
+      createdAt: new Date().toISOString(),
+    })
+    sendSocketJson(targetSocket, {
+      type: 'agent_error',
+      error,
+      agent: requestedAgent,
+      jobId: context.jobId,
+      requestType: 'local',
     })
   } finally {
     clearTimeout(timeout)
@@ -1549,6 +1863,7 @@ wss.on('connection', (socket, req) => {
     asrConfigured: Boolean(asrWorkerUrl || asrCommand),
     chunkMode: useVad ? 'vad' : 'fixed',
     vadBackend: useVad ? vadBackend : 'off',
+    workbench: workbenchStatus(),
   })
 
   if (useVad) {
@@ -1632,6 +1947,23 @@ wss.on('connection', (socket, req) => {
       }
       if (control?.type === 'get_message_history') {
         sendMessageHistory(socket)
+      }
+      if (control?.type === 'peek_progress') {
+        const auth = currentUserAuthConfig()
+        if (auth.required && !userAuthenticated) {
+          sendSocketJson(socket, {
+            type: 'agent_error',
+            error: 'Even user is required',
+            agent: stringValue(control.agent),
+            requestType: 'local',
+          })
+          return
+        }
+        postWorkbenchLocalSummary(control.agent, socket, {
+          user: evenUser,
+        }).catch(err => {
+          console.error(`[workbench] local summary request failed: ${err.message}`)
+        })
       }
       return
     }

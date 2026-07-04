@@ -273,6 +273,44 @@ const queuedWaitingRow = queuedWaitingContent.split('\n')[0]
 assert.match(queuedWaitingRow, /Queued: queued transcript now waiting/)
 assert.doesNotMatch(queuedWaitingRow, /[⧖⋈⦚]/)
 
+const progressNavigator = new HistoryNavigator({
+  width: CANVAS_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  scrollOverlapLines: 1,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+progressNavigator.replaceProgressAgents(['Flux', 'Pike'])
+progressNavigator.replaceEntries([
+  entry(0, 'You', 'older transcript'),
+  entry(1, 'Flux', 'Flux finished a previous task.', 'previous detail'),
+])
+const progressOpened = progressNavigator.open()
+assert.match(progressOpened.content, /^  Flux \(\.\.\.\)$/m)
+assert.match(progressOpened.content, /^  Pike \(\.\.\.\)$/m)
+assertViewportSafe(progressOpened.content)
+const selectedProgress = progressNavigator.scroll(1)
+assert.match(selectedProgress.content, /^> Flux \(\.\.\.\)$/m)
+const progressTap = progressNavigator.tap()
+assert.equal(progressTap.action, 'peek_progress')
+assert.equal(progressTap.mode, 'detail')
+assert.equal(progressTap.agent, 'Flux')
+assert.match(progressTap.content, /Checking\.\.\./)
+assertViewportSafe(progressTap.content)
+progressNavigator.appendEntry(entry(
+  2,
+  'Flux',
+  'Flux summarized the current progress.',
+  'npm test\n72 passed',
+))
+const openedProgressDetail = progressNavigator.openLatestDetailForAgent('flux')
+assert.equal(openedProgressDetail.action, 'opened_detail')
+assert.equal(openedProgressDetail.mode, 'detail')
+assert.match(openedProgressDetail.content, /^12:02 Flux npm test$/m)
+assert.match(openedProgressDetail.content, /^72 passed$/m)
+assert.doesNotMatch(openedProgressDetail.content, /previous detail/)
+assertViewportSafe(openedProgressDetail.content)
+
 const pagingNavigator = new HistoryNavigator({
   width: CANVAS_WIDTH,
   height: CANVAS_HEIGHT,

@@ -147,6 +147,13 @@ live view clears.
 Tap the glasses history control to open recent transcripts and agent summaries.
 Tap an item to open detail. Tap again to return to the list. Opening history
 clears the transient live transcript display.
+When a workbench agent is active and in progress, the history list also shows a
+progress row such as `Flux (...)`; selecting it asks the receiver for an
+on-demand local summary of that agent's latest tmux output. The returned
+summary opens as a detail view with the cleaned current log tail; while the
+summary is loading, the detail view shows `Checking...`. If the workbench does
+not send new progress content for three minutes, the receiver clears the
+progress row.
 
 **5. Route a command**
 
@@ -357,7 +364,8 @@ Common sections:
     "agents": ["Flux", "Brock", "Pike", "Wolf"],
     "requireAgentPrefix": true,
     "summaryPath": "/workbench/summary",
-    "summaryToken": ""
+    "summaryToken": "",
+    "progressStaleMs": 180000
   },
   "transcriptQueue": {
     "idleMs": 3000,
@@ -503,7 +511,8 @@ Enable command routing:
     "requireAgentPrefix": true,
     "agentPrefixWordLimit": 3,
     "agentArmTimeoutMs": 30000,
-    "summaryToken": "summary-secret"
+    "summaryToken": "summary-secret",
+    "progressStaleMs": 180000
   }
 }
 ```
@@ -523,6 +532,7 @@ VOICE_TMUX_SUMMARY_WEBHOOK_TOKEN=summary-secret \
 The receiver sends final commands to `/messages` only when an agent name appears
 within the configured prefix window. Agent summaries posted back to
 `/workbench/summary` are forwarded to connected glasses and saved in history.
+Active progress rows expire after `progressStaleMs` with no new content.
 
 ## Output Files
 

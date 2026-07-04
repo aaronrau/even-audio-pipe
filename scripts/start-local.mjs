@@ -155,6 +155,7 @@ spawnManaged('receiver', 'npm', ['start'], {
     SPEECH_WORKBENCH_TIMEOUT_MS: String(workbenchConfig.timeoutMs),
     SPEECH_WORKBENCH_SUMMARY_TOKEN: workbenchConfig.summaryToken,
     SPEECH_WORKBENCH_SUMMARY_PATH: workbenchConfig.summaryPath,
+    SPEECH_WORKBENCH_PROGRESS_STALE_MS: String(workbenchConfig.progressStaleMs),
     EVEN_AUDIO_PIPE_CONFIG_PATH: configPath,
     EVEN_AUDIO_PIPE_TOKEN: authConfig.enabled ? authConfig.token : '',
     EVEN_AUDIO_PIPE_TOKEN_SECRET: authConfig.enabled ? authConfig.tokenSecret : '',
@@ -531,6 +532,11 @@ function resolveWorkbenchConfig(workbench = {}) {
     workbench.summaryPath ||
     '/workbench/summary',
   )
+  const progressStaleMs = Number(
+    process.env.SPEECH_WORKBENCH_PROGRESS_STALE_MS ??
+    workbench.progressStaleMs ??
+    180_000,
+  )
 
   return {
     enabled,
@@ -544,6 +550,7 @@ function resolveWorkbenchConfig(workbench = {}) {
     timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15_000,
     summaryToken,
     summaryPath,
+    progressStaleMs: Number.isFinite(progressStaleMs) ? Math.max(0, Math.floor(progressStaleMs)) : 180_000,
   }
 }
 

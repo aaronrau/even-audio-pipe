@@ -143,6 +143,7 @@ const historyNavigator = new HistoryNavigator({
   scrollOverlapLines: 1,
   maxContentLength: TEXT_UPGRADE_LIMIT,
 })
+let pendingPeekAgent = ''
 
 function isHistoryMode() {
   return glassesMode !== 'live'
@@ -391,6 +392,28 @@ function stringValue(value: unknown) {
   return String(value).trim()
 }
 
+function normalizeAgentLabel(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function sameAgentLabel(a: string, b: string) {
+  return normalizeAgentLabel(a) === normalizeAgentLabel(b)
+}
+
+function sanitizeAgentList(value: unknown) {
+  if (!Array.isArray(value)) return []
+  const agents: string[] = []
+  const seen = new Set<string>()
+  for (const item of value) {
+    const agent = stringValue(item)
+    const key = normalizeAgentLabel(agent)
+    if (!agent || seen.has(key)) continue
+    seen.add(key)
+    agents.push(agent)
+  }
+  return agents
+}
+
 function textFromFields(record: Record<string, unknown>, fields: readonly string[]) {
   for (const field of fields) {
     const text = stringValue(record[field])
@@ -575,12 +598,65 @@ function requestHistoryWindowUpdate() {
   void flushHistoryWindowUpdate()
 }
 
+function cancelPendingStatusRender() {
+  statusRenderRevision += 1
+}
+
 function requestMessageHistory(reason: string) {
   if (ws?.readyState !== WebSocket.OPEN) return
   ws.send(JSON.stringify({
     type: 'get_message_history',
     reason,
   }))
+}
+
+function requestPeekProgress(agent: string) {
+  if (ws?.readyState !== WebSocket.OPEN) {
+    setUiStatus('Receiver disconnected')
+    return
+  }
+
+  pendingPeekAgent = agent
+  ws.send(JSON.stringify({
+    type: 'peek_progress',
+    agent,
+  }))
+  setUiStatus(`Checking ${agent} progress...`)
+}
+
+function updateWorkbenchProgressAgents(payload: Record<string, unknown>) {
+  const workbench = payload.workbench
+  if (!workbench || typeof workbench !== 'object') return
+
+  const record = workbench as Record<string, unknown>
+  const agents = record.enabled === false ? [] : sanitizeAgentList(record.activeAgents)
+  historyNavigator.replaceProgressAgents(agents)
+  requestHistoryWindowUpdate()
+}
+
+function openPeekProgressDetail(agent: string) {
+  if (!isHistoryMode()) return
+
+  const result = historyNavigator.openLatestDetailForAgent(agent)
+  syncHistoryMode()
+  if (result.action !== 'opened_detail') {
+    requestHistoryWindowUpdate()
+    return
+  }
+
+  void renderHistoryContent(result.content).then(rendered => {
+    if (!rendered) {
+      requestHistoryWindowUpdate()
+      return
+    }
+
+    sendControlDebug({
+      type: 'history_debug',
+      action: result.action,
+      mode: glassesMode,
+      ...navigatorDebugPayload(result.debug),
+    })
+  })
 }
 
 function sendControlDebug(payload: Record<string, unknown>) {
@@ -663,6 +739,7 @@ async function flushHistoryWindowUpdate() {
 }
 
 async function showHistoryWindow() {
+  cancelPendingStatusRender()
   clearLiveTranscriptDisplay()
   const previousMode = glassesMode
   const result = historyNavigator.open()
@@ -749,6 +826,9 @@ async function handleHistoryTap() {
         mode: glassesMode,
         ...navigatorDebugPayload(result.debug),
       })
+      if (result.action === 'peek_progress' && result.agent) {
+        requestPeekProgress(result.agent)
+      }
     } else {
       sendControlDebug({
         type: 'history_debug',
@@ -927,27 +1007,44 @@ function handleReceiverMessage(raw: string) {
     const agent = typeof payload.agent === 'string' && payload.agent
       ? payload.agent
       : 'Agent'
+    const shouldOpenPeekDetail = Boolean(
+      pendingPeekAgent && sameAgentLabel(agent, pendingPeekAgent),
+    )
+    if (pendingPeekAgent && sameAgentLabel(agent, pendingPeekAgent)) {
+      pendingPeekAgent = ''
+    }
     appendTranscript(summary, agent, detail)
+    if (shouldOpenPeekDetail) {
+      openPeekProgressDetail(agent)
+    }
     setUiStatus('Agent summary received')
     return
   }
 
   if (payload.type === 'receiver_idle' && typeof payload.frame === 'string') {
     backendIdleFrame = payload.frame
-    if (!startupPromptVisible && !speechDetected && !transcriptText) {
+    if (historyTransitioning || isHistoryMode()) {
+      requestHistoryWindowUpdate()
+      return
+    }
+    if (!historyTransitioning && !isHistoryMode() && !startupPromptVisible && !speechDetected && !transcriptText) {
       void renderGlassesStatus()
     }
     return
   }
 
   if (payload.type === 'agent_status' && payload.status === 'sending') {
-    setUiStatus('Sending to workbench...')
+    setUiStatus(payload.requestType === 'local'
+      ? 'Checking agent progress...'
+      : 'Sending to workbench...')
     return
   }
 
   if (payload.type === 'agent_status' && payload.status === 'sent') {
     stopSpeechProcessingIndicator()
-    setUiStatus('Waiting for agent summary...')
+    setUiStatus(payload.requestType === 'local'
+      ? 'Waiting for progress summary...'
+      : 'Waiting for agent summary...')
     return
   }
 
@@ -970,6 +1067,7 @@ function handleReceiverMessage(raw: string) {
     )
   ) {
     stopSpeechProcessingIndicator()
+    if (payload.requestType === 'local') pendingPeekAgent = ''
     setUiStatus('Listening for speech...')
     return
   }
@@ -977,6 +1075,13 @@ function handleReceiverMessage(raw: string) {
   if (payload.type === 'agent_error') {
     clearSpeechProcessingState()
     const error = typeof payload.error === 'string' ? payload.error : 'Workbench error'
+    if (
+      payload.requestType === 'local' &&
+      typeof payload.agent === 'string' &&
+      sameAgentLabel(payload.agent, pendingPeekAgent)
+    ) {
+      pendingPeekAgent = ''
+    }
     appendTranscript(error, 'Error')
     setUiStatus('Workbench error')
     return
@@ -1018,9 +1123,15 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'receiver_status') {
+    updateWorkbenchProgressAgents(payload)
     setUiStatus(payload.status === 'auth_required'
       ? 'Authenticating receiver...'
       : 'Receiver connected')
+    return
+  }
+
+  if (payload.type === 'workbench_status') {
+    updateWorkbenchProgressAgents(payload)
     return
   }
 
@@ -1235,7 +1346,7 @@ async function startAudioStream() {
 }
 
 async function renderGlassesStatus() {
-  if (glassesMode !== 'live') return
+  if (historyTransitioning || glassesMode !== 'live') return
 
   await upgradeStatusContainer(currentLiveGlassesContent())
 }

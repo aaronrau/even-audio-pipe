@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHmac } from 'node:crypto'
+import { createServer } from 'node:http'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -22,6 +23,44 @@ async function freePort() {
       server.close(() => resolve(address.port))
     })
   })
+}
+
+async function startFakeWorkbench(responseForRequest = null) {
+  const requests = []
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const text = Buffer.concat(chunks).toString('utf8')
+    requests.push({
+      method: req.method,
+      path: req.url,
+      body: text ? JSON.parse(text) : {},
+    })
+    const latest = requests.at(-1)
+    const body = responseForRequest
+      ? responseForRequest(latest)
+      : {
+        ok: true,
+        agent: latest?.body?.agent || '',
+        message: latest?.body?.message || '',
+      }
+    const response = JSON.stringify(body)
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(response),
+    })
+    res.end(response)
+  })
+  const port = await freePort()
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, '127.0.0.1', resolve)
+  })
+  return {
+    requests,
+    url: `http://127.0.0.1:${port}`,
+    close: () => new Promise(resolve => server.close(resolve)),
+  }
 }
 
 async function waitForHealth(port, child) {
@@ -214,6 +253,220 @@ test('receiver sends onboarding prompt after app start and logs audio stream', a
 
     ws.send(Buffer.alloc(320))
     await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver forwards peek progress as a local workbench message', async () => {
+  const workbench = await startFakeWorkbench()
+  const { child, dir, port } = await startReceiver({
+    SPEECH_WORKBENCH_ENABLED: '1',
+    SPEECH_WORKBENCH_URL: workbench.url,
+    SPEECH_WORKBENCH_AGENTS: 'Flux,Pike',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'mock-user' },
+    }))
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+
+    const sent = waitForJson(ws, message => (
+      message.type === 'agent_status' &&
+      message.status === 'sent' &&
+      message.requestType === 'local'
+    ))
+    ws.send(JSON.stringify({
+      type: 'peek_progress',
+      agent: 'Flux',
+    }))
+
+    const message = await sent
+    assert.equal(message.agent, 'Flux')
+    assert.equal(workbench.requests.length, 1)
+    assert.equal(workbench.requests[0].method, 'POST')
+    assert.equal(workbench.requests[0].path, '/messages')
+    assert.deepEqual(workbench.requests[0].body, {
+      type: 'local',
+      agent: 'Flux',
+      message: 'progress_summary',
+    })
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    await workbench.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver sends local progress summary response back to glasses', async () => {
+  const workbench = await startFakeWorkbench(request => ({
+    ok: true,
+    type: 'local',
+    sent: false,
+    agent: request.body.agent,
+    message: request.body.message,
+    summary: 'Pike updated the paused voice session tips layout.',
+    detail: 'removed Sim show logo\nmoved tips to bottom\nremoved Session in progress',
+    detail_lines: [
+      'removed Sim show logo',
+      'moved tips to bottom',
+      'removed Session in progress',
+    ],
+    phase: 'in_progress',
+  }))
+  const { child, dir, port } = await startReceiver({
+    SPEECH_WORKBENCH_ENABLED: '1',
+    SPEECH_WORKBENCH_URL: workbench.url,
+    SPEECH_WORKBENCH_AGENTS: 'Flux,Pike',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'mock-user' },
+    }))
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+
+    const summary = waitForJson(ws, message => (
+      message.type === 'agent_summary' &&
+      message.agent === 'Pike'
+    ))
+    ws.send(JSON.stringify({
+      type: 'peek_progress',
+      agent: 'Pike',
+    }))
+
+    const message = await summary
+    assert.equal(message.summary, 'Pike updated the paused voice session tips layout.')
+    assert.equal(
+      message.detail,
+      'removed Sim show logo\nmoved tips to bottom\nremoved Session in progress',
+    )
+    assert.equal(message.phase, 'in_progress')
+    assert.equal(message.is_final, false)
+
+    const duplicateMessages = collectJson(ws, 150)
+    const duplicateWebhook = await fetch(`http://127.0.0.1:${port}/workbench/summary`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'Pike',
+        summary: 'Pike updated the paused voice session tips layout.',
+        detail: 'removed Sim show logo\nmoved tips to bottom\nremoved Session in progress',
+        phase: 'in_progress',
+      }),
+    })
+    assert.equal(duplicateWebhook.ok, true)
+    assert.equal(
+      (await duplicateMessages).filter(item => item.type === 'agent_summary' && item.agent === 'Pike').length,
+      0,
+    )
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    await workbench.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver reports only in-progress workbench agents as active', async () => {
+  const { child, dir, port } = await startReceiver({
+    SPEECH_WORKBENCH_ENABLED: '1',
+    SPEECH_WORKBENCH_AGENTS: 'Flux,Pike',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    const status = await waitForJson(ws, message => message.type === 'receiver_status')
+    assert.deepEqual(status.workbench.activeAgents, [])
+
+    const active = waitForJson(ws, message => (
+      message.type === 'workbench_status' &&
+      message.workbench?.activeAgents?.includes('Flux')
+    ))
+    const inProgress = await fetch(`http://127.0.0.1:${port}/workbench/summary`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'Flux',
+        summary: 'Flux is running tests.',
+        phase: 'in_progress',
+      }),
+    })
+    assert.equal(inProgress.ok, true)
+    assert.deepEqual((await active).workbench.activeAgents, ['Flux'])
+
+    const inactive = waitForJson(ws, message => (
+      message.type === 'workbench_status' &&
+      Array.isArray(message.workbench?.activeAgents) &&
+      message.workbench.activeAgents.length === 0
+    ))
+    const final = await fetch(`http://127.0.0.1:${port}/workbench/summary`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'Flux',
+        summary: 'Flux finished the tests.',
+        phase: 'final',
+        is_final: true,
+      }),
+    })
+    assert.equal(final.ok, true)
+    assert.deepEqual((await inactive).workbench.activeAgents, [])
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver clears stale in-progress workbench agents with no new content', async () => {
+  const { child, dir, port } = await startReceiver({
+    SPEECH_WORKBENCH_ENABLED: '1',
+    SPEECH_WORKBENCH_AGENTS: 'Flux,Pike',
+    SPEECH_WORKBENCH_PROGRESS_STALE_MS: '80',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    const active = waitForJson(ws, message => (
+      message.type === 'workbench_status' &&
+      message.workbench?.activeAgents?.includes('Flux')
+    ))
+    const inProgress = await fetch(`http://127.0.0.1:${port}/workbench/summary`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'Flux',
+        summary: 'Flux is running tests.',
+        detail: 'npm test\n72 passed',
+        phase: 'in_progress',
+      }),
+    })
+    assert.equal(inProgress.ok, true)
+    assert.deepEqual((await active).workbench.activeAgents, ['Flux'])
+
+    const inactive = await waitForJson(ws, message => (
+      message.type === 'workbench_status' &&
+      Array.isArray(message.workbench?.activeAgents) &&
+      message.workbench.activeAgents.length === 0
+    ))
+    assert.deepEqual(inactive.workbench.activeAgents, [])
     ws.close()
   } finally {
     await stopReceiver(child)
