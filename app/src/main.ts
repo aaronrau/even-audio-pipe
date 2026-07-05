@@ -72,6 +72,7 @@ let historyUpdateInFlight = false
 let historyUpdatePending = false
 let lastHistoryRequestedContent = ''
 let lastHistoryRenderedContent = ''
+let lastStatusContainerUpgradeAt = 0
 let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
@@ -104,6 +105,7 @@ const BLANK_LIVE_CONTENT = ' '
 const SPINNER_INTERVAL_MS = 650
 const HISTORY_TOGGLE_DEBOUNCE_MS = 700
 const HISTORY_SCROLL_DEBOUNCE_MS = 350
+const SYNTHETIC_TEXT_EVENT_GUARD_MS = 1500
 const STATUS_CONTAINER_ID = 1
 const STATUS_CONTAINER_NAME = 'audio_status'
 const EVENT_CAPTURE_CONTAINER_ID = 2
@@ -699,6 +701,7 @@ function upgradeStatusContainer(content: string) {
     .catch(() => false)
     .then(async () => {
       if (revision !== statusRenderRevision) return true
+      lastStatusContainerUpgradeAt = Date.now()
       return bridge.textContainerUpgrade(
         new TextContainerUpgrade({
           containerID: STATUS_CONTAINER_ID,
@@ -1254,10 +1257,27 @@ function isHistoryToggleInput(event: EvenHubEvent) {
   return source === null && ALLOW_UNSOURCED_HISTORY_TOGGLE
 }
 
+function isSourceLessTextToggle(event: EvenHubEvent) {
+  return !!event.textEvent && getEventSource(event) === null
+}
+
 function shouldHandleHistoryToggle(event: EvenHubEvent) {
   if (!isHistoryToggleInput(event)) return false
 
   const now = Date.now()
+  if (
+    glassesMode === 'history_detail' &&
+    isSourceLessTextToggle(event) &&
+    now - lastStatusContainerUpgradeAt < SYNTHETIC_TEXT_EVENT_GUARD_MS
+  ) {
+    sendControlDebug({
+      type: 'history_debug',
+      action: 'ignored_synthetic_detail_toggle',
+      mode: glassesMode,
+    })
+    return false
+  }
+
   const sinceLastToggle = now - lastHistoryToggleInputAt
   if (sinceLastToggle < HISTORY_TOGGLE_DEBOUNCE_MS) {
     sendControlDebug({

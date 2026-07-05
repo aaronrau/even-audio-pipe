@@ -265,7 +265,7 @@ test('receiver forwards peek progress as a local workbench message', async () =>
   const { child, dir, port } = await startReceiver({
     SPEECH_WORKBENCH_ENABLED: '1',
     SPEECH_WORKBENCH_URL: workbench.url,
-    SPEECH_WORKBENCH_AGENTS: 'Flux,Pike',
+    SPEECH_WORKBENCH_AGENTS: 'flux,pike',
   })
 
   try {
@@ -287,7 +287,7 @@ test('receiver forwards peek progress as a local workbench message', async () =>
     ))
     ws.send(JSON.stringify({
       type: 'peek_progress',
-      agent: 'Flux',
+      agent: 'flux',
     }))
 
     const message = await sent
@@ -313,7 +313,7 @@ test('receiver sends local progress summary response back to glasses', async () 
     ok: true,
     type: 'local',
     sent: false,
-    agent: request.body.agent,
+    agent: request.body.agent.toLowerCase(),
     message: request.body.message,
     summary: 'Pike updated the paused voice session tips layout.',
     detail: 'removed Sim show logo\nmoved tips to bottom\nremoved Session in progress',
@@ -327,7 +327,7 @@ test('receiver sends local progress summary response back to glasses', async () 
   const { child, dir, port } = await startReceiver({
     SPEECH_WORKBENCH_ENABLED: '1',
     SPEECH_WORKBENCH_URL: workbench.url,
-    SPEECH_WORKBENCH_AGENTS: 'Flux,Pike',
+    SPEECH_WORKBENCH_AGENTS: 'flux,pike',
   })
 
   try {
@@ -348,10 +348,12 @@ test('receiver sends local progress summary response back to glasses', async () 
     ))
     ws.send(JSON.stringify({
       type: 'peek_progress',
-      agent: 'Pike',
+      agent: 'pike',
     }))
 
     const message = await summary
+    assert.equal(message.agent, 'Pike')
+    assert.equal(workbench.requests[0].body.agent, 'Pike')
     assert.equal(message.summary, 'Pike updated the paused voice session tips layout.')
     assert.equal(
       message.detail,
@@ -387,7 +389,7 @@ test('receiver sends local progress summary response back to glasses', async () 
 test('receiver reports only in-progress workbench agents as active', async () => {
   const { child, dir, port } = await startReceiver({
     SPEECH_WORKBENCH_ENABLED: '1',
-    SPEECH_WORKBENCH_AGENTS: 'Flux,Pike',
+    SPEECH_WORKBENCH_AGENTS: 'flux,pike',
   })
 
   try {
@@ -403,7 +405,7 @@ test('receiver reports only in-progress workbench agents as active', async () =>
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        agent: 'Flux',
+        agent: 'flux',
         summary: 'Flux is running tests.',
         phase: 'in_progress',
       }),
@@ -420,7 +422,7 @@ test('receiver reports only in-progress workbench agents as active', async () =>
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        agent: 'Flux',
+        agent: 'FLUX',
         summary: 'Flux finished the tests.',
         phase: 'final',
         is_final: true,

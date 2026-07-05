@@ -24,12 +24,13 @@ const terminalUrl = process.env.EVEN_TERMINAL_URL || ''
 const terminalToken = process.env.EVEN_TERMINAL_TOKEN || ''
 const terminalProvider = process.env.EVEN_TERMINAL_PROVIDER || 'codex'
 const terminalSessionId = process.env.EVEN_TERMINAL_SESSION_ID || ''
+const defaultWorkbenchAgents = ['Flux', 'Brock', 'Pike', 'Wolf']
 const workbenchConfig = {
   enabled: !isDisabled(process.env.SPEECH_WORKBENCH_ENABLED || '0'),
   url: process.env.SPEECH_WORKBENCH_URL || 'http://127.0.0.1:8787',
   token: process.env.SPEECH_WORKBENCH_TOKEN || '',
-  agent: process.env.SPEECH_WORKBENCH_AGENT || '',
-  agents: stringList(process.env.SPEECH_WORKBENCH_AGENTS || ''),
+  agent: displayWorkbenchAgentName(process.env.SPEECH_WORKBENCH_AGENT || ''),
+  agents: uniqueAgentNames(stringList(process.env.SPEECH_WORKBENCH_AGENTS || '')),
   requireAgentPrefix: !isDisabled(process.env.SPEECH_WORKBENCH_REQUIRE_AGENT_PREFIX || '1'),
   agentPrefixWordLimit: Number(process.env.SPEECH_WORKBENCH_AGENT_PREFIX_WORD_LIMIT || 3),
   agentArmTimeoutMs: Number(process.env.SPEECH_WORKBENCH_AGENT_ARM_TIMEOUT_MS || 30_000),
@@ -444,10 +445,36 @@ function normalizeAgentName(value) {
     .trim()
 }
 
+function displayWorkbenchAgentName(value) {
+  const normalized = normalizeAgentName(value)
+  if (!normalized) return ''
+
+  const known = defaultWorkbenchAgents.find(agent => normalizeAgentName(agent) === normalized)
+  if (known) return known
+
+  return normalized
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+}
+
+function uniqueAgentNames(values) {
+  const names = []
+  const seen = new Set()
+  for (const value of values) {
+    const label = displayWorkbenchAgentName(value)
+    const key = normalizeAgentName(label)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    names.push(label)
+  }
+  return names
+}
+
 function workbenchAgentNames() {
   return workbenchConfig.agents.length
     ? workbenchConfig.agents
-    : ['Flux', 'Brock', 'Pike', 'Wolf']
+    : defaultWorkbenchAgents
 }
 
 function canonicalWorkbenchAgent(agent) {
@@ -519,7 +546,7 @@ function scheduleWorkbenchProgressExpiry(key) {
 }
 
 function setWorkbenchAgentInProgress(agent, inProgress, options = {}) {
-  const label = canonicalWorkbenchAgent(agent) || stringValue(agent)
+  const label = canonicalWorkbenchAgent(agent) || displayWorkbenchAgentName(agent)
   const key = normalizeAgentName(label)
   if (!key) return false
 
@@ -683,7 +710,8 @@ function publishWorkbenchSummary(payload, options = {}) {
   const summary = normalizeTranscript(textFromFields(payload, summaryTextFields) || detail)
   if (!summary) return null
 
-  const agent = stringValue(payload.agent)
+  const rawAgent = stringValue(payload.agent)
+  const agent = canonicalWorkbenchAgent(rawAgent) || displayWorkbenchAgentName(rawAgent)
   const command = stringValue(payload.command)
   const phase = stringValue(payload.phase || (payload.is_final ? 'final' : 'in_progress'))
   const isFinal = payload.is_final === true || phase === 'final'
@@ -865,7 +893,8 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
 
     console.log(`[workbench] posted transcript to ${baseUrl}/messages`)
     if (route.clearPendingAgentOnSent) workbenchRouter.clearPendingAgent(targetSocket, route.agent)
-    const sentAgent = responseBody.agent || route.agent || workbenchConfig.agent || ''
+    const rawSentAgent = responseBody.agent || route.agent || workbenchConfig.agent || ''
+    const sentAgent = canonicalWorkbenchAgent(rawSentAgent) || displayWorkbenchAgentName(rawSentAgent)
     setWorkbenchAgentInProgress(sentAgent, true, {
       signature: route.message,
       forceActivity: true,
@@ -890,7 +919,8 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     sendSocketJson(targetSocket, {
       type: 'agent_error',
       error,
-      agent: route.agent || workbenchConfig.agent,
+      agent: canonicalWorkbenchAgent(route.agent || workbenchConfig.agent) ||
+        displayWorkbenchAgentName(route.agent || workbenchConfig.agent),
       jobId: context.jobId,
     })
   } finally {
@@ -979,10 +1009,12 @@ async function postWorkbenchLocalSummary(agent, targetSocket, context = {}) {
       throw new Error(`workbench local summary failed: ${detail}`)
     }
 
+    const rawResponseAgent = responseBody.agent || requestedAgent
+    const responseAgent = canonicalWorkbenchAgent(rawResponseAgent) || requestedAgent
     sendSocketJson(targetSocket, {
       type: 'agent_status',
       status: 'sent',
-      agent: responseBody.agent || requestedAgent,
+      agent: responseAgent,
       message: responseBody.message || 'progress_summary',
       jobId: context.jobId,
       requestType: 'local',
@@ -997,7 +1029,7 @@ async function postWorkbenchLocalSummary(agent, targetSocket, context = {}) {
     )
     if (responseSummary) {
       publishWorkbenchSummary({
-        agent: responseBody.agent || requestedAgent,
+        agent: responseAgent,
         command: responseBody.command,
         detail: responseDetail,
         is_final: responseBody.is_final === true,
