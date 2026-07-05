@@ -114,6 +114,24 @@ assert.match(reopened.content.split('\n')[0], /^< Back$/)
 const closedBack = navigator.tap()
 assert.equal(closedBack.mode, 'closed')
 
+const duplicateNameNavigator = new HistoryNavigator({
+  width: CANVAS_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  scrollOverlapLines: 1,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+duplicateNameNavigator.replaceEntries([
+  entry(3, 'Pike', 'Pike has updated the paused voice session tips layout.'),
+])
+duplicateNameNavigator.open()
+duplicateNameNavigator.scroll(1)
+const duplicateNameDetail = duplicateNameNavigator.tap()
+assert.equal(duplicateNameDetail.mode, 'detail')
+assert.match(duplicateNameDetail.content, /^12:03 Pike has updated the paused voice session tips layout\.$/m)
+assert.doesNotMatch(duplicateNameDetail.content, /Pike Pike/i)
+assertViewportSafe(duplicateNameDetail.content)
+
 const selectedFromBackWithOlderGesture = navigator.open()
 assert.match(selectedFromBackWithOlderGesture.content.split('\n')[0], /^< Back$/)
 const olderGestureSelection = navigator.scroll(-1)

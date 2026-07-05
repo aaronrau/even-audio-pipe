@@ -131,7 +131,7 @@ function stripLeadingLabel(text: string, label: string) {
   if (!normalizedLabel) return text
 
   return text
-    .replace(new RegExp(`^(?:hey|hi|ok|okay)?\\s*${escapedRegExp(normalizedLabel)}\\s*[:,.\\-]?\\s+`, 'i'), '')
+    .replace(new RegExp(`^(?:hey|hi|ok|okay)?\\s*${escapedRegExp(normalizedLabel)}\\s*[:,.\\-]?(?:\\s+|$)`, 'i'), '')
     .trim()
 }
 
@@ -180,6 +180,18 @@ function stripLeadingAgentIntro(text: string, label: string) {
     .replace(/^agent\s+(?:is|has|will|can|was|were|did|does|pulled|updated|created|completed|finished|started)\s+/i, '')
     .replace(/^the\s+agent\s+/i, '')
     .replace(/^agent\s+/i, '')
+    .trim()
+}
+
+function stripLeadingAgentDetailLabel(text: string, label: string) {
+  const [firstLine = '', ...remainingLines] = normalizeHistoryBlock(text).split('\n')
+  const cleanedFirstLine = stripLeadingAgentIntro(stripLeadingLabel(firstLine, label), label)
+  return [
+    cleanedFirstLine,
+    ...remainingLines,
+  ]
+    .filter((line, index) => index > 0 || line.trim())
+    .join('\n')
     .trim()
 }
 
@@ -435,7 +447,11 @@ export class HistoryNavigator {
   }
 
   private entryItem(entry: HistoryEntry, index: number): HistoryItem {
-    const detailText = normalizeHistoryBlock(entry.detail || entry.text)
+    const kind = entryKind(entry)
+    const rawDetailText = normalizeHistoryBlock(entry.detail || entry.text)
+    const detailText = kind === 'agent'
+      ? stripLeadingAgentDetailLabel(rawDetailText, entry.label) || rawDetailText
+      : rawDetailText
     const listText = normalizeInlineText(entry.text || detailText)
     const id = entryBaseId(entry, index)
     const detailEntry: HistoryEntry = {
@@ -448,7 +464,7 @@ export class HistoryNavigator {
 
     return {
       id,
-      kind: entryKind(entry),
+      kind,
       label: entry.label,
       listText,
       detailText: detailText || listText,
