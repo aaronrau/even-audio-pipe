@@ -23,8 +23,9 @@ The ladder is not code golf. It runs after understanding the touched flow.
 - Keep the thin client thin. ASR, cleanup, persistence, and workbench secrets
   stay server-side.
 - Prefer deleting redundant state over adding coordination logic.
-- Do not display queued ASR text; only final transcript events should render as
-  transcript history/live text.
+- Do not display unstable partial ASR text. Server-confirmed queued transcript
+  batches may render as transient `Queued:` live/history pending state. Durable
+  history still comes from final transcript and agent summary events.
 - Preserve safety: auth checks, transcript persistence, reconnect behavior,
   history paging limits, and Even text-container limits are not simplification
   targets.
@@ -33,4 +34,3 @@ The ladder is not code golf. It runs after understanding the touched flow.
   new flags.
 - For app changes, run at least `npm --prefix app run build`. For history or
   glasses navigation changes, also run `npm --prefix app run test:history`.
-

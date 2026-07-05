@@ -138,9 +138,10 @@ receiver URL and stream counters.
 
 **3. Speak**
 
-When speech is detected, the glasses show a compact waveform. Queued raw ASR
-text is not displayed. Only final transcript text is shown briefly, then the
-live view clears.
+When speech is detected, the glasses show a compact waveform. Once ASR returns
+server-confirmed queued text, the glasses show `Queued: ...`. If the transcript
+is sent to Workbench, that changes to `Sent: Agent, ...` for two seconds. If it
+is saved without agent routing, it changes to `Saved: ...` for two seconds.
 
 **4. Open history**
 
@@ -183,11 +184,13 @@ workbench.
 - Uses VAD to avoid fixed-length clipping.
 - Displays a waveform only while speech is active.
 
-**Final Transcript Display**
+**Speech Status Display**
 
-- Final cleaned transcripts are displayed briefly on glasses.
-- Live text clears automatically after the hold period.
-- Queued ASR text is kept out of the live/history UI to avoid duplicate display.
+- Server-confirmed queued transcript batches are displayed as `Queued: ...`.
+- Final transcript events append history but do not clear queued live text.
+- Workbench sends display as `Sent: Agent, ...` for two seconds.
+- Ambient saved-only speech displays as `Saved: ...` for two seconds.
+- Unstable partial ASR text is not displayed.
 
 **History And Details**
 
@@ -269,8 +272,10 @@ sequenceDiagram
   R->>R: queue raw transcript until idle
   R->>R: optional cleanup
   R->>S: write audio, transcript, metadata
+  R-->>C: asr_status queued + queuedText
+  C-->>G: display Queued: queuedText
   R-->>C: final transcript event
-  C-->>G: display final text briefly
+  C-->>G: keep queued text until route status
 ```
 
 ## Sequence: Workbench Command
@@ -287,10 +292,17 @@ sequenceDiagram
   R->>R: parse agent prefix
   R->>W: POST /messages {agent, message}
   W-->>R: accepts command
+  R-->>C: agent_status sent
+  C-->>G: display Sent: Wolf, terminate session for 2s
   W-->>R: POST /workbench/summary
   R-->>C: agent_summary event
   C-->>G: display summary
 ```
+
+## Interaction Flow
+
+The detailed event map and status-display contract are in
+[`INTERACTION_FLOW_AND_STATUS.md`](INTERACTION_FLOW_AND_STATUS.md).
 
 ## Sequence: Reconnect
 
@@ -317,8 +329,10 @@ sequenceDiagram
   receives JSON control/results over the same WebSocket.
 - **Thin client stays thin:** ASR, cleanup, workbench tokens, and file writes are
   server-side.
-- **Final text only:** The client does not display queued ASR text because it can
-  duplicate the final transcript.
+- **Server-confirmed text only:** The client does not display unstable partial
+  ASR text. It can display receiver-confirmed queued batches and terminal
+  sent/saved status without moving ASR, cleanup, routing, or persistence into
+  the client.
 - **Private-first failover:** `ws://` is preferred for private LAN use. `wss://`
   is the fallback for public WAN or tunnel access.
 - **History is pullable:** The client can request message history after

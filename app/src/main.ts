@@ -23,6 +23,11 @@ import {
 import { historyScrollDirectionFromEventType } from './historyInput'
 import { HistoryNavigator } from './historyNavigator'
 import { backendStartupPromptContent, nextStartupPromptVisible, startupLiveContent } from './startupPrompt'
+import {
+  formatSpeechDispatchDisplay,
+  normalizeSpeechDispatchText,
+  type SpeechDispatchDisplay,
+} from './speechDispatchDisplay'
 
 const RECEIVER_ADDRESS_STORAGE_KEY = 'evenAudioPipe.receiverAddress'
 const PRIVATE_ADDRESS_STORAGE_KEY = 'evenAudioPipe.privateAddress'
@@ -64,6 +69,7 @@ let sentChunks = 0
 let sentBytes = 0
 let droppedChunks = 0
 let transcriptText = ''
+let lastTranscriptEventText = ''
 let speechDetected = false
 let backendIdleFrame = ''
 let glassesMode: GlassesMode = 'live'
@@ -84,17 +90,21 @@ let audioEndpointSettings = blankAudioEndpointSettings()
 let audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
 let audioEndpointIndex = 0
 let clearTranscriptTimer: number | null = null
+let clearSpeechDispatchTimer: number | null = null
 let spinnerTimer: number | null = null
 let waveformFrameIndex = 0
 let unsubscribe: (() => void) | null = null
 let evenUserInfo: UserPayload | null = null
 let startupPromptVisible = true
 let backendStartupPrompt = ''
+let speechDispatchDisplay: SpeechDispatchDisplay | null = null
+let deferredLiveTranscript: { text: string; label: string; detail: string } | null = null
 
 const GLASSES_LINE_WIDTH = 52
 const GLASSES_MAX_LINES = 7
 const GLASSES_TEXT_LIMIT = GLASSES_LINE_WIDTH * GLASSES_MAX_LINES
 const TRANSCRIPT_CLEAR_MS = 12_000
+const SPEECH_DISPATCH_CLEAR_MS = 2_000
 const SPEECH_WAVEFORM_FRAMES = [
   '  |  ',
   ' ||| ',
@@ -547,6 +557,9 @@ function currentLiveGlassesContent() {
     return backendStartupPromptContent(backendStartupPrompt)
   }
   if (startupPromptVisible) return startupLiveContent(audioEndpointSettings)
+  if (speechDispatchDisplay) {
+    return formatGlassesTranscript(formatSpeechDispatchDisplay(speechDispatchDisplay))
+  }
   if (speechDetected) return currentSpeechWaveformFrame()
   if (transcriptText) return formatGlassesTranscript(transcriptText)
   if (backendIdleFrame) return backendIdleFrame
@@ -855,6 +868,7 @@ async function handleHistoryTap() {
 function clearSpeechProcessingState() {
   speechDetected = false
   waveformFrameIndex = 0
+  clearSpeechDispatchDisplay()
   clearLiveTranscriptDisplay()
   historyNavigator.clearPendingTranscript()
   requestHistoryWindowUpdate()
@@ -869,10 +883,21 @@ function clearLiveTranscriptDisplay() {
   }
 }
 
-function stopSpeechProcessingIndicator() {
+function clearSpeechDispatchDisplay() {
+  speechDispatchDisplay = null
+  deferredLiveTranscript = null
+  if (clearSpeechDispatchTimer !== null) {
+    window.clearTimeout(clearSpeechDispatchTimer)
+    clearSpeechDispatchTimer = null
+  }
+}
+
+function stopSpeechProcessingIndicator(options: { clearPending?: boolean } = {}) {
   speechDetected = false
   waveformFrameIndex = 0
-  historyNavigator.clearPendingTranscript()
+  if (options.clearPending !== false) {
+    historyNavigator.clearPendingTranscript()
+  }
   requestHistoryWindowUpdate()
 }
 
@@ -901,6 +926,13 @@ function appendTranscript(
     clearSpeechProcessingState()
   }
   pushHistory(label, normalized, detail)
+  showLiveTranscript(normalized)
+}
+
+function showLiveTranscript(text: string) {
+  const normalized = normalizeInlineText(text)
+  if (!normalized) return
+
   transcriptText = takeTail(normalized, GLASSES_TEXT_LIMIT)
   transcriptEl.textContent = transcriptText
   scheduleTranscriptClear()
@@ -909,6 +941,74 @@ function appendTranscript(
   } else {
     void renderGlassesStatus()
   }
+}
+
+function setQueuedSpeechDisplay(text: string) {
+  const queuedText = normalizeSpeechDispatchText(text)
+  if (!queuedText) return
+
+  speechDetected = false
+  waveformFrameIndex = 0
+  deferredLiveTranscript = null
+  clearLiveTranscriptDisplay()
+  if (clearSpeechDispatchTimer !== null) {
+    window.clearTimeout(clearSpeechDispatchTimer)
+    clearSpeechDispatchTimer = null
+  }
+  speechDispatchDisplay = {
+    state: 'queued',
+    text: queuedText,
+  }
+  historyNavigator.setPendingTranscript(queuedText)
+  transcriptEl.textContent = formatSpeechDispatchDisplay(speechDispatchDisplay)
+  requestHistoryWindowUpdate()
+  if (!isHistoryMode()) void renderGlassesStatus()
+}
+
+function setTerminalSpeechDisplay(display: SpeechDispatchDisplay) {
+  const normalizedText = normalizeSpeechDispatchText(display.text)
+  const normalizedMessage = normalizeSpeechDispatchText(display.message || '')
+  const normalizedAgent = normalizeSpeechDispatchText(display.agent || '')
+  speechDetected = false
+  waveformFrameIndex = 0
+  speechDispatchDisplay = {
+    ...display,
+    text: normalizedText,
+    message: normalizedMessage,
+    agent: normalizedAgent,
+  }
+  clearLiveTranscriptDisplay()
+  historyNavigator.clearPendingTranscript()
+  transcriptEl.textContent = formatSpeechDispatchDisplay(speechDispatchDisplay)
+  requestHistoryWindowUpdate()
+  if (!isHistoryMode()) void renderGlassesStatus()
+
+  if (clearSpeechDispatchTimer !== null) {
+    window.clearTimeout(clearSpeechDispatchTimer)
+  }
+
+  clearSpeechDispatchTimer = window.setTimeout(() => {
+    clearSpeechDispatchTimer = null
+    speechDispatchDisplay = null
+    transcriptEl.textContent = 'Listening...'
+    const deferred = deferredLiveTranscript
+    deferredLiveTranscript = null
+
+    if (deferred) {
+      showLiveTranscript(deferred.text)
+      return
+    }
+
+    void renderGlassesStatus()
+  }, SPEECH_DISPATCH_CLEAR_MS)
+}
+
+function isTerminalSpeechDisplayActive() {
+  return clearSpeechDispatchTimer !== null && speechDispatchDisplay !== null
+}
+
+function currentSpeechDispatchText() {
+  return speechDispatchDisplay?.text || lastTranscriptEventText || transcriptText
 }
 
 function formatGlassesTranscript(text: string) {
@@ -996,9 +1096,18 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'transcript' && typeof payload.text === 'string') {
-    stopSpeechProcessingIndicator()
-    appendTranscript(payload.text, 'You', '', { clearProcessing: false })
-    setUiStatus('Streaming G2 mic audio')
+    stopSpeechProcessingIndicator({ clearPending: false })
+    const normalized = normalizeInlineText(payload.text)
+    if (normalized) {
+      lastTranscriptEventText = normalized
+      pushHistory('You', normalized)
+      transcriptEl.textContent = speechDispatchDisplay
+        ? formatSpeechDispatchDisplay(speechDispatchDisplay)
+        : normalized
+      if (!speechDispatchDisplay) showLiveTranscript(normalized)
+    }
+    requestHistoryWindowUpdate()
+    setUiStatus('Transcript saved')
     return
   }
 
@@ -1019,11 +1128,19 @@ function handleReceiverMessage(raw: string) {
     if (shouldOpenPeekDetail) {
       speechDetected = false
       waveformFrameIndex = 0
+      clearSpeechDispatchDisplay()
       clearLiveTranscriptDisplay()
       historyNavigator.clearPendingTranscript()
       pushHistory(agent, summary, detail)
       renderPeekProgressDetail(agent)
       statusEl.textContent = 'Agent summary received'
+      return
+    }
+    if (isTerminalSpeechDisplayActive()) {
+      pushHistory(agent, summary, detail)
+      deferredLiveTranscript = { text: summary, label: agent, detail }
+      requestHistoryWindowUpdate()
+      setUiStatus('Agent summary received')
       return
     }
     appendTranscript(summary, agent, detail)
@@ -1037,7 +1154,7 @@ function handleReceiverMessage(raw: string) {
       requestHistoryWindowUpdate()
       return
     }
-    if (!historyTransitioning && !isHistoryMode() && !startupPromptVisible && !speechDetected && !transcriptText) {
+    if (!historyTransitioning && !isHistoryMode() && !startupPromptVisible && !speechDetected && !speechDispatchDisplay && !transcriptText) {
       void renderGlassesStatus()
     }
     return
@@ -1051,7 +1168,15 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'agent_status' && payload.status === 'sent') {
-    stopSpeechProcessingIndicator()
+    if (payload.requestType !== 'local') {
+      const message = stringValue(payload.message) || currentSpeechDispatchText()
+      setTerminalSpeechDisplay({
+        state: 'sent',
+        text: message,
+        message,
+        agent: stringValue(payload.agent),
+      })
+    }
     setUiStatus(payload.requestType === 'local'
       ? 'Waiting for progress summary...'
       : 'Waiting for agent summary...')
@@ -1059,10 +1184,13 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'agent_status' && payload.status === 'agent_armed') {
-    stopSpeechProcessingIndicator()
     const agent = typeof payload.agent === 'string' && payload.agent
       ? payload.agent
       : 'agent'
+    setTerminalSpeechDisplay({
+      state: 'saved',
+      text: currentSpeechDispatchText() || `${agent} selected`,
+    })
     setUiStatus(`${agent} selected`)
     return
   }
@@ -1076,14 +1204,23 @@ function handleReceiverMessage(raw: string) {
       payload.status === 'workbench_unconfigured'
     )
   ) {
-    stopSpeechProcessingIndicator()
-    if (payload.requestType === 'local') pendingPeekAgent = ''
-    setUiStatus('Listening for speech...')
+    if (payload.requestType === 'local') {
+      pendingPeekAgent = ''
+      setUiStatus('Listening for speech...')
+    } else if (payload.status !== 'empty_transcript') {
+      setTerminalSpeechDisplay({
+        state: 'saved',
+        text: currentSpeechDispatchText(),
+      })
+      setUiStatus('Transcript saved')
+    } else {
+      stopSpeechProcessingIndicator()
+      setUiStatus('Listening for speech...')
+    }
     return
   }
 
   if (payload.type === 'agent_error') {
-    clearSpeechProcessingState()
     const error = typeof payload.error === 'string' ? payload.error : 'Workbench error'
     if (
       payload.requestType === 'local' &&
@@ -1091,7 +1228,12 @@ function handleReceiverMessage(raw: string) {
       sameAgentLabel(payload.agent, pendingPeekAgent)
     ) {
       pendingPeekAgent = ''
+      pushHistory('Error', error)
+      requestHistoryWindowUpdate()
+      setUiStatus('Workbench error')
+      return
     }
+    clearSpeechProcessingState()
     appendTranscript(error, 'Error')
     setUiStatus('Workbench error')
     return
@@ -1111,16 +1253,14 @@ function handleReceiverMessage(raw: string) {
   }
 
   if (payload.type === 'asr_status' && payload.status === 'queued') {
-    speechDetected = false
-    historyNavigator.clearPendingTranscript()
-    requestHistoryWindowUpdate()
+    setQueuedSpeechDisplay(stringValue(payload.queuedText || payload.text))
     setUiStatus('Waiting for more speech...')
     return
   }
 
   if (payload.type === 'asr_status' && payload.status === 'cleaning') {
     speechDetected = false
-    historyNavigator.clearPendingTranscript()
+    waveformFrameIndex = 0
     requestHistoryWindowUpdate()
     setUiStatus('Cleaning transcript...')
     return

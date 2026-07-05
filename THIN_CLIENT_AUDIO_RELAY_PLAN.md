@@ -320,6 +320,25 @@ Server to client:
 - `pong`
 - `error`
 
+Current speech status display uses existing events rather than another client
+routing path:
+
+```text
+asr_status: queued
+  -> Queued: combined transcript
+transcript
+  -> durable history append, queued live text remains
+agent_status: sent
+  -> Sent: Agent, message for 2s
+agent_status: missing_agent_prefix/workbench_disabled/workbench_unconfigured
+  -> Saved: transcript for 2s
+agent_summary
+  -> durable response history and live response after any active terminal hold
+```
+
+The full flow is documented in
+[`INTERACTION_FLOW_AND_STATUS.md`](INTERACTION_FLOW_AND_STATUS.md).
+
 ### Start
 
 ```json

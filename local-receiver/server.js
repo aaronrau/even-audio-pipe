@@ -7,6 +7,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { VadEndpoint } from './vad-endpoint.js'
 import { createSileroFrameVad } from './silero-vad.ts'
 import {
+  combineQueuedTranscripts,
   markQueuedTranscriptActivity,
   queuedTranscriptActivityAt,
   transcriptQueueMaxHoldReached as transcriptQueueMaxHoldReachedSinceActivity,
@@ -1598,13 +1599,6 @@ async function flushRawTranscriptBatch(items) {
     rawText: rawTranscript,
   })
   await maybePostToTerminal(cleanedTranscript)
-}
-
-function combineQueuedTranscripts(transcripts) {
-  return normalizeTranscript(transcripts.join('\n'))
-    .replace(/\n+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
 }
 
 function queuedSegmentMetadata(item) {

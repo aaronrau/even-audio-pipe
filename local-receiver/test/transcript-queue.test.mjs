@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  combineQueuedTranscripts,
   markQueuedTranscriptActivity,
   queuedTranscriptActivityAt,
   transcriptQueueMaxHoldReached,
@@ -28,4 +29,30 @@ test('empty queues do not update activity', () => {
 
   assert.equal(markQueuedTranscriptActivity(queue, 3_500), false)
   assert.equal(queuedTranscriptActivityAt(queue), 1_000)
+})
+
+test('queued transcript combine removes repeated ASR overlap', () => {
+  assert.equal(
+    combineQueuedTranscripts([
+      'Pike update the docs',
+      'Pike update the docs',
+    ]),
+    'Pike update the docs',
+  )
+
+  assert.equal(
+    combineQueuedTranscripts([
+      'Pike update the docs',
+      'Pike update the docs and run tests',
+    ]),
+    'Pike update the docs and run tests',
+  )
+
+  assert.equal(
+    combineQueuedTranscripts([
+      'Pike update the docs',
+      'and run tests',
+    ]),
+    'Pike update the docs and run tests',
+  )
 })

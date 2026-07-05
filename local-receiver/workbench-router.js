@@ -14,7 +14,7 @@ export function createWorkbenchRouter(config, options = {}) {
     if (config.requireAgentPrefix) {
       if (parsed?.agent && parsed.message) {
         clearPendingAgent(targetSocket)
-        return parsed
+        return routeMessage(parsed.agent, parsed.message)
       }
 
       if (parsed?.agent && !parsed.message) {
@@ -28,11 +28,10 @@ export function createWorkbenchRouter(config, options = {}) {
 
       const pendingAgent = getPendingAgent(targetSocket)
       if (pendingAgent) {
-        return {
+        return routeMessage(pendingAgent, cleaned, {
           agent: pendingAgent,
-          message: cleaned,
           clearPendingAgentOnSent: true,
-        }
+        })
       }
 
       return {
@@ -42,15 +41,14 @@ export function createWorkbenchRouter(config, options = {}) {
     }
 
     if (config.agent) {
-      return {
+      return routeMessage(config.agent, cleaned, {
         agent: config.agent,
-        message: cleaned,
-      }
+      })
     }
 
     if (parsed?.agent && parsed.message) {
       clearPendingAgent(targetSocket)
-      return parsed
+      return routeMessage(parsed.agent, parsed.message)
     }
 
     if (parsed?.agent && !parsed.message) {
@@ -64,16 +62,32 @@ export function createWorkbenchRouter(config, options = {}) {
 
     const pendingAgent = getPendingAgent(targetSocket)
     if (pendingAgent) {
-      return {
+      return routeMessage(pendingAgent, cleaned, {
         agent: pendingAgent,
-        message: cleaned,
         clearPendingAgentOnSent: true,
-      }
+      })
     }
 
     return {
       skip: true,
       reason: 'missing_agent_prefix',
+    }
+  }
+
+  function routeMessage(agent, message, extras = {}) {
+    const cleanedMessage = stripRepeatedAgentFromMessage(agent, message)
+    if (!cleanedMessage) {
+      return {
+        skip: true,
+        reason: 'agent_armed',
+        agent,
+      }
+    }
+
+    return {
+      ...extras,
+      agent,
+      message: cleanedMessage,
     }
   }
 
@@ -191,11 +205,11 @@ export function createWorkbenchRouter(config, options = {}) {
     }
     if (!best) return null
 
-    const message = originalWords
+    const message = stripRepeatedAgentFromMessage(best.agent, originalWords
       .slice(best.startIndex + best.aliasWordCount)
       .join(' ')
       .replace(/^[\s.,:;+\-]+/, '')
-      .trim()
+      .trim())
 
     return {
       agent: best.agent,
@@ -239,6 +253,40 @@ export function createWorkbenchRouter(config, options = {}) {
     getPendingAgent,
     routeDescription,
   }
+}
+
+function stripRepeatedAgentFromMessage(agent, message) {
+  const normalizedAgent = normalizeCommandText(agent)
+  if (!normalizedAgent) return normalizeTranscript(message).replace(/\s+/g, ' ').trim()
+
+  const aliasWords = normalizedAgent.split(' ').filter(Boolean)
+  const words = String(message || '').trim().split(/\s+/).filter(Boolean)
+  const kept = []
+
+  for (let index = 0; index < words.length;) {
+    const normalizedSlice = words
+      .slice(index, index + aliasWords.length)
+      .map(word => normalizeCommandText(word))
+      .filter(Boolean)
+
+    if (
+      normalizedSlice.length === aliasWords.length &&
+      normalizedSlice.join(' ') === normalizedAgent
+    ) {
+      index += aliasWords.length
+      continue
+    }
+
+    kept.push(words[index])
+    index += 1
+  }
+
+  return kept
+    .join(' ')
+    .replace(/^[\s.,:;+\-]+/, '')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function normalizeTranscript(text) {

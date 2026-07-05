@@ -44,6 +44,9 @@ Even Realities G2 mic
   -> native host writes summary to G2 display over BLE
 ```
 
+The current WebView flow and the queued/sent/saved display contract are mapped
+in [`INTERACTION_FLOW_AND_STATUS.md`](INTERACTION_FLOW_AND_STATUS.md).
+
 For iOS, the host should use both background modes when needed:
 
 ```xml

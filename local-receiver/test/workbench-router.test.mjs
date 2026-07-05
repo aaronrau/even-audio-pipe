@@ -22,6 +22,25 @@ test('routes an explicit agent prefix inside the configured prefix window', () =
   })
 })
 
+test('removes repeated agent names from the routed message content', () => {
+  assert.deepEqual(router().routeTranscript('Pike Pike update docs and Pike run tests', {}), {
+    agent: 'Pike',
+    message: 'update docs and run tests',
+  })
+
+  const target = {}
+  const workbench = router()
+  assert.deepEqual(workbench.routeTranscript('Pike', target), {
+    skip: true,
+    reason: 'agent_armed',
+    agent: 'Pike',
+  })
+  assert.deepEqual(workbench.routeTranscript('Pike update docs', target), {
+    agent: 'Pike',
+    message: 'update docs',
+  })
+})
+
 test('arms an agent-only utterance and routes the next transcript to that agent', () => {
   const target = {}
   const workbench = router()

@@ -11,6 +11,10 @@ The message history view should behave like a manually controlled text canvas:
 - New pending transcripts and received messages repaint the window while it is open.
 - The SDK should not be treated as a native scroll view.
 
+Pending transcript text is populated from server-confirmed `asr_status: queued`
+events. Final `transcript` events append durable history but do not clear the
+pending row; terminal `Sent:` or `Saved:` route status clears it.
+
 ## SDK Constraints
 
 The Even Hub text API gives us a paint target, not a scrollable document model.
@@ -246,6 +250,9 @@ When pending transcript or message history changes:
 3. If the history view is open and `isPinnedToBottom` is true, reset to bottom.
 4. If the history view is open and the user is not pinned to bottom, prefer snapping to bottom for this app's current behavior requirement.
 5. Repaint the visible slice.
+
+The live status contract is mapped in
+[`INTERACTION_FLOW_AND_STATUS.md`](INTERACTION_FLOW_AND_STATUS.md).
 
 ```ts
 function onHistoryDataChanged() {
