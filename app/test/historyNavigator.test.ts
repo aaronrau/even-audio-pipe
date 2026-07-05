@@ -297,17 +297,50 @@ assert.equal(progressTap.mode, 'detail')
 assert.equal(progressTap.agent, 'Flux')
 assert.match(progressTap.content, /Checking\.\.\./)
 assertViewportSafe(progressTap.content)
+progressNavigator.replaceProgressAgents(['Pike'])
+assert.equal(progressNavigator.currentMode(), 'detail')
+assert.match(progressNavigator.content(), /Checking\.\.\./)
 progressNavigator.appendEntry(entry(
   2,
   'Flux',
   'Flux summarized the current progress.',
   'npm test\n72 passed',
 ))
+assert.equal(progressNavigator.currentMode(), 'detail')
+assert.match(progressNavigator.content(), /^12:02 Flux npm test$/m)
+assert.match(progressNavigator.content(), /^72 passed$/m)
+assert.doesNotMatch(progressNavigator.content(), /Checking\.\.\./)
+progressNavigator.replaceEntries([
+  entry(0, 'You', 'older transcript'),
+  entry(1, 'Flux', 'Flux finished a previous task.', 'previous detail'),
+  entry(3, 'Flux', 'Flux summarized the current progress.', 'npm test\n72 passed'),
+])
+assert.equal(progressNavigator.currentMode(), 'detail')
+assert.match(progressNavigator.content(), /^12:03 Flux npm test$/m)
+assert.match(progressNavigator.content(), /^72 passed$/m)
+assert.doesNotMatch(progressNavigator.content(), /previous detail/)
+progressNavigator.replaceEntries([
+  entry(0, 'You', 'older transcript'),
+  entry(1, 'Flux', 'Flux finished a previous task.', 'previous detail'),
+])
+assert.equal(progressNavigator.currentMode(), 'detail')
+assert.match(progressNavigator.content(), /^12:03 Flux npm test$/m)
+assert.match(progressNavigator.content(), /^72 passed$/m)
+progressNavigator.appendEntry(entry(
+  4,
+  'Flux',
+  'Flux found a later update.',
+  'npm test --watch\n73 passed',
+))
+assert.equal(progressNavigator.currentMode(), 'detail')
+assert.match(progressNavigator.content(), /^12:04 Flux npm test --watch$/m)
+assert.match(progressNavigator.content(), /^73 passed$/m)
+assert.doesNotMatch(progressNavigator.content(), /72 passed/)
 const openedProgressDetail = progressNavigator.openLatestDetailForAgent('flux')
 assert.equal(openedProgressDetail.action, 'opened_detail')
 assert.equal(openedProgressDetail.mode, 'detail')
-assert.match(openedProgressDetail.content, /^12:02 Flux npm test$/m)
-assert.match(openedProgressDetail.content, /^72 passed$/m)
+assert.match(openedProgressDetail.content, /^12:04 Flux npm test --watch$/m)
+assert.match(openedProgressDetail.content, /^73 passed$/m)
 assert.doesNotMatch(openedProgressDetail.content, /previous detail/)
 assertViewportSafe(openedProgressDetail.content)
 

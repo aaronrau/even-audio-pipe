@@ -482,7 +482,7 @@ function replaceHistory(entries: HistoryEntry[]) {
 
 function pushHistory(label: string, text: string, detail = '') {
   const normalized = normalizeInlineText(text)
-  if (!normalized) return
+  if (!normalized) return null
   const now = Date.now()
   let duplicate: HistoryEntry | undefined
   for (let index = messageHistory.length - 1; index >= 0; index -= 1) {
@@ -498,7 +498,7 @@ function pushHistory(label: string, text: string, detail = '') {
       const normalizedDetail = normalizeHistoryBlock(detail)
       if (normalizedDetail) duplicate.detail = normalizedDetail
     }
-    return
+    return duplicate
   }
 
   const entry: HistoryEntry = {
@@ -513,6 +513,7 @@ function pushHistory(label: string, text: string, detail = '') {
 
   messageHistory.push(entry)
   historyNavigator.appendEntry(entry)
+  return entry
 }
 
 async function scrollHistoryWindow(direction: HistoryScrollDirection) {
@@ -634,17 +635,16 @@ function updateWorkbenchProgressAgents(payload: Record<string, unknown>) {
   requestHistoryWindowUpdate()
 }
 
-function openPeekProgressDetail(agent: string) {
+function renderPeekProgressDetail(agent: string) {
   if (!isHistoryMode()) return
 
   const result = historyNavigator.openLatestDetailForAgent(agent)
   syncHistoryMode()
-  if (result.action !== 'opened_detail') {
-    requestHistoryWindowUpdate()
-    return
-  }
+  const content = result.action === 'opened_detail'
+    ? result.content
+    : historyNavigator.content()
 
-  void renderHistoryContent(result.content).then(rendered => {
+  void renderHistoryContent(content).then(rendered => {
     if (!rendered) {
       requestHistoryWindowUpdate()
       return
@@ -652,9 +652,9 @@ function openPeekProgressDetail(agent: string) {
 
     sendControlDebug({
       type: 'history_debug',
-      action: result.action,
+      action: result.action === 'opened_detail' ? result.action : 'opened_detail',
       mode: glassesMode,
-      ...navigatorDebugPayload(result.debug),
+      ...navigatorDebugPayload(historyNavigator.debug(content)),
     })
   })
 }
@@ -1013,10 +1013,17 @@ function handleReceiverMessage(raw: string) {
     if (pendingPeekAgent && sameAgentLabel(agent, pendingPeekAgent)) {
       pendingPeekAgent = ''
     }
-    appendTranscript(summary, agent, detail)
     if (shouldOpenPeekDetail) {
-      openPeekProgressDetail(agent)
+      speechDetected = false
+      waveformFrameIndex = 0
+      clearLiveTranscriptDisplay()
+      historyNavigator.clearPendingTranscript()
+      pushHistory(agent, summary, detail)
+      renderPeekProgressDetail(agent)
+      statusEl.textContent = 'Agent summary received'
+      return
     }
+    appendTranscript(summary, agent, detail)
     setUiStatus('Agent summary received')
     return
   }

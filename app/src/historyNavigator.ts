@@ -190,6 +190,9 @@ export class HistoryNavigator {
   private readonly detailCanvas: HistoryCanvas
   private entries: HistoryEntry[] = []
   private progressAgents: string[] = []
+  private pendingProgressDetailItem: HistoryItem | null = null
+  private retainedDetailItem: HistoryItem | null = null
+  private activeProgressDetailAgentKey = ''
   private pendingTranscript = ''
   private mode: HistoryNavigatorMode = 'closed'
   private selectedItemId: string | null = BACK_ROW_ID
@@ -222,6 +225,9 @@ export class HistoryNavigator {
     this.mode = 'list'
     this.selectedItemId = BACK_ROW_ID
     this.seenDetailIds.clear()
+    this.pendingProgressDetailItem = null
+    this.retainedDetailItem = null
+    this.activeProgressDetailAgentKey = ''
     this.listTopLine = 0
     return this.result('opened')
   }
@@ -229,6 +235,9 @@ export class HistoryNavigator {
   close(action: HistoryNavigatorAction = 'closed_back'): HistoryNavigatorResult {
     this.mode = 'closed'
     this.selectedItemId = BACK_ROW_ID
+    this.pendingProgressDetailItem = null
+    this.retainedDetailItem = null
+    this.activeProgressDetailAgentKey = ''
     this.listTopLine = 0
     return this.result(action)
   }
@@ -238,6 +247,9 @@ export class HistoryNavigator {
 
     if (this.mode === 'detail') {
       this.mode = 'list'
+      this.pendingProgressDetailItem = null
+      this.retainedDetailItem = null
+      this.activeProgressDetailAgentKey = ''
       this.ensureSelectedVisible()
       return this.result('closed_detail')
     }
@@ -257,6 +269,9 @@ export class HistoryNavigator {
     }
 
     if (item.kind === 'progress') {
+      this.pendingProgressDetailItem = item
+      this.retainedDetailItem = null
+      this.activeProgressDetailAgentKey = normalizedLabelKey(item.label)
       this.openDetail(item)
       return this.result('peek_progress', item.label)
     }
@@ -288,8 +303,12 @@ export class HistoryNavigator {
     const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
+    const previousDetailItem = this.mode === 'detail'
+      ? this.selectedItem()
+      : null
 
     this.entries = entries.slice()
+    if (previousDetailItem && this.preserveDetailItem(previousDetailItem)) return
     this.reconcileSelection(wasNewestSelected)
   }
 
@@ -304,6 +323,9 @@ export class HistoryNavigator {
       && this.selectedItemId === previousNewestId
 
     this.entries.push(entry)
+    if (this.replacePendingProgressDetail(entry, this.entries.length - 1)) return
+    if (this.replaceActiveProgressDetail(entry, this.entries.length - 1)) return
+
     this.reconcileSelection(wasNewestSelected)
   }
 
@@ -320,6 +342,9 @@ export class HistoryNavigator {
 
     this.selectedItemId = item.id
     this.seenDetailIds.add(item.id)
+    this.pendingProgressDetailItem = null
+    this.retainedDetailItem = null
+    this.activeProgressDetailAgentKey = key
     this.openDetail(item)
     return this.result('opened_detail', item.label)
   }
@@ -498,7 +523,81 @@ export class HistoryNavigator {
   private selectedItem() {
     if (this.selectedItemId === BACK_ROW_ID) return null
     return this.currentItems()
-      .find(item => item.id === this.selectedItemId) ?? null
+      .find(item => item.id === this.selectedItemId) ??
+      (this.pendingProgressDetailItem?.id === this.selectedItemId
+        ? this.pendingProgressDetailItem
+        : this.retainedDetailItem?.id === this.selectedItemId
+          ? this.retainedDetailItem
+        : null)
+  }
+
+  private replacePendingProgressDetail(entry: HistoryEntry, index: number) {
+    if (
+      this.mode !== 'detail' ||
+      !this.pendingProgressDetailItem ||
+      this.selectedItemId !== this.pendingProgressDetailItem.id ||
+      normalizedLabelKey(entry.label) !== normalizedLabelKey(this.pendingProgressDetailItem.label)
+    ) {
+      return false
+    }
+
+    const item = this.entryItem(entry, index)
+    this.pendingProgressDetailItem = null
+    this.retainedDetailItem = null
+    this.selectedItemId = item.id
+    this.seenDetailIds.add(item.id)
+    this.openDetail(item)
+    this.ensureSelectedVisible()
+    return true
+  }
+
+  private replaceActiveProgressDetail(entry: HistoryEntry, index: number) {
+    if (
+      this.mode !== 'detail' ||
+      !this.activeProgressDetailAgentKey ||
+      normalizedLabelKey(entry.label) !== this.activeProgressDetailAgentKey
+    ) {
+      return false
+    }
+
+    const item = this.entryItem(entry, index)
+    this.pendingProgressDetailItem = null
+    this.retainedDetailItem = null
+    this.selectedItemId = item.id
+    this.seenDetailIds.add(item.id)
+    this.openDetail(item)
+    this.ensureSelectedVisible()
+    return true
+  }
+
+  private preserveDetailItem(previousItem: HistoryItem) {
+    if (this.mode !== 'detail') return false
+
+    const replacement = previousItem.kind === 'progress'
+      ? null
+      : this.currentEntryItems()
+        .find(item => this.sameDetailItem(previousItem, item))
+    if (replacement) {
+      this.retainedDetailItem = null
+      this.selectedItemId = replacement.id
+      this.seenDetailIds.add(replacement.id)
+      this.openDetail(replacement, false)
+      this.ensureSelectedVisible()
+      return true
+    }
+
+    this.retainedDetailItem = previousItem
+    this.selectedItemId = previousItem.id
+    this.openDetail(previousItem, false)
+    this.ensureSelectedVisible()
+    return true
+  }
+
+  private sameDetailItem(a: HistoryItem, b: HistoryItem) {
+    return a.kind === b.kind &&
+      normalizedLabelKey(a.label) === normalizedLabelKey(b.label) &&
+      a.listText === b.listText &&
+      a.detailText === b.detailText
   }
 
   private reconcileSelection(selectNewest: boolean) {
@@ -509,8 +608,16 @@ export class HistoryNavigator {
       this.selectedItemId !== BACK_ROW_ID
       && !items.some(item => item.id === this.selectedItemId)
     ) {
-      this.selectedItemId = BACK_ROW_ID
-      if (this.mode === 'detail') this.mode = 'list'
+      const pendingProgressSelected = this.mode === 'detail' &&
+        this.pendingProgressDetailItem?.id === this.selectedItemId
+      const retainedDetailSelected = this.mode === 'detail' &&
+        this.retainedDetailItem?.id === this.selectedItemId
+      if (!pendingProgressSelected && !retainedDetailSelected) {
+        this.selectedItemId = BACK_ROW_ID
+        this.pendingProgressDetailItem = null
+        this.retainedDetailItem = null
+        if (this.mode === 'detail') this.mode = 'list'
+      }
     }
 
     if (this.mode === 'detail') {
