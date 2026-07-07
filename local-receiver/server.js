@@ -6,6 +6,7 @@ import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 import { VadEndpoint } from './vad-endpoint.js'
 import { createSileroFrameVad } from './silero-vad.ts'
+import { createDiarizationSidecar } from './diarization-sidecar.js'
 import {
   combineQueuedTranscripts,
   markQueuedTranscriptActivity,
@@ -44,6 +45,28 @@ const workbenchRouter = createWorkbenchRouter(workbenchConfig)
 const minAsrBytes = Number(process.env.MIN_ASR_BYTES || 6400)
 const segmentSeconds = Number(process.env.ASR_SEGMENT_SECONDS || 20)
 const bytesPerSecond = 16_000 * 2
+const speakerDiarizationConfig = {
+  enabled: !isDisabled(process.env.SPEAKER_DIARIZATION_ENABLED ?? '1'),
+  rootDir: process.env.SPEAKER_DIARIZATION_DIR || 'data/diarization',
+  speakerTranscriptDir: process.env.SPEAKER_DIARIZATION_TRANSCRIPT_DIR || transcriptDirPath,
+  segmentationModel: process.env.SPEAKER_DIARIZATION_SEGMENTATION_MODEL || '',
+  embeddingModel: process.env.SPEAKER_DIARIZATION_EMBEDDING_MODEL || '',
+  numClusters: Number(process.env.SPEAKER_DIARIZATION_NUM_CLUSTERS || -1),
+  clusterThreshold: Number(process.env.SPEAKER_DIARIZATION_CLUSTER_THRESHOLD || 0.5),
+  minDurationOn: Number(process.env.SPEAKER_DIARIZATION_MIN_DURATION_ON || 0.2),
+  minDurationOff: Number(process.env.SPEAKER_DIARIZATION_MIN_DURATION_OFF || 0.5),
+  maxOpenSegments: Number(process.env.SPEAKER_DIARIZATION_MAX_OPEN_SEGMENTS || 4),
+  maxPendingSegments: Number(process.env.SPEAKER_DIARIZATION_MAX_PENDING_SEGMENTS || 32),
+  maxSegmentBytes: Number(process.env.SPEAKER_DIARIZATION_MAX_SEGMENT_BYTES || bytesPerSecond * 30),
+  sampleRate: 16_000,
+  bytesPerSecond,
+  workerProcess: !isDisabled(process.env.SPEAKER_DIARIZATION_WORKER_PROCESS ?? '1'),
+  workerTimeoutMs: Number(process.env.SPEAKER_DIARIZATION_WORKER_TIMEOUT_MS || 120_000),
+  asrModel: process.env.PARAKEET_ONNX_MODEL || 'nemo-parakeet-tdt-0.6b-v3',
+  asrWorkerUrl: process.env.SPEAKER_DIARIZATION_ASR_WORKER_URL || asrWorkerUrl,
+  asrTimeoutMs: Number(process.env.SPEAKER_DIARIZATION_ASR_TIMEOUT_MS || 60_000),
+}
+const diarizationSidecar = createDiarizationSidecar(speakerDiarizationConfig)
 const segmentBytesLimit = segmentSeconds > 0 ? Math.floor(segmentSeconds * bytesPerSecond) : 0
 const chunkMode = (process.env.ASR_CHUNK_MODE || 'vad').toLowerCase()
 const useVad = chunkMode !== 'fixed'
@@ -68,6 +91,8 @@ const sileroVadThreshold = Number(process.env.SILERO_VAD_THRESHOLD || 0.5)
 const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 3_000)
 const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
 const receiverIdleAudioFreshMs = Number(process.env.RECEIVER_IDLE_AUDIO_FRESH_MS || 2_500)
+const activeAudioSocketProtectMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_PROTECT_MS || 10_000)
+const activeAudioSocketStartGraceMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_START_GRACE_MS || 1_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const messageHistoryDirPath = resolve(process.env.MESSAGE_HISTORY_DIR || join(transcriptDirPath, 'message-history'))
 const messageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || 0)
@@ -110,6 +135,9 @@ let runtimeConfigCache = {
   warned: false,
 }
 const audioSockets = new Set()
+const activeAudioSocketsByUser = new Map()
+const audioSocketActivity = new WeakMap()
+let diarizationDispatchQueue = Promise.resolve()
 const transcriptQueues = new WeakMap()
 const activeWorkbenchAgents = new Map()
 const recentWorkbenchSummaries = new Map()
@@ -259,6 +287,28 @@ function sendSocketJson(socket, payload) {
     console.error(`[socket] failed to send ${payload?.type || 'message'}: ${err.message}`)
     return false
   }
+}
+
+function dispatchDiarization(label, action) {
+  if (!speakerDiarizationConfig.enabled) return
+
+  diarizationDispatchQueue = diarizationDispatchQueue
+    .catch(() => {})
+    .then(() => new Promise(resolveDispatch => setImmediate(resolveDispatch)))
+    .then(() => {
+      try {
+        const result = action()
+        if (result && typeof result.catch === 'function') {
+          result.catch(err => logDiarizationDispatchFailure(label, err))
+        }
+      } catch (err) {
+        logDiarizationDispatchFailure(label, err)
+      }
+    })
+}
+
+function logDiarizationDispatchFailure(label, err) {
+  console.warn(`[diarization] ${label} dispatch failed: ${err?.message || String(err)}`)
 }
 
 function broadcastSocketJson(payload) {
@@ -1182,6 +1232,71 @@ function isAllowedUser(user, auth) {
   return false
 }
 
+function activeAudioSocketKey(user) {
+  const uid = stringValue(user?.uid)
+  return uid ? `uid:${uid}` : ''
+}
+
+function shouldKeepActiveAudioSocket(socket, now = Date.now()) {
+  if (activeAudioSocketProtectMs <= 0) return false
+
+  const activity = audioSocketActivity.get(socket)
+  if (!activity) return false
+
+  if (activity.lastAudioAt && now - activity.lastAudioAt <= activeAudioSocketProtectMs) {
+    return true
+  }
+
+  return Boolean(
+    activeAudioSocketStartGraceMs > 0 &&
+    activity.startedAt &&
+    now - activity.startedAt <= activeAudioSocketStartGraceMs,
+  )
+}
+
+function promoteActiveAudioSocket(socket, key, context = {}) {
+  if (!key) return { accepted: true, key: '' }
+
+  const previous = activeAudioSocketsByUser.get(key)
+  if (previous === socket) return { accepted: true, key }
+
+  if (previous && previous.readyState === WebSocket.OPEN && shouldKeepActiveAudioSocket(previous)) {
+    console.log(
+      `[audio] keeping active socket for ${key}${context.connectionStamp ? `; closing duplicate stamp=${context.connectionStamp}` : ''}`,
+    )
+    sendSocketJson(socket, {
+      type: 'receiver_status',
+      status: 'duplicate',
+      reason: 'active_socket_connected',
+    })
+    socket.close(4001, 'active audio socket already connected')
+    return { accepted: false, key: '' }
+  }
+
+  activeAudioSocketsByUser.set(key, socket)
+
+  if (previous && previous.readyState === WebSocket.OPEN) {
+    console.log(
+      `[audio] replacing active socket for ${key}${context.connectionStamp ? ` with stamp=${context.connectionStamp}` : ''}`,
+    )
+    sendSocketJson(previous, {
+      type: 'receiver_status',
+      status: 'replaced',
+      reason: 'newer_socket_active',
+    })
+    previous.close(4001, 'newer audio socket active')
+  }
+
+  return { accepted: true, key }
+}
+
+function clearActiveAudioSocket(socket, key) {
+  if (!key) return
+  if (activeAudioSocketsByUser.get(key) === socket) {
+    activeAudioSocketsByUser.delete(key)
+  }
+}
+
 function parseControlMessage(text) {
   try {
     const value = JSON.parse(text)
@@ -1367,6 +1482,21 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
 
   if (rawTranscript) {
     console.log(`[transcript:raw] ${rawTranscript}`)
+    dispatchDiarization('process saved audio', () => {
+      return diarizationSidecar.processExistingAudio(paths.wav, {
+        transcriptText: rawTranscript,
+        context: {
+          jobId,
+          user,
+          source: 'main-asr',
+        },
+        metadata: {
+          jobId,
+          user,
+          source: 'saved-audio',
+        },
+      })
+    })
     enqueueRawTranscript({
       rawTranscript,
       paths,
@@ -1784,6 +1914,12 @@ async function resetSileroVadState() {
 wss.on('connection', (socket, req) => {
   audioSockets.add(socket)
   const connectionStamp = stamp()
+  const socketActivity = {
+    connectionStamp,
+    startedAt: 0,
+    lastAudioAt: 0,
+  }
+  audioSocketActivity.set(socket, socketActivity)
   const transportAuth = req.audioTransportAuth || {
     accepted: !accessToken && !accessTokenSecret,
     challenge: false,
@@ -1797,6 +1933,7 @@ wss.on('connection', (socket, req) => {
   let chunks = 0
   let userAuthenticated = false
   let evenUser = null
+  let activeAudioSocketKeyForConnection = ''
   let authTimer = null
   let onboardingPromptSent = false
   let firstAudioChunkLogged = false
@@ -1962,6 +2099,18 @@ wss.on('connection', (socket, req) => {
         }
 
         userAuthenticated = true
+        socketActivity.startedAt = Date.now()
+        const nextActiveAudioSocketKey = activeAudioSocketKey(evenUser)
+        if (activeAudioSocketKeyForConnection !== nextActiveAudioSocketKey) {
+          clearActiveAudioSocket(socket, activeAudioSocketKeyForConnection)
+        }
+        const activeAudioSocketPromotion = promoteActiveAudioSocket(
+          socket,
+          nextActiveAudioSocketKey,
+          { connectionStamp },
+        )
+        if (!activeAudioSocketPromotion.accepted) return
+        activeAudioSocketKeyForConnection = activeAudioSocketPromotion.key
         persistScannedUser(evenUser, 'accepted')
         sendSocketJson(socket, {
           type: 'auth_status',
@@ -2014,6 +2163,7 @@ wss.on('connection', (socket, req) => {
     chunks += 1
     bytes += chunk.byteLength
     lastAudioAt = Date.now()
+    socketActivity.lastAudioAt = lastAudioAt
     idleLogged = false
     idleIndicatorEnabled = true
     if (!firstAudioChunkLogged) {
@@ -2043,6 +2193,7 @@ wss.on('connection', (socket, req) => {
     if (authTimer) clearTimeout(authTimer)
     clearInterval(idleTimer)
     audioSockets.delete(socket)
+    clearActiveAudioSocket(socket, activeAudioSocketKeyForConnection)
     audioQueue = audioQueue
       .catch(() => {})
       .then(() => {
@@ -2180,6 +2331,9 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`[server] Transcript queue max hold: ${transcriptQueueMaxHoldMs > 0 ? `${(transcriptQueueMaxHoldMs / 1000).toFixed(1)}s` : 'disabled'}`)
   console.log(`[server] ASR worker: ${asrWorkerUrl || 'not configured'}`)
   console.log(`[server] ASR command fallback: ${asrCommand ? 'configured' : 'not configured'}`)
+  console.log(
+    `[server] Speaker diarization sidecar: ${speakerDiarizationConfig.enabled ? `${speakerDiarizationConfig.rootDir} (${speakerDiarizationConfig.segmentationModel && speakerDiarizationConfig.embeddingModel ? 'onnx models configured' : 'single-speaker fallback'})` : 'disabled'}`,
+  )
   console.log(
     `[server] Transcript cleanup: ${startupCleanupConfig.enabled ? `${startupCleanupConfig.model} at ${startupCleanupConfig.url}` : 'disabled'}`,
   )

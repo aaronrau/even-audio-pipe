@@ -17,6 +17,9 @@ models/
 *.pcm
 *.wav
 *.log
+*.diarization.txt
+*.diarization.json
+*.diarization.jsonl
 *.ehpk
 
 # Python runtime artifacts

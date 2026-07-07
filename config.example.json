@@ -29,6 +29,24 @@
     "preRollMs": 500,
     "minUtteranceMs": 250
   },
+  "speakerDiarization": {
+    "enabled": true,
+    "rootDir": "data/diarization",
+    "speakerTranscriptDir": "data/transcripts",
+    "segmentationModel": "",
+    "embeddingModel": "",
+    "numClusters": -1,
+    "clusterThreshold": 0.5,
+    "minDurationOn": 0.2,
+    "minDurationOff": 0.5,
+    "maxOpenSegments": 4,
+    "maxPendingSegments": 32,
+    "maxSegmentBytes": 960000,
+    "workerProcess": true,
+    "workerTimeoutMs": 120000,
+    "asrWorkerUrl": "",
+    "asrTimeoutMs": 60000
+  },
   "workbench": {
     "enabled": false,
     "url": "http://127.0.0.1:8787",

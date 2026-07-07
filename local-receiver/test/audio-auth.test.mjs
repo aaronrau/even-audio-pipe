@@ -212,6 +212,34 @@ function collectJson(ws, durationMs) {
   })
 }
 
+function waitForClose(ws) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error('timed out waiting for websocket close'))
+    }, 2_000)
+
+    function cleanup() {
+      clearTimeout(timeout)
+      ws.off('close', onClose)
+      ws.off('error', onError)
+    }
+
+    function onClose(code, reason) {
+      cleanup()
+      resolve({ code, reason: reason.toString() })
+    }
+
+    function onError(err) {
+      cleanup()
+      reject(err)
+    }
+
+    ws.on('close', onClose)
+    ws.on('error', onError)
+  })
+}
+
 async function waitForOutput(child, predicate) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     if (predicate(child.stdoutText)) return
@@ -254,6 +282,90 @@ test('receiver sends onboarding prompt after app start and logs audio stream', a
     ws.send(Buffer.alloc(320))
     await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
     ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver keeps current audio socket active for the same Even user', async () => {
+  const { child, dir, port } = await startReceiver()
+
+  try {
+    const first = await openSocket(port)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    first.send(Buffer.alloc(320))
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+
+    const second = await openSocket(port)
+    const secondClose = waitForClose(second)
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+
+    const close = await secondClose
+    assert.equal(close.code, 4001)
+    assert.equal(close.reason, 'active audio socket already connected')
+
+    await delay(150)
+    assert.equal(first.readyState, WebSocket.OPEN)
+    assert.match(child.stdoutText, /\[audio\] keeping active socket for uid:same-user/)
+    first.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver lets newer socket replace a stale same-user socket before audio starts', async () => {
+  const { child, dir, port } = await startReceiver({
+    RECEIVER_ACTIVE_AUDIO_SOCKET_START_GRACE_MS: '1',
+  })
+
+  try {
+    const first = await openSocket(port)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    await delay(20)
+
+    const second = await openSocket(port)
+    const firstClose = waitForClose(first)
+    const secondPrompt = waitForJson(second, message => message.type === 'onboarding_prompt')
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+
+    const close = await firstClose
+    assert.equal(close.code, 4001)
+    assert.equal(close.reason, 'newer audio socket active')
+    await secondPrompt
+    assert.match(child.stdoutText, /\[audio\] replacing active socket for uid:same-user/)
+    second.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })

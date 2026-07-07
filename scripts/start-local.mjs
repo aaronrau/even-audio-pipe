@@ -21,6 +21,7 @@ const transcriptQueueConfig = resolveTranscriptQueueConfig(config.transcriptQueu
 const transcriptCleanupConfig = resolveTranscriptCleanupConfig(config.transcriptCleanup)
 const workbenchConfig = resolveWorkbenchConfig(config.workbench)
 const vadConfig = resolveVadConfig(config.vad)
+const speakerDiarizationConfig = resolveSpeakerDiarizationConfig(config.speakerDiarization)
 const networkConfig = resolveNetworkConfig(config.network)
 
 const configuredLanHost = process.env.EVEN_AUDIO_PIPE_HOST || networkConfig.lanHost
@@ -113,6 +114,7 @@ console.log(`  Transcript log: ${displayPath(storageConfig.transcriptsLog)}`)
 console.log(`  Transcript wait: ${(transcriptQueueConfig.idleMs / 1000).toFixed(1)}s`)
 console.log(`  Transcript max hold: ${transcriptQueueConfig.maxHoldMs > 0 ? `${(transcriptQueueConfig.maxHoldMs / 1000).toFixed(1)}s` : 'disabled'}`)
 console.log(`  Cleanup:        ${transcriptCleanupConfig.enabled ? `${transcriptCleanupConfig.model} at ${transcriptCleanupConfig.url}` : 'disabled'}`)
+console.log(`  Diarization:    ${speakerDiarizationConfig.enabled ? speakerDiarizationConfig.rootDir : 'disabled'}`)
 console.log(`  Workbench API:  ${workbenchConfig.enabled ? `${workbenchConfig.url}/messages` : 'disabled'}`)
 console.log(`  Workbench agents: ${workbenchConfig.agents.join(', ') || 'none configured'}`)
 console.log(`  Workbench route: ${workbenchRouteDescription(workbenchConfig)}`)
@@ -168,6 +170,22 @@ spawnManaged('receiver', 'npm', ['start'], {
     SILERO_VAD_THRESHOLD: String(vadConfig.threshold),
     SILERO_VAD_FRAME_SAMPLES: String(vadConfig.frameSamples),
     SILERO_VAD_MODEL: vadConfig.model,
+    SPEAKER_DIARIZATION_ENABLED: speakerDiarizationConfig.enabled ? '1' : '0',
+    SPEAKER_DIARIZATION_DIR: speakerDiarizationConfig.rootDir,
+    SPEAKER_DIARIZATION_TRANSCRIPT_DIR: speakerDiarizationConfig.speakerTranscriptDir,
+    SPEAKER_DIARIZATION_SEGMENTATION_MODEL: speakerDiarizationConfig.segmentationModel,
+    SPEAKER_DIARIZATION_EMBEDDING_MODEL: speakerDiarizationConfig.embeddingModel,
+    SPEAKER_DIARIZATION_NUM_CLUSTERS: String(speakerDiarizationConfig.numClusters),
+    SPEAKER_DIARIZATION_CLUSTER_THRESHOLD: String(speakerDiarizationConfig.clusterThreshold),
+    SPEAKER_DIARIZATION_MIN_DURATION_ON: String(speakerDiarizationConfig.minDurationOn),
+    SPEAKER_DIARIZATION_MIN_DURATION_OFF: String(speakerDiarizationConfig.minDurationOff),
+    SPEAKER_DIARIZATION_MAX_OPEN_SEGMENTS: String(speakerDiarizationConfig.maxOpenSegments),
+    SPEAKER_DIARIZATION_MAX_PENDING_SEGMENTS: String(speakerDiarizationConfig.maxPendingSegments),
+    SPEAKER_DIARIZATION_MAX_SEGMENT_BYTES: String(speakerDiarizationConfig.maxSegmentBytes),
+    SPEAKER_DIARIZATION_WORKER_PROCESS: speakerDiarizationConfig.workerProcess ? '1' : '0',
+    SPEAKER_DIARIZATION_WORKER_TIMEOUT_MS: String(speakerDiarizationConfig.workerTimeoutMs),
+    SPEAKER_DIARIZATION_ASR_WORKER_URL: speakerDiarizationConfig.asrWorkerUrl || (asrEnabled ? asrWorkerUrl : ''),
+    SPEAKER_DIARIZATION_ASR_TIMEOUT_MS: String(speakerDiarizationConfig.asrTimeoutMs),
   },
 })
 
@@ -475,6 +493,109 @@ function resolveVadConfig(vad = {}) {
 function normalizeSileroFrameSamples(value) {
   const frameSamples = Number(value)
   return [512, 1024, 1536].includes(frameSamples) ? frameSamples : 512
+}
+
+function resolveSpeakerDiarizationConfig(config = {}) {
+  const enabled = !isDisabled(
+    process.env.SPEAKER_DIARIZATION_ENABLED ??
+    config.enabled ??
+    '1',
+  )
+  const rootDir = resolveConfigPath(
+    process.env.SPEAKER_DIARIZATION_DIR ||
+    config.rootDir ||
+    config.dir ||
+    'data/diarization',
+  )
+  const speakerTranscriptDir = resolveConfigPath(
+    process.env.SPEAKER_DIARIZATION_TRANSCRIPT_DIR ||
+    config.speakerTranscriptDir ||
+    storageConfig.transcriptDir,
+  )
+  const segmentationModel = String(
+    process.env.SPEAKER_DIARIZATION_SEGMENTATION_MODEL ||
+    config.segmentationModel ||
+    '',
+  ).trim()
+  const embeddingModel = String(
+    process.env.SPEAKER_DIARIZATION_EMBEDDING_MODEL ||
+    config.embeddingModel ||
+    '',
+  ).trim()
+  const numClusters = Number(
+    process.env.SPEAKER_DIARIZATION_NUM_CLUSTERS ??
+    config.numClusters ??
+    -1,
+  )
+  const clusterThreshold = Number(
+    process.env.SPEAKER_DIARIZATION_CLUSTER_THRESHOLD ??
+    config.clusterThreshold ??
+    0.5,
+  )
+  const minDurationOn = Number(
+    process.env.SPEAKER_DIARIZATION_MIN_DURATION_ON ??
+    config.minDurationOn ??
+    0.2,
+  )
+  const minDurationOff = Number(
+    process.env.SPEAKER_DIARIZATION_MIN_DURATION_OFF ??
+    config.minDurationOff ??
+    0.5,
+  )
+  const maxOpenSegments = Number(
+    process.env.SPEAKER_DIARIZATION_MAX_OPEN_SEGMENTS ??
+    config.maxOpenSegments ??
+    4,
+  )
+  const maxPendingSegments = Number(
+    process.env.SPEAKER_DIARIZATION_MAX_PENDING_SEGMENTS ??
+    config.maxPendingSegments ??
+    32,
+  )
+  const maxSegmentBytes = Number(
+    process.env.SPEAKER_DIARIZATION_MAX_SEGMENT_BYTES ??
+    config.maxSegmentBytes ??
+    16_000 * 2 * 30,
+  )
+  const workerProcess = !isDisabled(
+    process.env.SPEAKER_DIARIZATION_WORKER_PROCESS ??
+    config.workerProcess ??
+    '1',
+  )
+  const workerTimeoutMs = Number(
+    process.env.SPEAKER_DIARIZATION_WORKER_TIMEOUT_MS ??
+    config.workerTimeoutMs ??
+    120_000,
+  )
+  const asrWorkerUrl = String(
+    process.env.SPEAKER_DIARIZATION_ASR_WORKER_URL ||
+    config.asrWorkerUrl ||
+    '',
+  ).trim()
+  const asrTimeoutMs = Number(
+    process.env.SPEAKER_DIARIZATION_ASR_TIMEOUT_MS ??
+    config.asrTimeoutMs ??
+    60_000,
+  )
+
+  return {
+    enabled,
+    rootDir,
+    speakerTranscriptDir,
+    segmentationModel: segmentationModel ? resolveConfigPath(segmentationModel) : '',
+    embeddingModel: embeddingModel ? resolveConfigPath(embeddingModel) : '',
+    numClusters: Number.isFinite(numClusters) ? Math.floor(numClusters) : -1,
+    clusterThreshold: Number.isFinite(clusterThreshold) ? clusterThreshold : 0.5,
+    minDurationOn: Number.isFinite(minDurationOn) ? Math.max(0, minDurationOn) : 0.2,
+    minDurationOff: Number.isFinite(minDurationOff) ? Math.max(0, minDurationOff) : 0.5,
+    maxOpenSegments: Number.isFinite(maxOpenSegments) ? Math.max(1, Math.floor(maxOpenSegments)) : 4,
+    maxPendingSegments: Number.isFinite(maxPendingSegments) ? Math.max(1, Math.floor(maxPendingSegments)) : 32,
+    maxSegmentBytes: Number.isFinite(maxSegmentBytes) ? Math.max(16_000 * 2, Math.floor(maxSegmentBytes)) : 16_000 * 2 * 30,
+    workerProcess,
+    workerTimeoutMs: Number.isFinite(workerTimeoutMs) ? Math.max(1_000, Math.floor(workerTimeoutMs)) : 120_000,
+    asrWorkerUrl,
+    asrTimeoutMs: Number.isFinite(asrTimeoutMs) ? Math.max(1_000, Math.floor(asrTimeoutMs)) : 60_000,
+  }
 }
 
 function resolveWorkbenchConfig(workbench = {}) {
