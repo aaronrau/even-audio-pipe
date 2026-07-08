@@ -21,6 +21,9 @@ if (!options.audioFiles.length) {
     '  --segmentation-model <file>  sherpa-onnx speaker segmentation ONNX model',
     '  --embedding-model <file>     sherpa-onnx speaker embedding ONNX model',
     '  --asr-worker-url <url>       Optional ASR worker for per-turn transcription',
+    '  --user-id <uid>              User id for enrollment/profile matching',
+    '  --no-enroll                  Disable first-sample user profile enrollment',
+    '  --match-threshold <n>        User speaker match threshold (default: 0.6)',
     '  --num-clusters <n>           Known speaker count, or -1 to infer (default: -1)',
     '  --cluster-threshold <n>      Clustering threshold (default: 0.5)',
   ].join('\n'))
@@ -37,6 +40,8 @@ const sidecar = createDiarizationSidecar({
   clusterThreshold: options.clusterThreshold,
   asrModel: process.env.PARAKEET_ONNX_MODEL || 'nemo-parakeet-tdt-0.6b-v3',
   asrWorkerUrl: options.asrWorkerUrl,
+  enrollmentEnabled: options.enrollmentEnabled,
+  speakerMatchThreshold: options.speakerMatchThreshold,
 })
 
 for (const file of options.audioFiles) {
@@ -56,6 +61,10 @@ for (const file of options.audioFiles) {
     context: {
       source: 'saved-audio-cli',
       transcriptMatched: Boolean(transcriptText),
+      user: options.userId ? { uid: options.userId } : undefined,
+    },
+    metadata: {
+      user: options.userId ? { uid: options.userId } : undefined,
     },
   })
 
@@ -78,6 +87,9 @@ function parseArgs(values) {
     segmentationModel: process.env.SPEAKER_DIARIZATION_SEGMENTATION_MODEL || '',
     embeddingModel: process.env.SPEAKER_DIARIZATION_EMBEDDING_MODEL || '',
     asrWorkerUrl: process.env.SPEAKER_DIARIZATION_ASR_WORKER_URL || '',
+    userId: process.env.SPEAKER_DIARIZATION_USER_ID || '',
+    enrollmentEnabled: !isDisabled(process.env.SPEAKER_DIARIZATION_ENROLLMENT_ENABLED ?? '1'),
+    speakerMatchThreshold: Number(process.env.SPEAKER_DIARIZATION_MATCH_THRESHOLD || 0.6),
     numClusters: Number(process.env.SPEAKER_DIARIZATION_NUM_CLUSTERS || -1),
     clusterThreshold: Number(process.env.SPEAKER_DIARIZATION_CLUSTER_THRESHOLD || 0.5),
     audioFiles: [],
@@ -97,6 +109,12 @@ function parseArgs(values) {
       parsed.embeddingModel = values[++index] || ''
     } else if (value === '--asr-worker-url') {
       parsed.asrWorkerUrl = values[++index] || ''
+    } else if (value === '--user-id') {
+      parsed.userId = values[++index] || ''
+    } else if (value === '--no-enroll') {
+      parsed.enrollmentEnabled = false
+    } else if (value === '--match-threshold') {
+      parsed.speakerMatchThreshold = Number(values[++index] || 0.6)
     } else if (value === '--num-clusters') {
       parsed.numClusters = Number(values[++index] || -1)
     } else if (value === '--cluster-threshold') {
@@ -107,4 +125,8 @@ function parseArgs(values) {
   }
 
   return parsed
+}
+
+function isDisabled(value) {
+  return /^(0|false|no|off|disabled)$/i.test(String(value || '').trim())
 }

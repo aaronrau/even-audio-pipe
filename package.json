@@ -8,6 +8,7 @@
     "start": "node scripts/start-local.mjs",
     "dev": "node scripts/start-local.mjs",
     "setup": "npm --prefix local-receiver ci && npm --prefix app ci",
+    "setup:diarization": "node scripts/install-diarization-models.mjs",
     "check": "npm run setup && node --check scripts/start-local.mjs && npm --prefix local-receiver run check && npm --prefix app run build && npm --prefix app run test:endpoints && npm --prefix app run test:bundle-urls && npm --prefix app run test:speech-dispatch && npm --prefix app run test:startup-prompt"
   }
 }

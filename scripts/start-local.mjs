@@ -186,6 +186,10 @@ spawnManaged('receiver', 'npm', ['start'], {
     SPEAKER_DIARIZATION_WORKER_TIMEOUT_MS: String(speakerDiarizationConfig.workerTimeoutMs),
     SPEAKER_DIARIZATION_ASR_WORKER_URL: speakerDiarizationConfig.asrWorkerUrl || (asrEnabled ? asrWorkerUrl : ''),
     SPEAKER_DIARIZATION_ASR_TIMEOUT_MS: String(speakerDiarizationConfig.asrTimeoutMs),
+    SPEAKER_DIARIZATION_ENROLLMENT_ENABLED: speakerDiarizationConfig.enrollmentEnabled ? '1' : '0',
+    SPEAKER_DIARIZATION_ENROLLMENT_MIN_DURATION_SEC: String(speakerDiarizationConfig.enrollmentMinDurationSec),
+    SPEAKER_DIARIZATION_PROFILE_MAX_SAMPLES: String(speakerDiarizationConfig.profileMaxSamples),
+    SPEAKER_DIARIZATION_MATCH_THRESHOLD: String(speakerDiarizationConfig.speakerMatchThreshold),
   },
 })
 
@@ -577,6 +581,26 @@ function resolveSpeakerDiarizationConfig(config = {}) {
     config.asrTimeoutMs ??
     60_000,
   )
+  const enrollmentEnabled = !isDisabled(
+    process.env.SPEAKER_DIARIZATION_ENROLLMENT_ENABLED ??
+    config.enrollmentEnabled ??
+    '1',
+  )
+  const enrollmentMinDurationSec = Number(
+    process.env.SPEAKER_DIARIZATION_ENROLLMENT_MIN_DURATION_SEC ??
+    config.enrollmentMinDurationSec ??
+    1.5,
+  )
+  const profileMaxSamples = Number(
+    process.env.SPEAKER_DIARIZATION_PROFILE_MAX_SAMPLES ??
+    config.profileMaxSamples ??
+    1,
+  )
+  const speakerMatchThreshold = Number(
+    process.env.SPEAKER_DIARIZATION_MATCH_THRESHOLD ??
+    config.speakerMatchThreshold ??
+    0.6,
+  )
 
   return {
     enabled,
@@ -595,6 +619,10 @@ function resolveSpeakerDiarizationConfig(config = {}) {
     workerTimeoutMs: Number.isFinite(workerTimeoutMs) ? Math.max(1_000, Math.floor(workerTimeoutMs)) : 120_000,
     asrWorkerUrl,
     asrTimeoutMs: Number.isFinite(asrTimeoutMs) ? Math.max(1_000, Math.floor(asrTimeoutMs)) : 60_000,
+    enrollmentEnabled,
+    enrollmentMinDurationSec: Number.isFinite(enrollmentMinDurationSec) ? Math.max(0, enrollmentMinDurationSec) : 1.5,
+    profileMaxSamples: Number.isFinite(profileMaxSamples) ? Math.max(1, Math.floor(profileMaxSamples)) : 1,
+    speakerMatchThreshold: Number.isFinite(speakerMatchThreshold) ? speakerMatchThreshold : 0.6,
   }
 }
 

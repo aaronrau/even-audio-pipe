@@ -45,7 +45,11 @@
     "workerProcess": true,
     "workerTimeoutMs": 120000,
     "asrWorkerUrl": "",
-    "asrTimeoutMs": 60000
+    "asrTimeoutMs": 60000,
+    "enrollmentEnabled": true,
+    "enrollmentMinDurationSec": 1.5,
+    "profileMaxSamples": 1,
+    "speakerMatchThreshold": 0.6
   },
   "workbench": {
     "enabled": false,

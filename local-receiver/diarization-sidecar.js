@@ -20,6 +20,10 @@ const DEFAULT_BYTES_PER_SECOND = DEFAULT_SAMPLE_RATE * 2
 const DEFAULT_MAX_OPEN_SEGMENTS = 4
 const DEFAULT_MAX_PENDING_SEGMENTS = 32
 const DEFAULT_MAX_SEGMENT_BYTES = DEFAULT_BYTES_PER_SECOND * 30
+const DEFAULT_ENROLLMENT_MIN_DURATION_SEC = 1.5
+const DEFAULT_PROFILE_MAX_SAMPLES = 1
+const DEFAULT_SPEAKER_MATCH_THRESHOLD = 0.6
+const PROFILE_STORE_VERSION = 1
 const RESULT_CACHE_LIMIT = 100
 
 const noopSidecar = {
@@ -46,6 +50,9 @@ export class DiarizationSidecar {
     this.audioDir = join(this.rootDir, 'audio')
     this.segmentDir = join(this.rootDir, 'segments')
     this.transcriptDir = join(this.rootDir, 'transcripts')
+    this.profileDir = join(this.rootDir, 'speakers')
+    this.enrollmentDir = join(this.profileDir, 'enrollments')
+    this.profileStorePath = join(this.profileDir, 'profiles.json')
     this.speakerTranscriptDir = resolve(options.speakerTranscriptDir || join(this.rootDir, 'speaker-transcripts'))
     this.sampleRate = positiveNumber(options.sampleRate, DEFAULT_SAMPLE_RATE)
     this.bytesPerSecond = positiveNumber(options.bytesPerSecond, this.sampleRate * 2)
@@ -65,6 +72,11 @@ export class DiarizationSidecar {
     this.asrModel = stringValue(options.asrModel)
     this.asrWorkerUrl = stringValue(options.asrWorkerUrl)
     this.asrTimeoutMs = positiveInteger(options.asrTimeoutMs, 60_000)
+    this.enrollmentEnabled = options.enrollmentEnabled !== false
+    this.enrollmentMinDurationSec = positiveNumber(options.enrollmentMinDurationSec, DEFAULT_ENROLLMENT_MIN_DURATION_SEC)
+    this.profileMaxSamples = positiveInteger(options.profileMaxSamples, DEFAULT_PROFILE_MAX_SAMPLES)
+    this.speakerMatchThreshold = finiteNumber(options.speakerMatchThreshold, DEFAULT_SPEAKER_MATCH_THRESHOLD)
+    this.profileDisplayName = stringValue(options.profileDisplayName || 'User') || 'User'
 
     this.openSegments = new Map()
     this.pendingTranscripts = new Map()
@@ -80,6 +92,8 @@ export class DiarizationSidecar {
     mkdirSync(this.audioDir, { recursive: true })
     mkdirSync(this.segmentDir, { recursive: true })
     mkdirSync(this.transcriptDir, { recursive: true })
+    mkdirSync(this.profileDir, { recursive: true })
+    mkdirSync(this.enrollmentDir, { recursive: true })
     mkdirSync(this.speakerTranscriptDir, { recursive: true })
   }
 
@@ -459,6 +473,14 @@ export class DiarizationSidecar {
     const sourceAudioPath = join(this.rootDir, result.audioFile)
     const turns = result.turns?.length ? result.turns : [fallbackTurn(result.durationSec)]
     const breakoutTurns = []
+    const user = transcript?.context?.user || result?.metadata?.user || null
+    const profile = await this.ensureUserSpeakerProfile({
+      result,
+      transcript,
+      user,
+      audioPath: sourceAudioPath,
+    })
+    const otherSpeakerLabels = new Map()
 
     for (let index = 0; index < turns.length; index += 1) {
       const turn = turns[index]
@@ -522,14 +544,15 @@ export class DiarizationSidecar {
         }
       }
 
+      const speaker = await this.resolveSpeakerForTurn({
+        turn,
+        turnAudioPath,
+        profile,
+        otherSpeakerLabels,
+      })
       breakoutTurns.push({
         index,
-        speaker: {
-          id: turn.speaker,
-          displayName: displaySpeakerName(turn.speaker),
-          confidence: turn.confidence,
-          matchedProfile: false,
-        },
+        speaker,
         startSec: turn.startSec,
         endSec: turn.endSec,
         audioFile: this.relativePath(turnAudioPath),
@@ -558,12 +581,230 @@ export class DiarizationSidecar {
       diarizationStatus: result.status,
       diarizationReason: result.reason,
       models: result.models,
+      speakerProfile: profile.publicRecord,
       context: compactMetadata(transcript.context),
     }
 
     writeTextFile(txtPath, formatSpeakerBreakoutText(record))
     writeJsonFile(jsonPath, record)
     return record
+  }
+
+  async ensureUserSpeakerProfile({ result, user, audioPath }) {
+    const profileId = speakerProfileIdForUser(user)
+    const baseRecord = {
+      enabled: this.enrollmentEnabled,
+      id: profileId,
+      displayName: this.profileDisplayName,
+      embeddingModel: this.embeddingModel ? basename(this.embeddingModel) : '',
+      threshold: this.speakerMatchThreshold,
+    }
+
+    if (!profileId) {
+      return {
+        id: '',
+        displayName: this.profileDisplayName,
+        embedding: null,
+        publicRecord: {
+          ...baseRecord,
+          status: 'skipped',
+          reason: 'missing_user_identity',
+        },
+      }
+    }
+
+    const modelStatus = this.embeddingModelStatus()
+    const store = this.readProfileStore()
+    let profile = normalizeSpeakerProfile(store.profiles[profileId], {
+      profileId,
+      displayName: this.profileDisplayName,
+    })
+    let status = profile.embedding.length ? 'existing' : 'missing'
+    let reason = ''
+
+    if (!modelStatus.ok) {
+      reason = modelStatus.reason
+    } else if (!this.enrollmentEnabled) {
+      reason = 'enrollment_disabled'
+    } else if (profile.samples.length >= this.profileMaxSamples) {
+      status = profile.embedding.length ? 'existing' : 'skipped'
+      reason = profile.embedding.length ? '' : 'profile_sample_limit_reached'
+    } else if (finiteNumber(result?.durationSec, 0) < this.enrollmentMinDurationSec) {
+      status = profile.embedding.length ? 'existing' : 'skipped'
+      reason = `audio_shorter_than_${this.enrollmentMinDurationSec}s`
+    } else {
+      try {
+        const embedding = await this.computeSpeakerEmbedding(audioPath)
+        if (!embedding.length) {
+          status = profile.embedding.length ? 'existing' : 'skipped'
+          reason = 'empty_embedding'
+        } else {
+          const sampleId = `${result.sourceSegmentId}-${String(profile.samples.length + 1).padStart(2, '0')}`
+          const enrollmentPath = this.enrollmentPathFor(profileId, sampleId)
+          copyFileSync(audioPath, enrollmentPath)
+
+          const sample = {
+            sampleId,
+            sourceSegmentId: result.sourceSegmentId,
+            createdAt: new Date().toISOString(),
+            durationSec: roundSeconds(result.durationSec),
+            audioFile: this.relativePath(enrollmentPath),
+            embedding,
+          }
+          profile = {
+            id: profileId,
+            displayName: this.profileDisplayName,
+            createdAt: profile.createdAt || sample.createdAt,
+            updatedAt: sample.createdAt,
+            user: publicUserRecord(user),
+            embeddingModel: basename(this.embeddingModel),
+            threshold: this.speakerMatchThreshold,
+            samples: [...profile.samples, sample].slice(0, this.profileMaxSamples),
+          }
+          profile.embedding = averageEmbeddings(profile.samples.map(item => item.embedding))
+          store.profiles[profileId] = profile
+          store.updatedAt = sample.createdAt
+          this.writeProfileStore(store)
+          this.writeSegmentEvent('speaker_profile_enrolled', {
+            sourceSegmentId: result.sourceSegmentId,
+            profileId,
+            durationSec: result.durationSec,
+            samples: profile.samples.length,
+            model: basename(this.embeddingModel),
+          })
+          status = 'enrolled'
+        }
+      } catch (err) {
+        status = profile.embedding.length ? 'existing' : 'failed'
+        reason = err.message
+        this.writeSegmentEvent('speaker_profile_enrollment_failed', {
+          sourceSegmentId: result.sourceSegmentId,
+          profileId,
+          error: err.message,
+        })
+      }
+    }
+
+    return {
+      id: profileId,
+      displayName: profile.displayName || this.profileDisplayName,
+      embedding: profile.embedding.length ? profile.embedding : null,
+      threshold: profile.threshold || this.speakerMatchThreshold,
+      publicRecord: compactObject({
+        ...baseRecord,
+        status,
+        reason,
+        samples: profile.samples.length,
+        enrolled: Boolean(profile.embedding.length),
+        updatedAt: profile.updatedAt,
+      }),
+    }
+  }
+
+  async resolveSpeakerForTurn({ turn, turnAudioPath, profile, otherSpeakerLabels }) {
+    const rawId = turn.speaker || 'speaker_00'
+    let profileSimilarity = null
+    let profileMatch = null
+
+    if (profile?.embedding?.length && this.embeddingModelStatus().ok && existsSync(turnAudioPath)) {
+      try {
+        const embedding = await this.computeSpeakerEmbedding(turnAudioPath)
+        profileSimilarity = cosineSimilarity(embedding, profile.embedding)
+        profileMatch = profileSimilarity !== null && profileSimilarity >= (profile.threshold || this.speakerMatchThreshold)
+          ? 'matched'
+          : 'below_threshold'
+      } catch (err) {
+        profileMatch = `embedding_failed:${err.message}`
+      }
+    } else if (profile?.id) {
+      profileMatch = profile?.publicRecord?.reason || 'profile_unavailable'
+    }
+
+    if (profileMatch === 'matched') {
+      return compactObject({
+        id: 'user',
+        rawId,
+        displayName: profile.displayName || this.profileDisplayName,
+        confidence: turn.confidence,
+        matchedProfile: true,
+        profileId: profile.id,
+        profileSimilarity: roundScore(profileSimilarity),
+      })
+    }
+
+    const other = otherSpeakerLabel(rawId, otherSpeakerLabels)
+    return compactObject({
+      id: other.id,
+      rawId,
+      displayName: other.displayName,
+      confidence: turn.confidence,
+      matchedProfile: false,
+      profileId: profile?.id || undefined,
+      profileSimilarity: profileSimilarity === null ? undefined : roundScore(profileSimilarity),
+      profileMatch: profileMatch || undefined,
+    })
+  }
+
+  async computeSpeakerEmbedding(wavPath) {
+    const modelStatus = this.embeddingModelStatus()
+    if (!modelStatus.ok) throw new Error(modelStatus.reason)
+
+    const embedding = this.workerProcess
+      ? await runEmbeddingWorker({
+        wavPath,
+        embeddingModel: this.embeddingModel,
+        numThreads: this.numThreads,
+        timeoutMs: this.workerTimeoutMs,
+      })
+      : runSherpaEmbedding({
+        wavPath,
+        embeddingModel: this.embeddingModel,
+        numThreads: this.numThreads,
+      })
+
+    return normalizeEmbedding(embedding)
+  }
+
+  embeddingModelStatus() {
+    if (!this.embeddingModel) {
+      return { ok: false, reason: 'embedding_model_unconfigured' }
+    }
+    if (!existsSync(this.embeddingModel)) {
+      return { ok: false, reason: `missing_embedding_model:${this.embeddingModel}` }
+    }
+    return { ok: true, reason: '' }
+  }
+
+  readProfileStore() {
+    if (!existsSync(this.profileStorePath)) {
+      return { version: PROFILE_STORE_VERSION, updatedAt: '', profiles: {} }
+    }
+
+    try {
+      const store = JSON.parse(readFileSync(this.profileStorePath, 'utf8'))
+      return {
+        version: PROFILE_STORE_VERSION,
+        updatedAt: stringValue(store.updatedAt),
+        profiles: store.profiles && typeof store.profiles === 'object' ? store.profiles : {},
+      }
+    } catch (err) {
+      this.writeSegmentEvent('speaker_profile_store_unreadable', {
+        profileStore: this.profileStorePath,
+        error: err.message,
+      })
+      return { version: PROFILE_STORE_VERSION, updatedAt: '', profiles: {} }
+    }
+  }
+
+  writeProfileStore(store) {
+    mkdirSync(this.profileDir, { recursive: true })
+    writeFileSync(this.profileStorePath, `${JSON.stringify(store, null, 2)}\n`)
+  }
+
+  enrollmentPathFor(profileId, sampleId) {
+    const dir = join(this.enrollmentDir, safeFilePart(profileId))
+    mkdirSync(dir, { recursive: true })
+    return join(dir, `${safeFilePart(sampleId)}.wav`)
   }
 
   appendJsonl(path, value) {
@@ -654,6 +895,107 @@ export function segmentIdForAudioPath(path) {
 export function segmentIdForPaths(paths) {
   if (typeof paths === 'string') return segmentIdForAudioPath(paths)
   return segmentIdForAudioPath(paths?.wav || paths?.pcm || paths?.txt || '')
+}
+
+export function speakerProfileIdForUser(user) {
+  const uid = stringValue(user?.uid ?? user?.userId ?? user?.id)
+  return uid ? `uid:${uid}` : ''
+}
+
+function normalizeSpeakerProfile(value, defaults = {}) {
+  const profile = value && typeof value === 'object' ? value : {}
+  const samples = Array.isArray(profile.samples)
+    ? profile.samples
+      .map(sample => ({
+        ...sample,
+        embedding: normalizeEmbedding(sample?.embedding),
+      }))
+      .filter(sample => sample.embedding.length)
+    : []
+  const embedding = normalizeEmbedding(profile.embedding)
+
+  return {
+    id: stringValue(profile.id || defaults.profileId),
+    displayName: stringValue(profile.displayName || defaults.displayName),
+    createdAt: stringValue(profile.createdAt),
+    updatedAt: stringValue(profile.updatedAt),
+    user: profile.user && typeof profile.user === 'object' ? profile.user : {},
+    embeddingModel: stringValue(profile.embeddingModel),
+    threshold: finiteNumber(profile.threshold, DEFAULT_SPEAKER_MATCH_THRESHOLD),
+    samples,
+    embedding: embedding.length ? embedding : averageEmbeddings(samples.map(sample => sample.embedding)),
+  }
+}
+
+function publicUserRecord(user) {
+  const uid = stringValue(user?.uid ?? user?.userId ?? user?.id)
+  return compactObject({ uid })
+}
+
+function otherSpeakerLabel(rawId, labels) {
+  const key = stringValue(rawId) || 'speaker_00'
+  if (!labels.has(key)) {
+    const number = labels.size + 1
+    labels.set(key, {
+      id: `other_speaker_${String(number).padStart(2, '0')}`,
+      displayName: `Other speaker ${number}`,
+    })
+  }
+  return labels.get(key)
+}
+
+export function normalizeEmbedding(value) {
+  if (!value) return []
+  return Array.from(value)
+    .map(Number)
+    .filter(Number.isFinite)
+}
+
+export function averageEmbeddings(embeddings) {
+  const valid = embeddings.map(normalizeEmbedding).filter(item => item.length)
+  if (!valid.length) return []
+
+  const dim = valid[0].length
+  const sums = new Array(dim).fill(0)
+  let count = 0
+  for (const embedding of valid) {
+    if (embedding.length !== dim) continue
+    for (let index = 0; index < dim; index += 1) sums[index] += embedding[index]
+    count += 1
+  }
+
+  return count
+    ? sums.map(value => value / count)
+    : []
+}
+
+export function cosineSimilarity(left, right) {
+  const a = normalizeEmbedding(left)
+  const b = normalizeEmbedding(right)
+  if (!a.length || a.length !== b.length) return null
+
+  let dot = 0
+  let aNorm = 0
+  let bNorm = 0
+  for (let index = 0; index < a.length; index += 1) {
+    dot += a[index] * b[index]
+    aNorm += a[index] * a[index]
+    bNorm += b[index] * b[index]
+  }
+
+  const denominator = Math.sqrt(aNorm) * Math.sqrt(bNorm)
+  return denominator > 0 ? dot / denominator : null
+}
+
+function roundScore(value) {
+  return value === null || value === undefined ? null : Math.round(value * 1000) / 1000
+}
+
+function safeFilePart(value) {
+  return String(value || 'unknown')
+    .replace(/[^a-z0-9_.-]+/gi, '_')
+    .replace(/^_+|_+$/g, '')
+    || 'unknown'
 }
 
 function normalizeTurns(rawTurns, durationSec) {
@@ -753,7 +1095,42 @@ export function runSherpaDiarization(job = {}) {
   return normalizeTurns(diarizer.process(wave.samples), finiteNumber(job.durationSec, 0))
 }
 
+export function runSherpaEmbedding(job = {}) {
+  const sherpa = require('sherpa-onnx-node')
+  const extractor = new sherpa.SpeakerEmbeddingExtractor({
+    model: job.embeddingModel,
+    numThreads: positiveInteger(job.numThreads, 1),
+  })
+  const wave = sherpa.readWave(job.wavPath)
+  const stream = extractor.createStream()
+  stream.acceptWaveform({
+    samples: wave.samples,
+    sampleRate: wave.sampleRate,
+  })
+  stream.inputFinished()
+
+  if (!extractor.isReady(stream)) {
+    throw new Error('speaker_embedding_stream_not_ready')
+  }
+
+  return normalizeEmbedding(extractor.compute(stream))
+}
+
 function runDiarizationWorker(job = {}) {
+  return runWorkerJob(
+    { ...job, type: 'diarization' },
+    payload => Array.isArray(payload.turns) ? payload.turns : [],
+  )
+}
+
+function runEmbeddingWorker(job = {}) {
+  return runWorkerJob(
+    { ...job, type: 'embedding' },
+    payload => normalizeEmbedding(payload.embedding),
+  )
+}
+
+function runWorkerJob(job = {}, readPayload) {
   return new Promise((resolvePromise, reject) => {
     const timeoutMs = positiveInteger(job.timeoutMs, 120_000)
     const child = spawn(process.execPath, [workerPath], {
@@ -810,7 +1187,7 @@ function runDiarizationWorker(job = {}) {
         return
       }
 
-      settle(null, Array.isArray(payload.turns) ? payload.turns : [])
+      settle(null, readPayload(payload))
     })
 
     child.stdin.end(JSON.stringify(compactObject(job)))

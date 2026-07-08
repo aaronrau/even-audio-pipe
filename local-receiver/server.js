@@ -65,6 +65,10 @@ const speakerDiarizationConfig = {
   asrModel: process.env.PARAKEET_ONNX_MODEL || 'nemo-parakeet-tdt-0.6b-v3',
   asrWorkerUrl: process.env.SPEAKER_DIARIZATION_ASR_WORKER_URL || asrWorkerUrl,
   asrTimeoutMs: Number(process.env.SPEAKER_DIARIZATION_ASR_TIMEOUT_MS || 60_000),
+  enrollmentEnabled: !isDisabled(process.env.SPEAKER_DIARIZATION_ENROLLMENT_ENABLED ?? '1'),
+  enrollmentMinDurationSec: Number(process.env.SPEAKER_DIARIZATION_ENROLLMENT_MIN_DURATION_SEC || 1.5),
+  profileMaxSamples: Number(process.env.SPEAKER_DIARIZATION_PROFILE_MAX_SAMPLES || 1),
+  speakerMatchThreshold: Number(process.env.SPEAKER_DIARIZATION_MATCH_THRESHOLD || 0.6),
 }
 const diarizationSidecar = createDiarizationSidecar(speakerDiarizationConfig)
 const segmentBytesLimit = segmentSeconds > 0 ? Math.floor(segmentSeconds * bytesPerSecond) : 0
