@@ -331,7 +331,11 @@ test('receiver keeps current audio socket active for the same Even user', async 
     await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
 
     const second = await openSocket(port)
-    const secondClose = waitForClose(second)
+    const standbyStatus = waitForJson(second, message => (
+      message.type === 'receiver_status' &&
+      message.status === 'standby' &&
+      message.reason === 'active_socket_has_audio'
+    ))
     second.send(JSON.stringify({
       type: 'start',
       source: 'g2',
@@ -341,14 +345,14 @@ test('receiver keeps current audio socket active for the same Even user', async 
       user: { id: 'same-user' },
     }))
 
-    const close = await secondClose
-    assert.equal(close.code, 4001)
-    assert.equal(close.reason, 'active audio socket already connected')
-
+    await standbyStatus
     await delay(150)
     assert.equal(first.readyState, WebSocket.OPEN)
+    assert.equal(second.readyState, WebSocket.OPEN)
     assert.match(child.stdoutText, /\[audio\] keeping active socket for uid:same-user/)
+    assert.doesNotMatch(child.stdoutText, /active audio socket already connected/)
     first.close()
+    second.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })
@@ -376,7 +380,6 @@ test('receiver lets newer socket replace zero-audio same-user socket inside star
 
     const second = await openSocket(port)
     await authenticateSharedSecretSocket(second, secret)
-    const firstClose = waitForClose(first)
     const secondPrompt = waitForJson(second, message => message.type === 'onboarding_prompt')
     second.send(JSON.stringify({
       type: 'start',
@@ -387,12 +390,14 @@ test('receiver lets newer socket replace zero-audio same-user socket inside star
       user: { id: 'same-user' },
     }))
 
-    const close = await firstClose
-    assert.equal(close.code, 4001)
-    assert.equal(close.reason, 'newer audio socket active')
     await secondPrompt
-    assert.match(child.stdoutText, /\[audio\] replacing active socket for uid:same-user/)
+    await delay(150)
+    assert.equal(first.readyState, WebSocket.OPEN)
+    assert.equal(second.readyState, WebSocket.OPEN)
+    assert.match(child.stdoutText, /\[audio\] switching active socket for uid:same-user/)
     assert.match(child.stdoutText, /previousBytes=0 previousChunks=0/)
+    assert.doesNotMatch(child.stdoutText, /newer audio socket active/)
+    first.close()
     second.close()
   } finally {
     await stopReceiver(child)
@@ -421,7 +426,6 @@ test('receiver lets newer socket replace weak one-chunk same-user socket', async
     await delay(20)
 
     const second = await openSocket(port)
-    const firstClose = waitForClose(first)
     const secondPrompt = waitForJson(second, message => message.type === 'onboarding_prompt')
     second.send(JSON.stringify({
       type: 'start',
@@ -432,12 +436,13 @@ test('receiver lets newer socket replace weak one-chunk same-user socket', async
       user: { id: 'same-user' },
     }))
 
-    const close = await firstClose
-    assert.equal(close.code, 4001)
-    assert.equal(close.reason, 'newer audio socket active')
     await secondPrompt
-    assert.match(child.stdoutText, /\[audio\] replacing active socket for uid:same-user/)
+    await delay(150)
+    assert.equal(first.readyState, WebSocket.OPEN)
+    assert.equal(second.readyState, WebSocket.OPEN)
+    assert.match(child.stdoutText, /\[audio\] switching active socket for uid:same-user/)
     second.close()
+    first.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })
@@ -463,7 +468,6 @@ test('receiver lets newer socket replace a stale same-user socket before audio s
     await delay(20)
 
     const second = await openSocket(port)
-    const firstClose = waitForClose(first)
     const secondPrompt = waitForJson(second, message => message.type === 'onboarding_prompt')
     second.send(JSON.stringify({
       type: 'start',
@@ -474,12 +478,13 @@ test('receiver lets newer socket replace a stale same-user socket before audio s
       user: { id: 'same-user' },
     }))
 
-    const close = await firstClose
-    assert.equal(close.code, 4001)
-    assert.equal(close.reason, 'newer audio socket active')
     await secondPrompt
-    assert.match(child.stdoutText, /\[audio\] replacing active socket for uid:same-user/)
+    await delay(150)
+    assert.equal(first.readyState, WebSocket.OPEN)
+    assert.equal(second.readyState, WebSocket.OPEN)
+    assert.match(child.stdoutText, /\[audio\] switching active socket for uid:same-user/)
     second.close()
+    first.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })

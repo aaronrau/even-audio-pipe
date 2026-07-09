@@ -1341,39 +1341,37 @@ function hasProtectedAudioActivity(activity) {
 }
 
 function promoteActiveAudioSocket(socket, key, context = {}) {
-  if (!key) return { accepted: true, key: '' }
+  if (!key) return { accepted: true, key: '', standby: false }
 
   const previous = activeAudioSocketsByUser.get(key)
-  if (previous === socket) return { accepted: true, key }
+  if (previous === socket) return { accepted: true, key, standby: false }
 
   if (previous && previous.readyState === WebSocket.OPEN && shouldKeepActiveAudioSocket(previous)) {
     console.log(
-      `[audio] keeping active socket for ${key}${context.connectionStamp ? `; closing duplicate stamp=${context.connectionStamp}` : ''}; ${audioActivitySummary(previous)}`,
+      `[audio] keeping active socket for ${key}${context.connectionStamp ? `; standby duplicate stamp=${context.connectionStamp}` : ''}; ${audioActivitySummary(previous)}`,
     )
     sendSocketJson(socket, {
       type: 'receiver_status',
-      status: 'duplicate',
-      reason: 'active_socket_connected',
+      status: 'standby',
+      reason: 'active_socket_has_audio',
     })
-    socket.close(4001, 'active audio socket already connected')
-    return { accepted: false, key: '' }
+    return { accepted: true, key, standby: true }
   }
 
   activeAudioSocketsByUser.set(key, socket)
 
   if (previous && previous.readyState === WebSocket.OPEN) {
     console.log(
-      `[audio] replacing active socket for ${key}${context.connectionStamp ? ` with stamp=${context.connectionStamp}` : ''}; ${audioActivitySummary(previous)}`,
+      `[audio] switching active socket for ${key}${context.connectionStamp ? ` to stamp=${context.connectionStamp}` : ''}; keeping previous open; ${audioActivitySummary(previous)}`,
     )
     sendSocketJson(previous, {
       type: 'receiver_status',
-      status: 'replaced',
+      status: 'standby',
       reason: 'newer_socket_active',
     })
-    previous.close(4001, 'newer audio socket active')
   }
 
-  return { accepted: true, key }
+  return { accepted: true, key, standby: false }
 }
 
 function audioActivitySummary(socket) {
@@ -1389,6 +1387,28 @@ function audioActivitySummary(socket) {
     `previousStartedAge=${startedAge}`,
     `previousLastAudioAge=${lastAudioAge}`,
   ].join(' ')
+}
+
+function promoteAudioSocketForChunk(socket, user) {
+  const key = activeAudioSocketKey(user)
+  if (!key) return
+
+  const previous = activeAudioSocketsByUser.get(key)
+  if (previous === socket) return
+
+  activeAudioSocketsByUser.set(key, socket)
+  if (previous && previous.readyState === WebSocket.OPEN) {
+    console.log(
+      `[audio] switching active socket for ${key} on audio chunk; keeping previous open; ${audioActivitySummary(previous)}`,
+    )
+    sendSocketJson(previous, {
+      type: 'receiver_status',
+      status: 'standby',
+      reason: 'audio_received_on_another_socket',
+    })
+  } else {
+    console.log(`[audio] active socket for ${key} selected on audio chunk; ${socketDebugLabel(socket)}`)
+  }
 }
 
 function clearActiveAudioSocket(socket, key) {
@@ -2419,10 +2439,15 @@ wss.on('connection', (socket, req) => {
         }, {
           auth: 'user_accepted',
           activeKey: activeAudioSocketKeyForConnection,
+          standby: activeAudioSocketPromotion.standby,
         })
-        console.log(`[audio] start accepted stamp=${connectionStamp} activeKey=${activeAudioSocketKeyForConnection || 'none'} user=${userLabel(evenUser)}`)
-        sendOnboardingPrompt()
-        flushPreStartAudio()
+        console.log(
+          `[audio] start accepted stamp=${connectionStamp} activeKey=${activeAudioSocketKeyForConnection || 'none'} user=${userLabel(evenUser)} standby=${activeAudioSocketPromotion.standby}`,
+        )
+        if (!activeAudioSocketPromotion.standby) {
+          sendOnboardingPrompt()
+          flushPreStartAudio()
+        }
       }
       if (control?.type === 'get_message_history') {
         sendMessageHistory(socket)
@@ -2463,6 +2488,7 @@ wss.on('connection', (socket, req) => {
       userAuthenticated = true
     }
 
+    promoteAudioSocketForChunk(socket, evenUser)
     handleAudioChunk(chunk)
   })
 
