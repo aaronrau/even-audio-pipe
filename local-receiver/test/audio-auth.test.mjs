@@ -248,6 +248,10 @@ async function waitForOutput(child, predicate) {
   throw new Error(`timed out waiting for receiver output: ${child.stdoutText}`)
 }
 
+function countOccurrences(value, pattern) {
+  return (value.match(pattern) || []).length
+}
+
 test('receiver sends onboarding prompt after app start and logs audio stream', async () => {
   const { child, dir, port } = await startReceiver()
 
@@ -644,6 +648,55 @@ test('shared-secret websocket auth accepts a valid HMAC proof', async () => {
     ))
     assert.equal(accepted.mode, 'shared-secret')
     ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver handles repeated authenticated audio reconnect cycles', async () => {
+  const secret = 'local-test-secret'
+  const { child, dir, port } = await startReceiver({
+    EVEN_AUDIO_PIPE_TOKEN: '',
+    EVEN_AUDIO_PIPE_TOKEN_SECRET: secret,
+  })
+
+  try {
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      const ws = await openSocket(port)
+      const challenge = await waitForJson(ws, message => message.type === 'auth_challenge')
+      ws.send(JSON.stringify({
+        type: 'auth',
+        nonce: challenge.nonce,
+        proof: authProof(secret, challenge.nonce),
+        algorithm: 'hmac-sha256',
+      }))
+      await waitForJson(ws, message => (
+        message.type === 'auth_status' &&
+        message.status === 'accepted' &&
+        message.transport === true
+      ))
+      ws.send(JSON.stringify({
+        type: 'start',
+        source: 'g2',
+        encoding: 'pcm_s16le',
+        sampleRate: 16000,
+        channels: 1,
+        user: { id: 'cycle-user' },
+      }))
+      await waitForJson(ws, message => message.type === 'onboarding_prompt')
+      ws.send(Buffer.alloc(320))
+      await waitForOutput(child, output => (
+        countOccurrences(output, /\[audio\] stream started: receiving G2 mic chunks/g) >= cycle + 1
+      ))
+      const closed = waitForClose(ws)
+      ws.close()
+      await closed
+      await delay(25)
+    }
+
+    assert.doesNotMatch(child.stderrText, /shared-secret auth timed out/)
+    assert.doesNotMatch(child.stdoutText, /active audio socket already connected|newer audio socket active/)
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })

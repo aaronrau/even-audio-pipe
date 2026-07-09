@@ -1553,21 +1553,24 @@ function connect() {
   backendIdleFrame = ''
   setStats()
   audioStreamStarted = false
-  ws = new WebSocket(endpoint.url)
-  ws.binaryType = 'arraybuffer'
+  const connectingSocket = new WebSocket(endpoint.url)
+  ws = connectingSocket
+  connectingSocket.binaryType = 'arraybuffer'
   let opened = false
   let connectTimedOut = false
   const connectTimeout = window.setTimeout(() => {
     if (opened || ws !== connectingSocket) return
     connectTimedOut = true
     setUiStatus(`${endpoint.label} receiver timed out`)
-    ws.close()
+    connectingSocket.close()
   }, CONNECT_TIMEOUT_MS)
-  const connectingSocket = ws
 
-  ws.addEventListener('open', async () => {
-    if (!ws) return
+  connectingSocket.addEventListener('open', async () => {
     window.clearTimeout(connectTimeout)
+    if (ws !== connectingSocket) {
+      connectingSocket.close()
+      return
+    }
     opened = true
     receiverState = 'open'
     lastReceiverClose = ''
@@ -1579,14 +1582,16 @@ function connect() {
     await startAudioStream()
   })
 
-  ws.addEventListener('message', event => {
+  connectingSocket.addEventListener('message', event => {
+    if (ws !== connectingSocket) return
     if (typeof event.data === 'string') {
       handleReceiverMessage(event.data)
     }
   })
 
-  ws.addEventListener('close', async event => {
+  connectingSocket.addEventListener('close', async event => {
     window.clearTimeout(connectTimeout)
+    if (ws !== connectingSocket) return
     ws = null
     receiverState = 'closed'
     backendIdleFrame = ''
@@ -1608,8 +1613,9 @@ function connect() {
     }
   })
 
-  ws.addEventListener('error', () => {
+  connectingSocket.addEventListener('error', () => {
     window.clearTimeout(connectTimeout)
+    if (ws !== connectingSocket) return
     receiverState = 'error'
     backendIdleFrame = ''
     setStats()
