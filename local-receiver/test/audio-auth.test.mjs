@@ -138,12 +138,12 @@ function openSocket(port) {
   })
 }
 
-function waitForJson(ws, predicate) {
+function waitForJson(ws, predicate, timeoutMs = 2_000) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup()
       reject(new Error('timed out waiting for websocket message'))
-    }, 2_000)
+    }, timeoutMs)
 
     function cleanup() {
       clearTimeout(timeout)
@@ -252,6 +252,27 @@ function countOccurrences(value, pattern) {
   return (value.match(pattern) || []).length
 }
 
+function sendAudioChunks(ws, count, bytes = 3200) {
+  for (let index = 0; index < count; index += 1) {
+    ws.send(Buffer.alloc(bytes, 1))
+  }
+}
+
+async function authenticateSharedSecretSocket(ws, secret) {
+  const challenge = await waitForJson(ws, message => message.type === 'auth_challenge')
+  ws.send(JSON.stringify({
+    type: 'auth',
+    nonce: challenge.nonce,
+    proof: authProof(secret, challenge.nonce),
+    algorithm: 'hmac-sha256',
+  }))
+  await waitForJson(ws, message => (
+    message.type === 'auth_status' &&
+    message.status === 'accepted' &&
+    message.transport === true
+  ))
+}
+
 test('receiver sends onboarding prompt after app start and logs audio stream', async () => {
   const { child, dir, port } = await startReceiver()
 
@@ -306,7 +327,7 @@ test('receiver keeps current audio socket active for the same Even user', async 
       user: { id: 'same-user' },
     }))
     await waitForJson(first, message => message.type === 'onboarding_prompt')
-    first.send(Buffer.alloc(320))
+    sendAudioChunks(first, 6)
     await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
 
     const second = await openSocket(port)
@@ -328,6 +349,50 @@ test('receiver keeps current audio socket active for the same Even user', async 
     assert.equal(first.readyState, WebSocket.OPEN)
     assert.match(child.stdoutText, /\[audio\] keeping active socket for uid:same-user/)
     first.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver lets newer socket replace weak one-chunk same-user socket', async () => {
+  const { child, dir, port } = await startReceiver({
+    RECEIVER_ACTIVE_AUDIO_SOCKET_START_GRACE_MS: '1',
+  })
+
+  try {
+    const first = await openSocket(port)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    first.send(Buffer.alloc(1600, 1))
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+    await delay(20)
+
+    const second = await openSocket(port)
+    const firstClose = waitForClose(first)
+    const secondPrompt = waitForJson(second, message => message.type === 'onboarding_prompt')
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+
+    const close = await firstClose
+    assert.equal(close.code, 4001)
+    assert.equal(close.reason, 'newer audio socket active')
+    await secondPrompt
+    assert.match(child.stdoutText, /\[audio\] replacing active socket for uid:same-user/)
+    second.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })
@@ -739,6 +804,58 @@ test('receiver buffers audio that arrives after auth before start', async () => 
     assert.doesNotMatch(child.stderrText, /rejected audio before Even user start message/)
     assert.equal(ws.readyState, WebSocket.OPEN)
     ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver delivers transcript from closed socket audio to current user socket', async () => {
+  const secret = 'local-test-secret'
+  const { child, dir, port } = await startReceiver({
+    ASR_COMMAND: "printf 'simulated transcript'",
+    ASR_CHUNK_MODE: 'fixed',
+    MIN_ASR_BYTES: '1',
+    TRANSCRIPT_QUEUE_IDLE_MS: '500',
+    TRANSCRIPT_CLEANUP_ENABLED: '0',
+    EVEN_AUDIO_PIPE_TOKEN: '',
+    EVEN_AUDIO_PIPE_TOKEN_SECRET: secret,
+  })
+
+  try {
+    const first = await openSocket(port)
+    await authenticateSharedSecretSocket(first, secret)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'reroute-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    sendAudioChunks(first, 3)
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+    const firstClosed = waitForClose(first)
+    first.close()
+    await firstClosed
+
+    const second = await openSocket(port)
+    await authenticateSharedSecretSocket(second, secret)
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'reroute-user' },
+    }))
+    await waitForJson(second, message => message.type === 'onboarding_prompt')
+
+    const transcript = await waitForJson(second, message => message.type === 'transcript', 5_000)
+    assert.equal(transcript.text, 'simulated transcript')
+    assert.match(child.stdoutText, /\[thin-client\] rerouting send/)
+    second.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })

@@ -99,6 +99,8 @@ const receiverStalledAudioCloseMs = Number(process.env.RECEIVER_STALLED_AUDIO_CL
 const receiverPreStartAudioBufferMs = Number(process.env.RECEIVER_PRE_START_AUDIO_BUFFER_MS || 1_000)
 const activeAudioSocketProtectMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_PROTECT_MS || 10_000)
 const activeAudioSocketStartGraceMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_START_GRACE_MS || 1_000)
+const activeAudioSocketMinProtectChunks = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_MIN_PROTECT_CHUNKS || 5)
+const activeAudioSocketMinProtectBytes = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_MIN_PROTECT_BYTES || 16_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const messageHistoryDirPath = resolve(process.env.MESSAGE_HISTORY_DIR || join(transcriptDirPath, 'message-history'))
 const messageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || 0)
@@ -144,7 +146,8 @@ const audioSockets = new Set()
 const activeAudioSocketsByUser = new Map()
 const audioSocketActivity = new WeakMap()
 let diarizationDispatchQueue = Promise.resolve()
-const transcriptQueues = new WeakMap()
+const transcriptQueuesBySocket = new WeakMap()
+const transcriptQueuesByUser = new Map()
 const activeWorkbenchAgents = new Map()
 const recentWorkbenchSummaries = new Map()
 let sileroVad = null
@@ -305,6 +308,7 @@ function socketDebugLabel(socket) {
   const activity = audioSocketActivity.get(socket)
   return [
     `socket=${activity?.connectionStamp || 'unknown'}`,
+    `attempt=${activity?.connectionAttempt || 'none'}`,
     `readyState=${socketReadyStateName(socket.readyState)}`,
   ].join(' ')
 }
@@ -1309,7 +1313,11 @@ function shouldKeepActiveAudioSocket(socket, now = Date.now()) {
   const activity = audioSocketActivity.get(socket)
   if (!activity) return false
 
-  if (activity.lastAudioAt && now - activity.lastAudioAt <= activeAudioSocketProtectMs) {
+  if (
+    activity.lastAudioAt &&
+    now - activity.lastAudioAt <= activeAudioSocketProtectMs &&
+    hasProtectedAudioActivity(activity)
+  ) {
     return true
   }
 
@@ -1317,6 +1325,17 @@ function shouldKeepActiveAudioSocket(socket, now = Date.now()) {
     activeAudioSocketStartGraceMs > 0 &&
     activity.startedAt &&
     now - activity.startedAt <= activeAudioSocketStartGraceMs,
+  )
+}
+
+function hasProtectedAudioActivity(activity) {
+  const minChunks = Math.max(0, activeAudioSocketMinProtectChunks)
+  const minBytes = Math.max(0, activeAudioSocketMinProtectBytes)
+  if (minChunks <= 0 && minBytes <= 0) return true
+
+  return Boolean(
+    (minChunks > 0 && Number(activity.chunks || 0) >= minChunks) ||
+    (minBytes > 0 && Number(activity.bytes || 0) >= minBytes),
   )
 }
 
@@ -1601,27 +1620,46 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
   }
 }
 
-function getTranscriptQueue(targetSocket) {
+function getTranscriptQueue(targetSocket, user = null) {
+  const key = transcriptQueueKey(targetSocket, user)
+  if (key) {
+    let queue = transcriptQueuesByUser.get(key)
+    if (!queue) {
+      queue = createTranscriptQueue()
+      transcriptQueuesByUser.set(key, queue)
+    }
+    return queue
+  }
+
   if (!targetSocket || typeof targetSocket !== 'object') return null
 
-  let queue = transcriptQueues.get(targetSocket)
+  let queue = transcriptQueuesBySocket.get(targetSocket)
   if (!queue) {
-    queue = {
-      items: [],
-      timer: null,
-      flushPromise: Promise.resolve(),
-      activeSegments: 0,
-      pendingAsrJobs: 0,
-      lastTranscriptAt: 0,
-      lastActivityAt: 0,
-    }
-    transcriptQueues.set(targetSocket, queue)
+    queue = createTranscriptQueue()
+    transcriptQueuesBySocket.set(targetSocket, queue)
   }
   return queue
 }
 
+function createTranscriptQueue() {
+  return {
+    items: [],
+    timer: null,
+    flushPromise: Promise.resolve(),
+    activeSegments: 0,
+    pendingAsrJobs: 0,
+    lastTranscriptAt: 0,
+    lastActivityAt: 0,
+  }
+}
+
+function transcriptQueueKey(targetSocket, user = null) {
+  const activity = targetSocket ? audioSocketActivity.get(targetSocket) : null
+  return activeAudioSocketKey(user || activity?.user)
+}
+
 function markTranscriptQueueActivity(targetSocket) {
-  const queue = targetSocket ? transcriptQueues.get(targetSocket) : null
+  const queue = targetSocket ? getTranscriptQueue(targetSocket) : null
   if (!markQueuedTranscriptActivity(queue)) return
   if (!transcriptQueueMaxHoldReached(queue)) scheduleTranscriptQueueFlush(targetSocket)
 }
@@ -1643,25 +1681,25 @@ function markAudioSegmentFinished(targetSocket) {
   scheduleTranscriptQueueFlush(targetSocket)
 }
 
-function markAsrJobQueued(targetSocket) {
-  const queue = getTranscriptQueue(targetSocket)
+function markAsrJobQueued(targetSocket, user = null) {
+  const queue = getTranscriptQueue(targetSocket, user)
   if (!queue) return
 
   queue.pendingAsrJobs += 1
   markTranscriptQueueActivity(targetSocket)
 }
 
-function markAsrJobFinished(targetSocket) {
-  const queue = getTranscriptQueue(targetSocket)
+function markAsrJobFinished(targetSocket, user = null) {
+  const queue = getTranscriptQueue(targetSocket, user)
   if (!queue) return
 
   queue.pendingAsrJobs = Math.max(0, queue.pendingAsrJobs - 1)
   markTranscriptQueueActivity(targetSocket)
-  scheduleTranscriptQueueFlush(targetSocket)
+  scheduleTranscriptQueueFlush(targetSocket, null, user)
 }
 
 function enqueueRawTranscript(item) {
-  const queue = getTranscriptQueue(item.targetSocket)
+  const queue = getTranscriptQueue(item.targetSocket, item.user)
   if (!queue) {
     flushRawTranscriptBatch([item]).catch(err => {
       console.error(`[transcript-queue] failed to flush fallback batch: ${err.message}`)
@@ -1672,7 +1710,7 @@ function enqueueRawTranscript(item) {
   queue.items.push(item)
   queue.lastTranscriptAt = Date.now()
   queue.lastActivityAt = queue.lastTranscriptAt
-  scheduleTranscriptQueueFlush(item.targetSocket)
+  scheduleTranscriptQueueFlush(item.targetSocket, null, item.user)
   const queuedText = combineQueuedTranscripts(queue.items.map(queueItem => queueItem.rawTranscript))
 
   logThinClientSendForUser(item.targetSocket, item.user, {
@@ -1698,8 +1736,8 @@ function enqueueRawTranscript(item) {
   )
 }
 
-function scheduleTranscriptQueueFlush(targetSocket, retryMs = null) {
-  const queue = getTranscriptQueue(targetSocket)
+function scheduleTranscriptQueueFlush(targetSocket, retryMs = null, user = null) {
+  const queue = getTranscriptQueue(targetSocket, user)
   if (!queue || !queue.items.length) return
 
   if (queue.timer) clearTimeout(queue.timer)
@@ -1712,13 +1750,13 @@ function scheduleTranscriptQueueFlush(targetSocket, retryMs = null) {
     queue.timer = null
     queue.flushPromise = queue.flushPromise
       .catch(() => {})
-      .then(() => flushTranscriptQueue(targetSocket))
+      .then(() => flushTranscriptQueue(targetSocket, user))
   }, waitMs)
   queue.timer.unref?.()
 }
 
-async function flushTranscriptQueue(targetSocket) {
-  const queue = getTranscriptQueue(targetSocket)
+async function flushTranscriptQueue(targetSocket, user = null) {
+  const queue = getTranscriptQueue(targetSocket, user)
   if (!queue || !queue.items.length) return
 
   const maxHoldReached = transcriptQueueMaxHoldReached(queue)
@@ -1908,7 +1946,7 @@ function enqueueRecording(paths, bytes, reason, targetSocket, user) {
   console.log(
     `[asr] request queued job=${jobId} reason=${reason} bytes=${bytes} pcm=${paths.pcm} ${socketDebugLabel(targetSocket)} user=${userLabel(user)}`,
   )
-  markAsrJobQueued(targetSocket)
+  markAsrJobQueued(targetSocket, user)
 
   asrQueue = asrQueue
     .catch(() => {})
@@ -1921,7 +1959,7 @@ function enqueueRecording(paths, bytes, reason, targetSocket, user) {
       console.error(`[asr] job ${jobId} failed: ${err.message}`)
     })
     .finally(() => {
-      markAsrJobFinished(targetSocket)
+      markAsrJobFinished(targetSocket, user)
     })
 }
 
@@ -2030,10 +2068,19 @@ async function resetSileroVadState() {
 wss.on('connection', (socket, req) => {
   audioSockets.add(socket)
   const connectionStamp = stamp()
+  const connectionUrl = new URL(req.url || '/', 'http://localhost')
+  const clientSessionId = stringValue(connectionUrl.searchParams.get('clientSessionId'))
+  const connectionAttempt = stringValue(connectionUrl.searchParams.get('connectionAttempt'))
   const socketActivity = {
     connectionStamp,
+    clientSessionId,
+    connectionAttempt,
     startedAt: 0,
+    firstAudioAt: 0,
     lastAudioAt: 0,
+    bytes: 0,
+    chunks: 0,
+    user: null,
   }
   audioSocketActivity.set(socket, socketActivity)
   const transportAuth = req.audioTransportAuth || {
@@ -2082,7 +2129,9 @@ wss.on('connection', (socket, req) => {
     })
     : null
 
-  console.log(`[audio] connected: stamp=${connectionStamp} remote=${req.socket.remoteAddress || 'unknown'}`)
+  console.log(
+    `[audio] connected: stamp=${connectionStamp} remote=${req.socket.remoteAddress || 'unknown'} clientSessionId=${clientSessionId || 'none'} connectionAttempt=${connectionAttempt || 'none'}`,
+  )
   const idleTimer = setInterval(() => {
     if (socket.readyState !== WebSocket.OPEN) return
 
@@ -2235,7 +2284,10 @@ wss.on('connection', (socket, req) => {
     chunks += 1
     bytes += chunk.byteLength
     lastAudioAt = Date.now()
+    if (!socketActivity.firstAudioAt) socketActivity.firstAudioAt = lastAudioAt
     socketActivity.lastAudioAt = lastAudioAt
+    socketActivity.bytes = bytes
+    socketActivity.chunks = chunks
     idleLogged = false
     stalledAudioCloseRequested = false
     idleIndicatorEnabled = true
@@ -2311,7 +2363,10 @@ wss.on('connection', (socket, req) => {
           return
         }
         evenUser = normalizeUser(control.user)
-        console.log(`[audio] start received stamp=${connectionStamp} user=${userLabel(evenUser)} source=${stringValue(control.source) || 'unknown'} ${socketDebugLabel(socket)}`)
+        socketActivity.user = evenUser
+        console.log(
+          `[audio] start received stamp=${connectionStamp} user=${userLabel(evenUser)} source=${stringValue(control.source) || 'unknown'} clientSessionId=${stringValue(control.clientSessionId) || clientSessionId || 'none'} connectionAttempt=${stringValue(control.connectionAttempt) || connectionAttempt || 'none'} ${socketDebugLabel(socket)}`,
+        )
         const auth = currentUserAuthConfig()
 
         if (auth.required && !isAllowedUser(evenUser, auth)) {

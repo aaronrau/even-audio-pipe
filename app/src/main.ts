@@ -82,10 +82,18 @@ let lastStatusContainerUpgradeAt = 0
 let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
-let audioStreamStarted = false
+const startedAudioSockets = new WeakSet<WebSocket>()
+const socketConnectionAttempts = new WeakMap<WebSocket, number>()
+const micWatchdogState = new WeakMap<WebSocket, {
+  baselineChunks: number
+  restarted: boolean
+}>()
+let micWatchdogTimer: number | null = null
+let micWatchdogSocket: WebSocket | null = null
 let receiverState = 'disconnected'
 let lastReceiverClose = ''
 let reconnectTimer: number | null = null
+let connectionAttempt = 0
 let audioEndpointSettings = blankAudioEndpointSettings()
 let audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings)
 let audioEndpointIndex = 0
@@ -105,6 +113,10 @@ const GLASSES_MAX_LINES = 7
 const GLASSES_TEXT_LIMIT = GLASSES_LINE_WIDTH * GLASSES_MAX_LINES
 const TRANSCRIPT_CLEAR_MS = 12_000
 const SPEECH_DISPATCH_CLEAR_MS = 2_000
+const MIC_WATCHDOG_MS = 3_000
+const MIC_WATCHDOG_RESTART_DELAY_MS = 250
+const MIC_WATCHDOG_MIN_CHUNKS = 3
+const clientSessionId = createClientSessionId()
 const SPEECH_WAVEFORM_FRAMES = [
   '  |  ',
   ' ||| ',
@@ -183,6 +195,22 @@ function setStats() {
 function launchToken() {
   const params = new URLSearchParams(window.location.search)
   return params.get('t') || params.get('token') || ''
+}
+
+function createClientSessionId() {
+  if (typeof window.crypto?.randomUUID === 'function') return window.crypto.randomUUID()
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+function withClientConnectionParams(url: string, attempt: number) {
+  try {
+    const parsed = new URL(url)
+    parsed.searchParams.set('clientSessionId', clientSessionId)
+    parsed.searchParams.set('connectionAttempt', String(attempt))
+    return parsed.toString()
+  } catch {
+    return url
+  }
 }
 
 function currentSharedSecret() {
@@ -1057,7 +1085,7 @@ function startIdleSpinner() {
   }, SPINNER_INTERVAL_MS)
 }
 
-function handleReceiverMessage(raw: string) {
+function handleReceiverMessage(socket: WebSocket, raw: string) {
   let message: unknown
   try {
     message = JSON.parse(raw)
@@ -1069,7 +1097,7 @@ function handleReceiverMessage(raw: string) {
   const payload = message as Record<string, unknown>
 
   if (payload.type === 'auth_challenge' && typeof payload.nonce === 'string') {
-    void answerAuthChallenge(payload.nonce)
+    void answerAuthChallenge(socket, payload.nonce)
     return
   }
 
@@ -1287,7 +1315,7 @@ function handleReceiverMessage(raw: string) {
 
   if (payload.type === 'auth_status') {
     if (payload.status === 'accepted') {
-      void startAudioStream()
+      void startAudioStream(socket)
     } else if (payload.status === 'rejected') {
       setUiStatus('Authentication rejected')
     }
@@ -1295,18 +1323,19 @@ function handleReceiverMessage(raw: string) {
   }
 }
 
-async function answerAuthChallenge(nonce: string) {
+async function answerAuthChallenge(socket: WebSocket, nonce: string) {
   const secret = currentSharedSecret()
   if (!secret) {
     setUiStatus('Missing shared secret')
     return
   }
 
-  if (!ws || ws.readyState !== WebSocket.OPEN) return
+  if (socket !== ws || socket.readyState !== WebSocket.OPEN) return
 
   try {
     const proof = await sharedSecretProof(secret, nonce)
-    ws.send(JSON.stringify({
+    if (socket !== ws || socket.readyState !== WebSocket.OPEN) return
+    socket.send(JSON.stringify({
       type: 'auth',
       nonce,
       proof,
@@ -1489,23 +1518,27 @@ if (created !== 0) {
   throw new Error(`createStartUpPageContainer failed: ${created}`)
 }
 
-async function startAudioStream() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || audioStreamStarted) return
-  audioStreamStarted = true
+async function startAudioStream(socket: WebSocket) {
+  if (socket !== ws || socket.readyState !== WebSocket.OPEN || startedAudioSockets.has(socket)) return
+  startedAudioSockets.add(socket)
   const endpoint = currentAudioEndpoint()
+  const attempt = socketConnectionAttempts.get(socket) || 0
   const startMessage: Record<string, unknown> = {
     type: 'start',
     source: 'g2',
     encoding: 'pcm_s16le',
     sampleRate: 16000,
     channels: 1,
+    clientSessionId,
+    connectionAttempt: attempt,
   }
 
   if (evenUserInfo) {
     startMessage.user = evenUserInfo
   }
 
-  ws.send(JSON.stringify(startMessage))
+  socket.send(JSON.stringify(startMessage))
+  scheduleMicWatchdog(socket, { baselineChunks: sentChunks, restarted: false })
   await setAudio(true)
   if (!backendStartupPrompt) {
     setUiStatus(`Streaming G2 mic audio${endpoint ? ` via ${endpoint.label}` : ''}`)
@@ -1532,6 +1565,76 @@ async function setAudio(open: boolean) {
   }
 }
 
+function delayMs(ms: number) {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+async function restartAudioControl(reason: string) {
+  console.warn(`Restarting G2 audio: ${reason}`)
+  setUiStatus('Restarting mic audio...')
+  try {
+    audioOpen = false
+    setStats()
+    await bridge.audioControl(false)
+    await delayMs(MIC_WATCHDOG_RESTART_DELAY_MS)
+    audioOpen = true
+    setStats()
+    await bridge.audioControl(true)
+  } catch (err) {
+    audioOpen = false
+    setStats()
+    setUiStatus('Mic restart failed')
+    console.error(err)
+  }
+}
+
+function clearMicWatchdog(socket?: WebSocket) {
+  if (socket && micWatchdogSocket && socket !== micWatchdogSocket) return
+  if (micWatchdogTimer !== null) window.clearTimeout(micWatchdogTimer)
+  micWatchdogTimer = null
+  micWatchdogSocket = null
+}
+
+function scheduleMicWatchdog(socket: WebSocket, state: { baselineChunks: number; restarted: boolean }) {
+  if (socket !== ws || socket.readyState !== WebSocket.OPEN) return
+  micWatchdogState.set(socket, state)
+  clearMicWatchdog()
+  micWatchdogSocket = socket
+  micWatchdogTimer = window.setTimeout(() => {
+    micWatchdogTimer = null
+    micWatchdogSocket = null
+    void checkMicWatchdog(socket)
+  }, MIC_WATCHDOG_MS)
+}
+
+async function checkMicWatchdog(socket: WebSocket) {
+  const state = micWatchdogState.get(socket)
+  if (!state || socket !== ws || socket.readyState !== WebSocket.OPEN) return
+
+  const newChunks = sentChunks - state.baselineChunks
+  if (newChunks >= MIC_WATCHDOG_MIN_CHUNKS) return
+
+  if (!state.restarted) {
+    await restartAudioControl(`only ${newChunks} chunk(s) after websocket start`)
+    if (socket === ws && socket.readyState === WebSocket.OPEN) {
+      scheduleMicWatchdog(socket, { baselineChunks: sentChunks, restarted: true })
+    }
+    return
+  }
+
+  setUiStatus('Mic audio stalled, reconnecting...')
+  socket.close(4003, 'mic audio not flowing')
+}
+
+function markAudioChunkSent(socket: WebSocket, byteLength: number) {
+  sentChunks += 1
+  sentBytes += byteLength
+  const state = micWatchdogState.get(socket)
+  if (state && sentChunks - state.baselineChunks >= MIC_WATCHDOG_MIN_CHUNKS) {
+    clearMicWatchdog(socket)
+  }
+}
+
 function scheduleReconnect() {
   if (cleanedUp || reconnectTimer !== null || audioWsEndpoints.length === 0) return
   reconnectTimer = window.setTimeout(() => {
@@ -1552,9 +1655,12 @@ function connect() {
   receiverState = 'connecting'
   backendIdleFrame = ''
   setStats()
-  audioStreamStarted = false
-  const connectingSocket = new WebSocket(endpoint.url)
+  const attempt = connectionAttempt + 1
+  connectionAttempt = attempt
+  const socketUrl = withClientConnectionParams(endpoint.url, attempt)
+  const connectingSocket = new WebSocket(socketUrl)
   ws = connectingSocket
+  socketConnectionAttempts.set(connectingSocket, attempt)
   connectingSocket.binaryType = 'arraybuffer'
   let opened = false
   let connectTimedOut = false
@@ -1579,13 +1685,13 @@ function connect() {
       setUiStatus(`Authenticating ${endpoint.label} receiver...`)
       return
     }
-    await startAudioStream()
+    await startAudioStream(connectingSocket)
   })
 
   connectingSocket.addEventListener('message', event => {
     if (ws !== connectingSocket) return
     if (typeof event.data === 'string') {
-      handleReceiverMessage(event.data)
+      handleReceiverMessage(connectingSocket, event.data)
     }
   })
 
@@ -1593,6 +1699,7 @@ function connect() {
     window.clearTimeout(connectTimeout)
     if (ws !== connectingSocket) return
     ws = null
+    clearMicWatchdog(connectingSocket)
     receiverState = 'closed'
     backendIdleFrame = ''
     lastReceiverClose = `${event.code}${event.reason ? ` ${event.reason}` : ''}${event.wasClean ? ' clean' : ' unclean'}`
@@ -1631,6 +1738,7 @@ function cleanup() {
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
   if (clearTranscriptTimer !== null) window.clearTimeout(clearTranscriptTimer)
   if (spinnerTimer !== null) window.clearInterval(spinnerTimer)
+  clearMicWatchdog()
   reconnectTimer = null
   clearTranscriptTimer = null
   spinnerTimer = null
@@ -1644,10 +1752,10 @@ function cleanup() {
 unsubscribe = bridge.onEvenHubEvent(event => {
   const pcm = normalizePcm(event.audioEvent?.audioPcm)
   if (pcm) {
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(pcm)
-      sentChunks += 1
-      sentBytes += pcm.byteLength
+    const currentSocket = ws
+    if (currentSocket?.readyState === WebSocket.OPEN) {
+      currentSocket.send(pcm)
+      markAudioChunkSent(currentSocket, pcm.byteLength)
       if (sentChunks % 10 === 0) {
         setStats()
         void renderGlassesStatus()
