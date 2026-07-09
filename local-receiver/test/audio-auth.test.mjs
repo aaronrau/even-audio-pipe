@@ -703,6 +703,48 @@ test('receiver handles repeated authenticated audio reconnect cycles', async () 
   }
 })
 
+test('receiver buffers audio that arrives after auth before start', async () => {
+  const secret = 'local-test-secret'
+  const { child, dir, port } = await startReceiver({
+    EVEN_AUDIO_PIPE_TOKEN: '',
+    EVEN_AUDIO_PIPE_TOKEN_SECRET: secret,
+  })
+
+  try {
+    const ws = await openSocket(port)
+    const challenge = await waitForJson(ws, message => message.type === 'auth_challenge')
+    ws.send(JSON.stringify({
+      type: 'auth',
+      nonce: challenge.nonce,
+      proof: authProof(secret, challenge.nonce),
+      algorithm: 'hmac-sha256',
+    }))
+    await waitForJson(ws, message => (
+      message.type === 'auth_status' &&
+      message.status === 'accepted' &&
+      message.transport === true
+    ))
+    ws.send(Buffer.alloc(320))
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'early-audio-user' },
+    }))
+
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+    assert.doesNotMatch(child.stderrText, /rejected audio before Even user start message/)
+    assert.equal(ws.readyState, WebSocket.OPEN)
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('shared-secret websocket auth rejects a bad HMAC proof', async () => {
   const { child, dir, port } = await startReceiver({
     EVEN_AUDIO_PIPE_TOKEN: '',

@@ -96,6 +96,7 @@ const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 3_0
 const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
 const receiverIdleAudioFreshMs = Number(process.env.RECEIVER_IDLE_AUDIO_FRESH_MS || 2_500)
 const receiverStalledAudioCloseMs = Number(process.env.RECEIVER_STALLED_AUDIO_CLOSE_MS || 12_000)
+const receiverPreStartAudioBufferMs = Number(process.env.RECEIVER_PRE_START_AUDIO_BUFFER_MS || 1_000)
 const activeAudioSocketProtectMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_PROTECT_MS || 10_000)
 const activeAudioSocketStartGraceMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_START_GRACE_MS || 1_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
@@ -325,6 +326,31 @@ function logThinClientSend(socket, payload, context = {}) {
     `[thin-client] send type=${payload?.type || 'message'} sent=${sent} ${socketDebugLabel(socket)}${details ? ` ${details}` : ''}`,
   )
   return sent
+}
+
+function logThinClientSendForUser(preferredSocket, user, payload, context = {}) {
+  const socket = resolveThinClientSocket(preferredSocket, user)
+  const rerouted = socket && socket !== preferredSocket
+  return logThinClientSend(socket, payload, {
+    ...context,
+    rerouted,
+    user: userLabel(user),
+  })
+}
+
+function resolveThinClientSocket(preferredSocket, user) {
+  if (preferredSocket?.readyState === WebSocket.OPEN) return preferredSocket
+
+  const key = activeAudioSocketKey(user)
+  const activeSocket = key ? activeAudioSocketsByUser.get(key) : null
+  if (activeSocket?.readyState === WebSocket.OPEN) {
+    console.log(
+      `[thin-client] rerouting send from ${socketDebugLabel(preferredSocket)} to ${socketDebugLabel(activeSocket)} user=${userLabel(user)}`,
+    )
+    return activeSocket
+  }
+
+  return preferredSocket
 }
 
 function dispatchDiarization(label, action) {
@@ -894,9 +920,11 @@ async function maybePostToTerminal(text) {
 }
 
 async function maybePostToWorkbench(text, targetSocket, context = {}) {
+  const thinClientSocket = resolveThinClientSocket(targetSocket, context.user)
+
   if (!text) {
     console.log('[workbench] skipped transcript: empty_transcript')
-    sendSocketJson(targetSocket, {
+    logThinClientSendForUser(thinClientSocket, context.user, {
       type: 'agent_status',
       status: 'empty_transcript',
       jobId: context.jobId,
@@ -906,7 +934,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
 
   if (!workbenchConfig.enabled) {
     console.log('[workbench] skipped transcript: workbench_disabled')
-    sendSocketJson(targetSocket, {
+    logThinClientSendForUser(thinClientSocket, context.user, {
       type: 'agent_status',
       status: 'workbench_disabled',
       jobId: context.jobId,
@@ -918,7 +946,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
   if (!baseUrl) {
     console.warn('[workbench] enabled but SPEECH_WORKBENCH_URL is empty')
     console.log('[workbench] skipped transcript: workbench_unconfigured')
-    sendSocketJson(targetSocket, {
+    logThinClientSendForUser(thinClientSocket, context.user, {
       type: 'agent_status',
       status: 'workbench_unconfigured',
       jobId: context.jobId,
@@ -926,12 +954,12 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     return
   }
 
-  const route = workbenchRouter.routeTranscript(text, targetSocket, {
+  const route = workbenchRouter.routeTranscript(text, thinClientSocket, {
     rawText: context.rawText,
   })
   if (route.skip) {
     console.log(`[workbench] skipped transcript: ${route.reason}`)
-    sendSocketJson(targetSocket, {
+    logThinClientSendForUser(thinClientSocket, context.user, {
       type: 'agent_status',
       status: route.reason,
       agent: route.agent || '',
@@ -947,7 +975,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
   const headers = { 'content-type': 'application/json' }
   if (workbenchConfig.token) headers.authorization = `Bearer ${workbenchConfig.token}`
 
-  sendSocketJson(targetSocket, {
+  logThinClientSendForUser(thinClientSocket, context.user, {
     type: 'agent_status',
     status: 'sending',
     agent: route.agent || workbenchConfig.agent,
@@ -981,14 +1009,14 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     }
 
     console.log(`[workbench] posted transcript to ${baseUrl}/messages`)
-    if (route.clearPendingAgentOnSent) workbenchRouter.clearPendingAgent(targetSocket, route.agent)
+    if (route.clearPendingAgentOnSent) workbenchRouter.clearPendingAgent(thinClientSocket, route.agent)
     const rawSentAgent = responseBody.agent || route.agent || workbenchConfig.agent || ''
     const sentAgent = canonicalWorkbenchAgent(rawSentAgent) || displayWorkbenchAgentName(rawSentAgent)
     setWorkbenchAgentInProgress(sentAgent, true, {
       signature: route.message,
       forceActivity: true,
     })
-    sendSocketJson(targetSocket, {
+    logThinClientSendForUser(thinClientSocket, context.user, {
       type: 'agent_status',
       status: 'sent',
       agent: sentAgent,
@@ -1005,7 +1033,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
       text: error,
       createdAt: new Date().toISOString(),
     })
-    sendSocketJson(targetSocket, {
+    logThinClientSendForUser(thinClientSocket, context.user, {
       type: 'agent_error',
       error,
       agent: canonicalWorkbenchAgent(route.agent || workbenchConfig.agent) ||
@@ -1503,7 +1531,7 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
   let rawTranscript = ''
   if (asrWorkerUrl) {
     console.log(`[asr] sending WAV to worker: ${asrWorkerUrl}`)
-    logThinClientSend(targetSocket, {
+    logThinClientSendForUser(targetSocket, user, {
       type: 'asr_status',
       status: 'transcribing',
       jobId,
@@ -1517,7 +1545,7 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
   } else {
     const command = renderAsrCommand(asrCommand, paths)
     console.log(`[asr] running ASR command: ${command}`)
-    logThinClientSend(targetSocket, {
+    logThinClientSendForUser(targetSocket, user, {
       type: 'asr_status',
       status: 'transcribing',
       jobId,
@@ -1560,7 +1588,7 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
     })
   } else {
     console.log(`[asr] no transcript returned job=${jobId} wav=${paths.wav} ${socketDebugLabel(targetSocket)}`)
-    logThinClientSend(targetSocket, {
+    logThinClientSendForUser(targetSocket, user, {
       type: 'asr_status',
       status: 'no_transcript',
       jobId,
@@ -1647,7 +1675,7 @@ function enqueueRawTranscript(item) {
   scheduleTranscriptQueueFlush(item.targetSocket)
   const queuedText = combineQueuedTranscripts(queue.items.map(queueItem => queueItem.rawTranscript))
 
-  logThinClientSend(item.targetSocket, {
+  logThinClientSendForUser(item.targetSocket, item.user, {
     type: 'asr_status',
     status: 'queued',
     jobId: item.jobId,
@@ -1740,7 +1768,7 @@ async function flushRawTranscriptBatch(items) {
     `[transcript-queue] flushing ${batch.length} segment(s): jobs=${jobIds.join(',')} rawChars=${rawTranscript.length} file=${basename(paths.wav)} ${socketDebugLabel(targetSocket)} user=${userLabel(user)}`,
   )
   if (cleanupConfig.enabled) {
-    logThinClientSend(targetSocket, {
+    logThinClientSendForUser(targetSocket, user, {
       type: 'asr_status',
       status: 'cleaning',
       jobId: lastItem.jobId,
@@ -1778,7 +1806,7 @@ async function flushRawTranscriptBatch(items) {
   console.log(
     `[transcript] saved job=${lastItem.jobId} txt=${paths.txt} raw=${paths.rawTxt} clean=${paths.cleanTxt} json=${paths.json}`,
   )
-  const transcriptSent = logThinClientSend(targetSocket, {
+  const transcriptSent = logThinClientSendForUser(targetSocket, user, {
     type: 'transcript',
     text: cleanedTranscript,
     rawText: rawTranscript,
@@ -2032,6 +2060,9 @@ wss.on('connection', (socket, req) => {
   let idleIndicatorClearSent = true
   let idleIndicatorFrame = 0
   const preRollBytes = Math.floor((vadPreRollMs / 1000) * bytesPerSecond)
+  const preStartAudioMaxBytes = Math.max(0, Math.floor((receiverPreStartAudioBufferMs / 1000) * bytesPerSecond))
+  const preStartAudioChunks = []
+  let preStartAudioBytes = 0
   let audioQueue = Promise.resolve()
   const endpoint = useVad
     ? new VadEndpoint({
@@ -2165,6 +2196,75 @@ wss.on('connection', (socket, req) => {
     })
   }
 
+  function bufferPreStartAudio(chunk) {
+    if (!chunk.byteLength) return
+    if (preStartAudioMaxBytes <= 0) {
+      console.warn(`[audio] dropping pre-start audio: buffer disabled stamp=${connectionStamp} bytes=${chunk.byteLength}`)
+      return
+    }
+
+    if (preStartAudioBytes + chunk.byteLength > preStartAudioMaxBytes) {
+      console.warn(
+        `[audio] dropping pre-start audio: buffer full stamp=${connectionStamp} bytes=${chunk.byteLength} bufferedBytes=${preStartAudioBytes} maxBytes=${preStartAudioMaxBytes}`,
+      )
+      return
+    }
+
+    preStartAudioChunks.push(chunk)
+    preStartAudioBytes += chunk.byteLength
+    console.warn(
+      `[audio] buffered pre-start audio stamp=${connectionStamp} chunkBytes=${chunk.byteLength} bufferedChunks=${preStartAudioChunks.length} bufferedBytes=${preStartAudioBytes}`,
+    )
+  }
+
+  function flushPreStartAudio() {
+    if (!preStartAudioChunks.length) return
+
+    const bufferedChunks = preStartAudioChunks.splice(0)
+    const bufferedBytes = preStartAudioBytes
+    preStartAudioBytes = 0
+    console.log(
+      `[audio] replaying pre-start audio stamp=${connectionStamp} chunks=${bufferedChunks.length} bytes=${bufferedBytes}`,
+    )
+    for (const chunk of bufferedChunks) {
+      handleAudioChunk(chunk, 'pre-start')
+    }
+  }
+
+  function handleAudioChunk(chunk, source = 'live') {
+    chunks += 1
+    bytes += chunk.byteLength
+    lastAudioAt = Date.now()
+    socketActivity.lastAudioAt = lastAudioAt
+    idleLogged = false
+    stalledAudioCloseRequested = false
+    idleIndicatorEnabled = true
+    if (!firstAudioChunkLogged) {
+      firstAudioChunkLogged = true
+      console.log(`[audio] stream started: receiving G2 mic chunks, stamp=${connectionStamp}`)
+    }
+    if (source !== 'live') {
+      console.log(`[audio] accepted ${source} chunk stamp=${connectionStamp} bytes=${chunk.byteLength}`)
+    }
+
+    if (useVad) {
+      audioQueue = audioQueue
+        .catch(() => {})
+        .then(() => endpoint.processChunk(chunk))
+        .catch(err => {
+          console.error(`[audio] VAD processing failed: ${err.message}`)
+          closeCurrentSegment('vad error')
+        })
+    } else {
+      const segment = getCurrentSegment()
+      writeSegmentChunk(segment, chunk)
+
+      if (segmentBytesLimit && segment.bytes >= segmentBytesLimit) {
+        closeCurrentSegment('segment limit')
+      }
+    }
+  }
+
   socket.on('message', (data, isBinary) => {
     if (!isBinary) {
       const text = data.toString()
@@ -2206,6 +2306,10 @@ wss.on('connection', (socket, req) => {
       }
 
       if (control?.type === 'start') {
+        if (socket.readyState !== WebSocket.OPEN) {
+          console.warn(`[audio] ignored start for non-open socket stamp=${connectionStamp} ${socketDebugLabel(socket)}`)
+          return
+        }
         evenUser = normalizeUser(control.user)
         console.log(`[audio] start received stamp=${connectionStamp} user=${userLabel(evenUser)} source=${stringValue(control.source) || 'unknown'} ${socketDebugLabel(socket)}`)
         const auth = currentUserAuthConfig()
@@ -2247,6 +2351,7 @@ wss.on('connection', (socket, req) => {
         })
         console.log(`[audio] start accepted stamp=${connectionStamp} activeKey=${activeAudioSocketKeyForConnection || 'none'} user=${userLabel(evenUser)}`)
         sendOnboardingPrompt()
+        flushPreStartAudio()
       }
       if (control?.type === 'get_message_history') {
         sendMessageHistory(socket)
@@ -2277,45 +2382,17 @@ wss.on('connection', (socket, req) => {
       return
     }
 
+    const chunk = toBuffer(data)
     if (!userAuthenticated) {
       const auth = currentUserAuthConfig()
       if (auth.required) {
-        console.warn('[auth] rejected audio before Even user start message')
-        socket.close(1008, 'Even user is required')
+        bufferPreStartAudio(chunk)
         return
       }
       userAuthenticated = true
     }
 
-    const chunk = toBuffer(data)
-    chunks += 1
-    bytes += chunk.byteLength
-    lastAudioAt = Date.now()
-    socketActivity.lastAudioAt = lastAudioAt
-    idleLogged = false
-    stalledAudioCloseRequested = false
-    idleIndicatorEnabled = true
-    if (!firstAudioChunkLogged) {
-      firstAudioChunkLogged = true
-      console.log(`[audio] stream started: receiving G2 mic chunks, stamp=${connectionStamp}`)
-    }
-
-    if (useVad) {
-      audioQueue = audioQueue
-        .catch(() => {})
-        .then(() => endpoint.processChunk(chunk))
-        .catch(err => {
-          console.error(`[audio] VAD processing failed: ${err.message}`)
-          closeCurrentSegment('vad error')
-        })
-    } else {
-      const segment = getCurrentSegment()
-      writeSegmentChunk(segment, chunk)
-
-      if (segmentBytesLimit && segment.bytes >= segmentBytesLimit) {
-        closeCurrentSegment('segment limit')
-      }
-    }
+    handleAudioChunk(chunk)
   })
 
   socket.on('close', (code, reason) => {
