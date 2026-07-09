@@ -372,6 +372,35 @@ test('receiver lets newer socket replace a stale same-user socket before audio s
   }
 })
 
+test('receiver closes an open socket when audio chunks stall', async () => {
+  const { child, dir, port } = await startReceiver({
+    RECEIVER_STALLED_AUDIO_CLOSE_MS: '250',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'stalled-user' },
+    }))
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+    ws.send(Buffer.alloc(320))
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+
+    const close = await waitForClose(ws)
+    assert.equal(close.code, 4002)
+    assert.equal(close.reason, 'audio stream stalled')
+    assert.match(child.stderrText, /\[audio\] stalled: no chunks/)
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('receiver forwards peek progress as a local workbench message', async () => {
   const workbench = await startFakeWorkbench()
   const { child, dir, port } = await startReceiver({

@@ -95,6 +95,7 @@ const sileroVadThreshold = Number(process.env.SILERO_VAD_THRESHOLD || 0.5)
 const transcriptQueueIdleMs = Number(process.env.TRANSCRIPT_QUEUE_IDLE_MS || 3_000)
 const transcriptQueueMaxHoldMs = Number(process.env.TRANSCRIPT_QUEUE_MAX_HOLD_MS || 10_000)
 const receiverIdleAudioFreshMs = Number(process.env.RECEIVER_IDLE_AUDIO_FRESH_MS || 2_500)
+const receiverStalledAudioCloseMs = Number(process.env.RECEIVER_STALLED_AUDIO_CLOSE_MS || 12_000)
 const activeAudioSocketProtectMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_PROTECT_MS || 10_000)
 const activeAudioSocketStartGraceMs = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_START_GRACE_MS || 1_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
@@ -1943,6 +1944,7 @@ wss.on('connection', (socket, req) => {
   let firstAudioChunkLogged = false
   let lastAudioAt = 0
   let idleLogged = false
+  let stalledAudioCloseRequested = false
   let idleIndicatorEnabled = false
   let idleIndicatorClearSent = true
   let idleIndicatorFrame = 0
@@ -1986,10 +1988,28 @@ wss.on('connection', (socket, req) => {
       idleIndicatorClearSent = true
     }
 
-    if (!lastAudioAt || idleLogged) return
+    if (!lastAudioAt) return
 
     const idleMs = Date.now() - lastAudioAt
-    if (idleMs < 5_000) return
+    if (
+      receiverStalledAudioCloseMs > 0 &&
+      idleMs >= receiverStalledAudioCloseMs &&
+      !stalledAudioCloseRequested
+    ) {
+      stalledAudioCloseRequested = true
+      console.warn(
+        `[audio] stalled: no chunks for ${(idleMs / 1000).toFixed(1)}s, closing socket to trigger reconnect, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
+      )
+      sendSocketJson(socket, {
+        type: 'receiver_status',
+        status: 'stalled',
+        reason: 'audio_stream_stalled',
+      })
+      socket.close(4002, 'audio stream stalled')
+      return
+    }
+
+    if (idleLogged || idleMs < 5_000) return
 
     idleLogged = true
     console.log(
@@ -2169,6 +2189,7 @@ wss.on('connection', (socket, req) => {
     lastAudioAt = Date.now()
     socketActivity.lastAudioAt = lastAudioAt
     idleLogged = false
+    stalledAudioCloseRequested = false
     idleIndicatorEnabled = true
     if (!firstAudioChunkLogged) {
       firstAudioChunkLogged = true
