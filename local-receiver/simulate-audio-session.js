@@ -6,7 +6,9 @@ import { WebSocket } from 'ws'
 const options = parseArgs(process.argv.slice(2))
 
 for (let cycle = 1; cycle <= options.cycles; cycle += 1) {
-  const url = withClientConnectionParams(options.url, options.clientSessionId, cycle)
+  const url = options.clientParams
+    ? withClientConnectionParams(options.url, options.clientSessionId, cycle)
+    : options.url
   console.log(`[simulate] cycle ${cycle}/${options.cycles}: connecting ${url}`)
   const socket = await openSocket(url)
   let started = false
@@ -78,16 +80,19 @@ for (let cycle = 1; cycle <= options.cycles; cycle += 1) {
 console.log('[simulate] complete')
 
 function sendStart(socket, opts, cycle) {
-  socket.send(JSON.stringify({
+  const message = {
     type: 'start',
     source: 'simulator',
     encoding: 'pcm_s16le',
     sampleRate: 16000,
     channels: 1,
     user: { id: opts.userId },
-    clientSessionId: opts.clientSessionId,
-    connectionAttempt: cycle,
-  }))
+  }
+  if (opts.clientParams) {
+    message.clientSessionId = opts.clientSessionId
+    message.connectionAttempt = cycle
+  }
+  socket.send(JSON.stringify(message))
   console.log(`[simulate] start sent user=${opts.userId}`)
 }
 
@@ -162,6 +167,7 @@ function parseArgs(values) {
     startTimeoutMs: Number(process.env.SIM_AUDIO_START_TIMEOUT_MS || 5_000),
     amplitude: Number(process.env.SIM_AUDIO_AMPLITUDE || 6000),
     earlyAudio: false,
+    clientParams: true,
     clientSessionId: `sim-${Date.now().toString(36)}`,
   }
 
@@ -177,6 +183,7 @@ function parseArgs(values) {
     else if (value === '--chunk-delay-ms') parsed.chunkDelayMs = Number(values[++index] || parsed.chunkDelayMs)
     else if (value === '--settle-ms') parsed.settleMs = Number(values[++index] || parsed.settleMs)
     else if (value === '--early-audio') parsed.earlyAudio = true
+    else if (value === '--no-client-params') parsed.clientParams = false
   }
 
   return parsed

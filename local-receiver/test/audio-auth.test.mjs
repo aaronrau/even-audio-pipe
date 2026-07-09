@@ -355,6 +355,51 @@ test('receiver keeps current audio socket active for the same Even user', async 
   }
 })
 
+test('receiver lets newer socket replace zero-audio same-user socket inside start grace', async () => {
+  const secret = 'local-test-secret'
+  const { child, dir, port } = await startReceiver({
+    EVEN_AUDIO_PIPE_TOKEN_SECRET: secret,
+  })
+
+  try {
+    const first = await openSocket(port)
+    await authenticateSharedSecretSocket(first, secret)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+
+    const second = await openSocket(port)
+    await authenticateSharedSecretSocket(second, secret)
+    const firstClose = waitForClose(first)
+    const secondPrompt = waitForJson(second, message => message.type === 'onboarding_prompt')
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+
+    const close = await firstClose
+    assert.equal(close.code, 4001)
+    assert.equal(close.reason, 'newer audio socket active')
+    await secondPrompt
+    assert.match(child.stdoutText, /\[audio\] replacing active socket for uid:same-user/)
+    assert.match(child.stdoutText, /previousBytes=0 previousChunks=0/)
+    second.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('receiver lets newer socket replace weak one-chunk same-user socket', async () => {
   const { child, dir, port } = await startReceiver({
     RECEIVER_ACTIVE_AUDIO_SOCKET_START_GRACE_MS: '1',

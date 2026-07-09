@@ -1324,7 +1324,8 @@ function shouldKeepActiveAudioSocket(socket, now = Date.now()) {
   return Boolean(
     activeAudioSocketStartGraceMs > 0 &&
     activity.startedAt &&
-    now - activity.startedAt <= activeAudioSocketStartGraceMs,
+    now - activity.startedAt <= activeAudioSocketStartGraceMs &&
+    hasProtectedAudioActivity(activity),
   )
 }
 
@@ -1347,7 +1348,7 @@ function promoteActiveAudioSocket(socket, key, context = {}) {
 
   if (previous && previous.readyState === WebSocket.OPEN && shouldKeepActiveAudioSocket(previous)) {
     console.log(
-      `[audio] keeping active socket for ${key}${context.connectionStamp ? `; closing duplicate stamp=${context.connectionStamp}` : ''}`,
+      `[audio] keeping active socket for ${key}${context.connectionStamp ? `; closing duplicate stamp=${context.connectionStamp}` : ''}; ${audioActivitySummary(previous)}`,
     )
     sendSocketJson(socket, {
       type: 'receiver_status',
@@ -1362,7 +1363,7 @@ function promoteActiveAudioSocket(socket, key, context = {}) {
 
   if (previous && previous.readyState === WebSocket.OPEN) {
     console.log(
-      `[audio] replacing active socket for ${key}${context.connectionStamp ? ` with stamp=${context.connectionStamp}` : ''}`,
+      `[audio] replacing active socket for ${key}${context.connectionStamp ? ` with stamp=${context.connectionStamp}` : ''}; ${audioActivitySummary(previous)}`,
     )
     sendSocketJson(previous, {
       type: 'receiver_status',
@@ -1373,6 +1374,21 @@ function promoteActiveAudioSocket(socket, key, context = {}) {
   }
 
   return { accepted: true, key }
+}
+
+function audioActivitySummary(socket) {
+  const activity = audioSocketActivity.get(socket)
+  if (!activity) return 'previousAudio=unknown'
+
+  const startedAge = activity.startedAt ? `${Date.now() - activity.startedAt}ms` : 'none'
+  const lastAudioAge = activity.lastAudioAt ? `${Date.now() - activity.lastAudioAt}ms` : 'none'
+  return [
+    `previousStamp=${activity.connectionStamp || 'unknown'}`,
+    `previousBytes=${Number(activity.bytes || 0)}`,
+    `previousChunks=${Number(activity.chunks || 0)}`,
+    `previousStartedAge=${startedAge}`,
+    `previousLastAudioAge=${lastAudioAge}`,
+  ].join(' ')
 }
 
 function clearActiveAudioSocket(socket, key) {
