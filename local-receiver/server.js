@@ -283,15 +283,48 @@ async function convertPcmToWav(pcmPath, wavPath) {
 }
 
 function sendSocketJson(socket, payload) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    console.warn(
+      `[socket] skipped send ${payload?.type || 'message'}: ${socketDebugLabel(socket)}`,
+    )
+    return false
+  }
 
   try {
     socket.send(JSON.stringify(payload))
     return true
   } catch (err) {
-    console.error(`[socket] failed to send ${payload?.type || 'message'}: ${err.message}`)
+    console.error(`[socket] failed to send ${payload?.type || 'message'}: ${err.message}; ${socketDebugLabel(socket)}`)
     return false
   }
+}
+
+function socketDebugLabel(socket) {
+  if (!socket) return 'socket=none readyState=none'
+  const activity = audioSocketActivity.get(socket)
+  return [
+    `socket=${activity?.connectionStamp || 'unknown'}`,
+    `readyState=${socketReadyStateName(socket.readyState)}`,
+  ].join(' ')
+}
+
+function socketReadyStateName(value) {
+  if (value === WebSocket.CONNECTING) return 'CONNECTING'
+  if (value === WebSocket.OPEN) return 'OPEN'
+  if (value === WebSocket.CLOSING) return 'CLOSING'
+  if (value === WebSocket.CLOSED) return 'CLOSED'
+  return String(value)
+}
+
+function logThinClientSend(socket, payload, context = {}) {
+  const sent = sendSocketJson(socket, payload)
+  const details = Object.entries(compactObject(context))
+    .map(([key, value]) => `${key}=${value}`)
+    .join(' ')
+  console.log(
+    `[thin-client] send type=${payload?.type || 'message'} sent=${sent} ${socketDebugLabel(socket)}${details ? ` ${details}` : ''}`,
+  )
+  return sent
 }
 
 function dispatchDiarization(label, action) {
@@ -1450,41 +1483,57 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
 
 async function processRecording(paths, bytes, targetSocket, jobId, user) {
   if (bytes < minAsrBytes) {
-    console.log(`[asr] skipping short recording (${bytes} bytes < ${minAsrBytes})`)
+    console.log(
+      `[asr] request skipped job=${jobId} reason=short_audio bytes=${bytes} minBytes=${minAsrBytes} pcm=${paths.pcm} ${socketDebugLabel(targetSocket)} user=${userLabel(user)}`,
+    )
     return
   }
 
+  console.log(
+    `[asr] request received job=${jobId} bytes=${bytes} pcm=${paths.pcm} wav=${paths.wav} ${socketDebugLabel(targetSocket)} user=${userLabel(user)}`,
+  )
   console.log(`[asr] converting PCM to WAV: ${paths.wav}`)
   await convertPcmToWav(paths.pcm, paths.wav)
 
   if (!asrWorkerUrl && !asrCommand) {
-    console.log('[asr] ASR_WORKER_URL/ASR_COMMAND is not set; WAV saved but no transcription was run')
+    console.log(`[asr] request skipped job=${jobId} reason=asr_unconfigured wav=${paths.wav}`)
     return
   }
 
   let rawTranscript = ''
   if (asrWorkerUrl) {
     console.log(`[asr] sending WAV to worker: ${asrWorkerUrl}`)
-    sendSocketJson(targetSocket, {
+    logThinClientSend(targetSocket, {
       type: 'asr_status',
       status: 'transcribing',
       jobId,
+      file: basename(paths.wav),
+    }, {
+      job: jobId,
+      status: 'transcribing',
       file: basename(paths.wav),
     })
     rawTranscript = await transcribeWithWorker(paths.wav)
   } else {
     const command = renderAsrCommand(asrCommand, paths)
     console.log(`[asr] running ASR command: ${command}`)
-    sendSocketJson(targetSocket, {
+    logThinClientSend(targetSocket, {
       type: 'asr_status',
       status: 'transcribing',
       jobId,
+      file: basename(paths.wav),
+    }, {
+      job: jobId,
+      status: 'transcribing',
       file: basename(paths.wav),
     })
     const result = await runShell(command, 'asr')
     rawTranscript = normalizeTranscript(result.stdout)
   }
 
+  console.log(
+    `[asr] transcript result job=${jobId} empty=${rawTranscript ? 'false' : 'true'} chars=${rawTranscript.length} wav=${paths.wav} ${socketDebugLabel(targetSocket)}`,
+  )
   if (rawTranscript) {
     console.log(`[transcript:raw] ${rawTranscript}`)
     dispatchDiarization('process saved audio', () => {
@@ -1510,11 +1559,15 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
       user,
     })
   } else {
-    console.log('[asr] no transcript returned')
-    sendSocketJson(targetSocket, {
+    console.log(`[asr] no transcript returned job=${jobId} wav=${paths.wav} ${socketDebugLabel(targetSocket)}`)
+    logThinClientSend(targetSocket, {
       type: 'asr_status',
       status: 'no_transcript',
       jobId,
+      file: basename(paths.wav),
+    }, {
+      job: jobId,
+      status: 'no_transcript',
       file: basename(paths.wav),
     })
   }
@@ -1594,7 +1647,7 @@ function enqueueRawTranscript(item) {
   scheduleTranscriptQueueFlush(item.targetSocket)
   const queuedText = combineQueuedTranscripts(queue.items.map(queueItem => queueItem.rawTranscript))
 
-  sendSocketJson(item.targetSocket, {
+  logThinClientSend(item.targetSocket, {
     type: 'asr_status',
     status: 'queued',
     jobId: item.jobId,
@@ -1605,9 +1658,15 @@ function enqueueRawTranscript(item) {
     activeSegments: queue.activeSegments,
     pendingAsrJobs: queue.pendingAsrJobs,
     file: basename(item.paths.wav),
+  }, {
+    job: item.jobId,
+    status: 'queued',
+    queuedSegments: queue.items.length,
+    activeSegments: queue.activeSegments,
+    pendingAsrJobs: queue.pendingAsrJobs,
   })
   console.log(
-    `[transcript-queue] queued job ${item.jobId}; waiting ${(transcriptQueueIdleMs / 1000).toFixed(1)}s after last translated text/VAD speech and audio idle`,
+    `[transcript-queue] queued job ${item.jobId}; queuedSegments=${queue.items.length} chars=${queuedText.length} activeSegments=${queue.activeSegments} pendingAsrJobs=${queue.pendingAsrJobs}; waiting ${(transcriptQueueIdleMs / 1000).toFixed(1)}s after last translated text/VAD speech and audio idle`,
   )
 }
 
@@ -1677,9 +1736,11 @@ async function flushRawTranscriptBatch(items) {
   const rawTranscript = combineQueuedTranscripts(batch.map(item => item.rawTranscript))
   const cleanupConfig = currentTranscriptCleanupConfig()
 
-  console.log(`[transcript-queue] flushing ${batch.length} segment(s): jobs=${jobIds.join(',')}`)
+  console.log(
+    `[transcript-queue] flushing ${batch.length} segment(s): jobs=${jobIds.join(',')} rawChars=${rawTranscript.length} file=${basename(paths.wav)} ${socketDebugLabel(targetSocket)} user=${userLabel(user)}`,
+  )
   if (cleanupConfig.enabled) {
-    sendSocketJson(targetSocket, {
+    logThinClientSend(targetSocket, {
       type: 'asr_status',
       status: 'cleaning',
       jobId: lastItem.jobId,
@@ -1688,11 +1749,18 @@ async function flushRawTranscriptBatch(items) {
       queuedText: rawTranscript,
       text: rawTranscript,
       file: basename(paths.wav),
+    }, {
+      job: lastItem.jobId,
+      status: 'cleaning',
+      queuedSegments: batch.length,
     })
   }
 
   const cleanup = await cleanTranscript(rawTranscript, cleanupConfig)
   const cleanedTranscript = cleanup.text
+  console.log(
+    `[transcript] cleaned job=${lastItem.jobId} jobs=${jobIds.join(',')} cleanupEnabled=${cleanup.enabled} cleanupOk=${cleanup.ok} rawChars=${rawTranscript.length} cleanChars=${cleanedTranscript.length}`,
+  )
 
   writeTranscriptFiles(paths, rawTranscript, cleanedTranscript, cleanup, user, {
     queuedSegments: batch.map(batchItem => queuedSegmentMetadata(batchItem)),
@@ -1707,8 +1775,10 @@ async function flushRawTranscriptBatch(items) {
     createdAt,
   })
   console.log(`[transcript:clean] ${cleanedTranscript}`)
-  console.log(`[asr] queued transcript saved: ${paths.txt}`)
-  sendSocketJson(targetSocket, {
+  console.log(
+    `[transcript] saved job=${lastItem.jobId} txt=${paths.txt} raw=${paths.rawTxt} clean=${paths.cleanTxt} json=${paths.json}`,
+  )
+  const transcriptSent = logThinClientSend(targetSocket, {
     type: 'transcript',
     text: cleanedTranscript,
     rawText: rawTranscript,
@@ -1727,7 +1797,17 @@ async function flushRawTranscriptBatch(items) {
     rawFile: basename(paths.rawTxt),
     cleanFile: basename(paths.cleanTxt),
     createdAt,
+  }, {
+    job: lastItem.jobId,
+    jobs: jobIds.join(','),
+    queuedSegments: batch.length,
+    cleanChars: cleanedTranscript.length,
+    file: basename(paths.txt),
   })
+  console.log(
+    `[transcript] thin-client delivery job=${lastItem.jobId} sent=${transcriptSent} file=${basename(paths.txt)} ${socketDebugLabel(targetSocket)}`,
+  )
+  console.log(`[asr] queued transcript saved: ${paths.txt}`)
   await maybePostToWorkbench(cleanedTranscript, targetSocket, {
     jobId: lastItem.jobId,
     user,
@@ -1797,6 +1877,9 @@ function appendTranscript(rawTranscript, cleanedTranscript, paths, cleanup, user
 
 function enqueueRecording(paths, bytes, reason, targetSocket, user) {
   const jobId = ++asrJobId
+  console.log(
+    `[asr] request queued job=${jobId} reason=${reason} bytes=${bytes} pcm=${paths.pcm} ${socketDebugLabel(targetSocket)} user=${userLabel(user)}`,
+  )
   markAsrJobQueued(targetSocket)
 
   asrQueue = asrQueue
@@ -2019,29 +2102,37 @@ wss.on('connection', (socket, req) => {
   idleTimer.unref?.()
 
   if (transportAuth.challenge) {
-    sendSocketJson(socket, {
+    const challengeSent = logThinClientSend(socket, {
       type: 'auth_challenge',
       mode: 'shared-secret',
       nonce: authNonce,
       algorithm: 'hmac-sha256',
+    }, {
+      auth: 'challenge',
     })
+    console.log(`[auth] shared-secret challenge sent stamp=${connectionStamp} sent=${challengeSent}`)
     authTimer = setTimeout(() => {
       if (transportAuthenticated || socket.readyState !== WebSocket.OPEN) return
-      console.warn('[auth] shared-secret auth timed out')
-      sendSocketJson(socket, {
+      console.warn(`[auth] shared-secret auth timed out stamp=${connectionStamp} ${socketDebugLabel(socket)}`)
+      logThinClientSend(socket, {
         type: 'auth_status',
         status: 'rejected',
         reason: 'timeout',
+      }, {
+        auth: 'timeout',
       })
       socket.close(1008, 'shared-secret auth timed out')
     }, transportAuthTimeoutMs)
   } else if (transportAuthenticated) {
-    sendSocketJson(socket, {
+    logThinClientSend(socket, {
       type: 'auth_status',
       status: 'accepted',
       mode: transportAuth.mode,
       transport: true,
+    }, {
+      auth: 'transport_accepted',
     })
+    console.log(`[auth] transport accepted stamp=${connectionStamp} mode=${transportAuth.mode}`)
   }
 
   sendSocketJson(socket, {
@@ -2066,9 +2157,11 @@ wss.on('connection', (socket, req) => {
   function sendOnboardingPrompt() {
     if (onboardingPromptSent || !transportAuthenticated || !userAuthenticated) return
     onboardingPromptSent = true
-    sendSocketJson(socket, {
+    logThinClientSend(socket, {
       type: 'onboarding_prompt',
       message: 'Say something to get started.',
+    }, {
+      prompt: 'onboarding',
     })
   }
 
@@ -2078,22 +2171,28 @@ wss.on('connection', (socket, req) => {
       const control = parseControlMessage(text)
 
       if (control?.type === 'auth') {
+        console.log(`[auth] proof received stamp=${connectionStamp} proofChars=${stringValue(control.proof).length}`)
         if (isValidAuthProof(accessTokenSecret, authNonce, control.proof)) {
           transportAuthenticated = true
           if (authTimer) clearTimeout(authTimer)
           authTimer = null
-          sendSocketJson(socket, {
+          logThinClientSend(socket, {
             type: 'auth_status',
             status: 'accepted',
             mode: 'shared-secret',
             transport: true,
+          }, {
+            auth: 'accepted',
           })
+          console.log(`[auth] shared-secret accepted stamp=${connectionStamp}`)
         } else {
-          console.warn('[auth] rejected shared-secret proof')
-          sendSocketJson(socket, {
+          console.warn(`[auth] rejected shared-secret proof stamp=${connectionStamp}`)
+          logThinClientSend(socket, {
             type: 'auth_status',
             status: 'rejected',
             reason: 'bad_proof',
+          }, {
+            auth: 'bad_proof',
           })
           socket.close(1008, 'shared-secret auth failed')
         }
@@ -2101,13 +2200,14 @@ wss.on('connection', (socket, req) => {
       }
 
       if (!transportAuthenticated) {
-        console.warn('[auth] rejected control before transport auth')
+        console.warn(`[auth] rejected control before transport auth stamp=${connectionStamp} type=${control?.type || 'unknown'}`)
         socket.close(1008, 'transport auth required')
         return
       }
 
       if (control?.type === 'start') {
         evenUser = normalizeUser(control.user)
+        console.log(`[audio] start received stamp=${connectionStamp} user=${userLabel(evenUser)} source=${stringValue(control.source) || 'unknown'} ${socketDebugLabel(socket)}`)
         const auth = currentUserAuthConfig()
 
         if (auth.required && !isAllowedUser(evenUser, auth)) {
@@ -2136,12 +2236,16 @@ wss.on('connection', (socket, req) => {
         if (!activeAudioSocketPromotion.accepted) return
         activeAudioSocketKeyForConnection = activeAudioSocketPromotion.key
         persistScannedUser(evenUser, 'accepted')
-        sendSocketJson(socket, {
+        logThinClientSend(socket, {
           type: 'auth_status',
           status: 'accepted',
           user: evenUser,
           restricted: auth.required,
+        }, {
+          auth: 'user_accepted',
+          activeKey: activeAudioSocketKeyForConnection,
         })
+        console.log(`[audio] start accepted stamp=${connectionStamp} activeKey=${activeAudioSocketKeyForConnection || 'none'} user=${userLabel(evenUser)}`)
         sendOnboardingPrompt()
       }
       if (control?.type === 'get_message_history') {
@@ -2229,7 +2333,7 @@ wss.on('connection', (socket, req) => {
         }
         const reasonText = reason?.toString() || ''
         console.log(
-          `[audio] closed: code=${code} reason=${reasonText || 'none'} stamp=${connectionStamp}, ${bytes} bytes total, ${chunks} chunks`,
+          `[audio] closed: code=${code} reason=${reasonText || 'none'} stamp=${connectionStamp}, transportAuthenticated=${transportAuthenticated} userAuthenticated=${userAuthenticated} activeKey=${activeAudioSocketKeyForConnection || 'none'}, ${bytes} bytes total, ${chunks} chunks`,
         )
       })
   })
