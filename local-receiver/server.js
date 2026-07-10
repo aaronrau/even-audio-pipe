@@ -2169,53 +2169,99 @@ wss.on('connection', (socket, req) => {
     `[audio] connected: stamp=${connectionStamp} remote=${req.socket.remoteAddress || 'unknown'} clientSessionId=${clientSessionId || 'none'} connectionAttempt=${connectionAttempt || 'none'}`,
   )
   const idleTimer = setInterval(() => {
+    try {
+      if (socket.readyState !== WebSocket.OPEN) return
+
+      const audioFresh = lastAudioAt && Date.now() - lastAudioAt <= receiverIdleAudioFreshMs
+      if (idleIndicatorEnabled && audioFresh) {
+        sendSocketJson(socket, {
+          type: 'receiver_idle',
+          frame: idleIndicatorFrame % 2 === 0 ? ' - ' : '- -',
+        })
+        idleIndicatorFrame += 1
+        idleIndicatorClearSent = false
+      } else if (idleIndicatorEnabled && !idleIndicatorClearSent) {
+        sendSocketJson(socket, {
+          type: 'receiver_idle',
+          frame: '',
+        })
+        idleIndicatorClearSent = true
+      }
+
+      if (!lastAudioAt) return
+
+      const idleMs = Date.now() - lastAudioAt
+      if (
+        receiverStalledAudioCloseMs > 0 &&
+        idleMs >= receiverStalledAudioCloseMs &&
+        !stalledAudioCloseRequested
+      ) {
+        stalledAudioCloseRequested = true
+        if (isStandbyAudioSocket()) {
+          console.log(
+            `[audio] standby idle: no chunks for ${(idleMs / 1000).toFixed(1)}s, leaving socket open, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
+          )
+          return
+        }
+        requestRetryListen('audio_stream_stalled', 'audio stream stalled')
+        return
+      }
+
+      if (idleLogged || idleMs < 5_000) return
+
+      idleLogged = true
+      console.log(
+        `[audio] idle: no chunks for ${(idleMs / 1000).toFixed(1)}s, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
+      )
+    } catch (err) {
+      handleAudioFailure('idle_watchdog_failed', err)
+    }
+  }, 1_000)
+  idleTimer.unref?.()
+
+  function requestRetryListen(reason, closeReason, err = null) {
     if (socket.readyState !== WebSocket.OPEN) return
 
-    const audioFresh = lastAudioAt && Date.now() - lastAudioAt <= receiverIdleAudioFreshMs
-    if (idleIndicatorEnabled && audioFresh) {
-      sendSocketJson(socket, {
-        type: 'receiver_idle',
-        frame: idleIndicatorFrame % 2 === 0 ? ' - ' : '- -',
-      })
-      idleIndicatorFrame += 1
-      idleIndicatorClearSent = false
-    } else if (idleIndicatorEnabled && !idleIndicatorClearSent) {
-      sendSocketJson(socket, {
-        type: 'receiver_idle',
-        frame: '',
-      })
-      idleIndicatorClearSent = true
+    const errorText = err ? (err.message || String(err)) : ''
+    console.warn(
+      `[audio] retry listen: reason=${reason}${errorText ? ` error=${errorText}` : ''}, closing active socket, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
+    )
+    logThinClientSend(socket, {
+      type: 'receiver_status',
+      status: 'retry_listen',
+      reason,
+      retry: true,
+      error: errorText || undefined,
+    }, {
+      retry: 'listen',
+      reason,
+    })
+    clearActiveAudioSocket(socket, activeAudioSocketKeyForConnection)
+    try {
+      socket.close(4002, closeReason)
+    } catch (closeErr) {
+      console.error(`[audio] failed to close active socket for retry: ${closeErr.message}; ${socketDebugLabel(socket)}`)
+      socket.terminate?.()
     }
+  }
 
-    if (!lastAudioAt) return
-
-    const idleMs = Date.now() - lastAudioAt
-    if (
-      receiverStalledAudioCloseMs > 0 &&
-      idleMs >= receiverStalledAudioCloseMs &&
-      !stalledAudioCloseRequested
-    ) {
-      stalledAudioCloseRequested = true
+  function handleAudioFailure(reason, err) {
+    const errorText = err?.message || String(err || 'unknown error')
+    if (isStandbyAudioSocket()) {
       console.warn(
-        `[audio] stalled: no chunks for ${(idleMs / 1000).toFixed(1)}s, closing socket to trigger reconnect, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
+        `[audio] standby ${reason}: ${errorText}; leaving socket open, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
       )
       sendSocketJson(socket, {
         type: 'receiver_status',
-        status: 'stalled',
-        reason: 'audio_stream_stalled',
+        status: 'standby',
+        reason,
+        error: errorText,
       })
-      socket.close(4002, 'audio stream stalled')
       return
     }
 
-    if (idleLogged || idleMs < 5_000) return
-
-    idleLogged = true
-    console.log(
-      `[audio] idle: no chunks for ${(idleMs / 1000).toFixed(1)}s, stamp=${connectionStamp}, bytes=${bytes}, chunks=${chunks}, readyState=${socket.readyState}`,
-    )
-  }, 1_000)
-  idleTimer.unref?.()
+    requestRetryListen(reason, 'audio receiver error', err)
+  }
 
   if (transportAuth.challenge) {
     const challengeSent = logThinClientSend(socket, {
@@ -2316,6 +2362,13 @@ wss.on('connection', (socket, req) => {
     }
   }
 
+  function isStandbyAudioSocket() {
+    return Boolean(
+      activeAudioSocketKeyForConnection &&
+      activeAudioSocketsByUser.get(activeAudioSocketKeyForConnection) !== socket,
+    )
+  }
+
   function handleAudioChunk(chunk, source = 'live') {
     chunks += 1
     bytes += chunk.byteLength
@@ -2342,6 +2395,7 @@ wss.on('connection', (socket, req) => {
         .catch(err => {
           console.error(`[audio] VAD processing failed: ${err.message}`)
           closeCurrentSegment('vad error')
+          handleAudioFailure('vad_processing_failed', err)
         })
     } else {
       const segment = getCurrentSegment()
@@ -2354,6 +2408,14 @@ wss.on('connection', (socket, req) => {
   }
 
   socket.on('message', (data, isBinary) => {
+    try {
+      handleSocketMessage(data, isBinary)
+    } catch (err) {
+      handleAudioFailure('message_handler_failed', err)
+    }
+  })
+
+  function handleSocketMessage(data, isBinary) {
     if (!isBinary) {
       const text = data.toString()
       const control = parseControlMessage(text)
@@ -2490,7 +2552,7 @@ wss.on('connection', (socket, req) => {
 
     promoteAudioSocketForChunk(socket, evenUser)
     handleAudioChunk(chunk)
-  })
+  }
 
   socket.on('close', (code, reason) => {
     if (authTimer) clearTimeout(authTimer)

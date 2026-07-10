@@ -510,10 +510,69 @@ test('receiver closes an open socket when audio chunks stall', async () => {
     ws.send(Buffer.alloc(320))
     await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
 
+    const retryStatus = waitForJson(ws, message => (
+      message.type === 'receiver_status' &&
+      message.status === 'retry_listen' &&
+      message.reason === 'audio_stream_stalled'
+    ))
     const close = await waitForClose(ws)
+    await retryStatus
     assert.equal(close.code, 4002)
     assert.equal(close.reason, 'audio stream stalled')
-    assert.match(child.stderrText, /\[audio\] stalled: no chunks/)
+    assert.match(child.stderrText, /\[audio\] retry listen: reason=audio_stream_stalled/)
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver does not close standby sockets when their audio goes idle', async () => {
+  const { child, dir, port } = await startReceiver({
+    RECEIVER_STALLED_AUDIO_CLOSE_MS: '1000',
+  })
+
+  try {
+    const first = await openSocket(port)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    sendAudioChunks(first, 6)
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+
+    const second = await openSocket(port)
+    const standbyStatus = waitForJson(second, message => (
+      message.type === 'receiver_status' &&
+      message.status === 'standby' &&
+      message.reason === 'active_socket_has_audio'
+    ))
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await standbyStatus
+
+    for (let index = 0; index < 30 && !child.stdoutText.includes('[audio] standby idle: no chunks'); index += 1) {
+      second.send(Buffer.alloc(3200, 1))
+      await delay(100)
+    }
+
+    assert.match(child.stdoutText, /\[audio\] standby idle: no chunks/)
+    assert.equal(first.readyState, WebSocket.OPEN)
+    assert.equal(second.readyState, WebSocket.OPEN)
+    assert.doesNotMatch(child.stdoutText, /retry listen: reason=audio_stream_stalled/)
+    assert.doesNotMatch(child.stdoutText, /closed: code=4002/)
+    first.close()
+    second.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })
