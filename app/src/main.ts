@@ -36,6 +36,7 @@ const LAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.lanAddress'
 const WAN_ENDPOINT_STORAGE_KEY = 'evenAudioPipe.wanAddress'
 const AUTH_TOKEN_STORAGE_KEY = 'evenAudioPipe.authToken'
 const CONNECT_TIMEOUT_MS = 5000
+const AUDIO_CONTROL_TIMEOUT_MS = 1500
 
 const statusEl = document.getElementById('status')!
 const statsEl = document.getElementById('stats')!
@@ -1302,6 +1303,14 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
 
   if (payload.type === 'receiver_status') {
     updateWorkbenchProgressAgents(payload)
+    if (payload.status === 'retry_listen') {
+      clearSpeechProcessingState()
+      setUiStatus('Retrying audio listener...')
+      if (socket === ws && socket.readyState === WebSocket.OPEN) {
+        socket.close(4004, 'receiver requested retry listen')
+      }
+      return
+    }
     setUiStatus(payload.status === 'auth_required'
       ? 'Authenticating receiver...'
       : 'Receiver connected')
@@ -1556,13 +1565,40 @@ async function setAudio(open: boolean) {
   audioOpen = open
   setStats()
   try {
-    await bridge.audioControl(open)
+    await audioControlWithTimeout(open)
   } catch (err) {
     audioOpen = !open
     setStats()
     setUiStatus(`audioControl(${String(open)}) failed`)
     console.error(err)
   }
+}
+
+function stopAudioForReconnect() {
+  audioOpen = false
+  setStats()
+  void audioControlWithTimeout(false).catch(err => {
+    console.warn('audioControl(false) during reconnect failed')
+    console.error(err)
+  })
+}
+
+function audioControlWithTimeout(open: boolean) {
+  return withTimeout(
+    bridge.audioControl(open),
+    AUDIO_CONTROL_TIMEOUT_MS,
+    `audioControl(${String(open)})`,
+  )
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string) {
+  let timer: number | null = null
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== null) window.clearTimeout(timer)
+  })
 }
 
 function delayMs(ms: number) {
@@ -1575,11 +1611,11 @@ async function restartAudioControl(reason: string) {
   try {
     audioOpen = false
     setStats()
-    await bridge.audioControl(false)
+    await audioControlWithTimeout(false)
     await delayMs(MIC_WATCHDOG_RESTART_DELAY_MS)
     audioOpen = true
     setStats()
-    await bridge.audioControl(true)
+    await audioControlWithTimeout(true)
   } catch (err) {
     audioOpen = false
     setStats()
@@ -1705,7 +1741,7 @@ function connect() {
     lastReceiverClose = `${event.code}${event.reason ? ` ${event.reason}` : ''}${event.wasClean ? ' clean' : ' unclean'}`
     setStats()
     clearSpeechProcessingState()
-    await setAudio(false)
+    stopAudioForReconnect()
     if (!cleanedUp) {
       if (opened) {
         audioEndpointIndex = 0
