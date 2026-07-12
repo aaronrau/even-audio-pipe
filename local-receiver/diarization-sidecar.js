@@ -223,7 +223,8 @@ export class DiarizationSidecar {
             attachedAt: new Date().toISOString(),
           }
           this.writeTranscriptForResult(result, transcript)
-          await this.writeSpeakerBreakoutForResult(result, transcript)
+          const breakout = await this.writeSpeakerBreakoutForResult(result, transcript)
+          return { ...result, breakout }
         }
 
         return result

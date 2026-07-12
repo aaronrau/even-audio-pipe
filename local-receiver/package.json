@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "tsx server.js",
-    "check": "node --check server.js workbench-router.js transcript-queue.js diarization-sidecar.js diarization-worker.js diarize-saved-audio.js simulate-audio-session.js && node --import tsx --test test/vad-endpoint.test.mjs test/silero-vad.test.mts test/workbench-router.test.mjs test/transcript-queue.test.mjs test/audio-auth.test.mjs test/diarization-sidecar.test.mjs",
+    "check": "node --check server.js custom-agent.js workbench-router.js transcript-queue.js diarization-sidecar.js diarization-worker.js diarize-saved-audio.js simulate-audio-session.js && node --import tsx --test test/vad-endpoint.test.mjs test/silero-vad.test.mts test/workbench-router.test.mjs test/transcript-queue.test.mjs test/audio-auth.test.mjs test/diarization-sidecar.test.mjs test/custom-agent.test.mjs",
     "diarize:saved": "node diarize-saved-audio.js",
     "simulate:audio": "node simulate-audio-session.js",
+    "test:meemo-stream": "node --import tsx test/meemo-stream.test.mjs",
     "test:auth": "node --import tsx --test test/audio-auth.test.mjs",
     "test:vad": "node --import tsx --test test/vad-endpoint.test.mjs test/silero-vad.test.mts",
     "test:workbench": "node --import tsx --test test/workbench-router.test.mjs"

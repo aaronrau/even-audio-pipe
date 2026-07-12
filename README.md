@@ -548,6 +548,72 @@ within the configured prefix window. Agent summaries posted back to
 `/workbench/summary` are forwarded to connected glasses and saved in history.
 Active progress rows expire after `progressStaleMs` with no new content.
 
+## Custom Voice Agents
+
+Custom voice agents are receiver-side processors and are separate from Speech
+Agent Workbench names. A matching invocation is saved as a normal transcript,
+verified against the authenticated user's enrolled speaker profile, and then
+processed in the background. Verification or processing failures never block
+normal transcript persistence and never fall through to Workbench or the legacy
+terminal integration.
+
+For a multi-segment conversation, speaker authorization applies to the segment
+containing the custom-agent invocation. Once that invocation matches the owner
+profile, the full queued conversation is available to the memo processor; other
+speakers in the conversation do not have to match the owner's voice profile.
+
+The included example config defines `Meemo`, with the STT aliases `Meamo`,
+`Me Mo`, and `Mimo`, as a Markdown key-point processor:
+
+```json
+{
+  "customAgents": [
+    {
+      "id": "meemo",
+      "name": "Meemo",
+      "aliases": ["Meamo", "Me Mo", "Mimo"],
+      "prefixWordLimit": 3,
+      "matchAnywhere": true,
+      "nameCorrectionPrompt": "Normalize Meamo, Me Mo, and Mimo to Meemo when spoken as the invocation.",
+      "processingPrompt": "Return only distinct, deduplicated key points as a Markdown bullet list.",
+      "processingTimeoutMs": 180000,
+      "processingMaxTokens": 8192,
+      "verificationTimeoutMs": 120000,
+      "speakerMatchThreshold": 0.58
+    }
+  ]
+}
+```
+
+With `matchAnywhere` enabled, the invocation may come before or after the
+conversation. A trailing `Mimo` is removed from the memo input while all of the
+preceding transcript is preserved.
+
+Runtime speaker enrollment should be disabled after enrolling a known owner
+sample:
+
+```json
+{
+  "speakerDiarization": {
+    "enrollmentEnabled": false
+  }
+}
+```
+
+Successful custom results use the existing `agent_status` and `agent_summary`
+events. The history row is labeled `[Meemo Memo]`; its existing detail view
+renders the deduplicated key-point bullets directly. The complete raw
+ASR transcript, cleaned transcript, and processed memo remain preserved in the
+`*.meemo.custom.json` audit. No thin-client changes are required.
+
+The reproducible stream test replays the enrolled owner sample through the real
+WebSocket, VAD, and speaker-verification path while using deterministic local
+ASR and LLM responses:
+
+```bash
+npm --prefix local-receiver run test:meemo-stream
+```
+
 ## Output Files
 
 Runtime artifacts are written under `data/` by default:
@@ -561,6 +627,7 @@ Runtime artifacts are written under `data/` by default:
 *.json             metadata
 transcripts.log    append-only transcript JSONL
 message-history/   glasses history JSONL
+*.meemo.custom.json  custom-agent verification and Markdown memo audit
 ```
 
 These files can contain private audio and transcripts. They are ignored by git.

@@ -8,6 +8,14 @@ import { VadEndpoint } from './vad-endpoint.js'
 import { createSileroFrameVad } from './silero-vad.ts'
 import { createDiarizationSidecar } from './diarization-sidecar.js'
 import {
+  customAgentCleanupPrompt,
+  customAgentDetail,
+  findCustomAgentInvocation,
+  normalizeCustomAgents,
+  speakerBreakoutVerified,
+  verifyCustomAgentInvocation,
+} from './custom-agent.js'
+import {
   combineQueuedTranscripts,
   markQueuedTranscriptActivity,
   queuedTranscriptActivityAt,
@@ -145,7 +153,6 @@ let runtimeConfigCache = {
 const audioSockets = new Set()
 const activeAudioSocketsByUser = new Map()
 const audioSocketActivity = new WeakMap()
-let diarizationDispatchQueue = Promise.resolve()
 const transcriptQueuesBySocket = new WeakMap()
 const transcriptQueuesByUser = new Map()
 const activeWorkbenchAgents = new Map()
@@ -355,28 +362,6 @@ function resolveThinClientSocket(preferredSocket, user) {
   }
 
   return preferredSocket
-}
-
-function dispatchDiarization(label, action) {
-  if (!speakerDiarizationConfig.enabled) return
-
-  diarizationDispatchQueue = diarizationDispatchQueue
-    .catch(() => {})
-    .then(() => new Promise(resolveDispatch => setImmediate(resolveDispatch)))
-    .then(() => {
-      try {
-        const result = action()
-        if (result && typeof result.catch === 'function') {
-          result.catch(err => logDiarizationDispatchFailure(label, err))
-        }
-      } catch (err) {
-        logDiarizationDispatchFailure(label, err)
-      }
-    })
-}
-
-function logDiarizationDispatchFailure(label, err) {
-  console.warn(`[diarization] ${label} dispatch failed: ${err?.message || String(err)}`)
 }
 
 function broadcastSocketJson(payload) {
@@ -1205,13 +1190,21 @@ async function transcribeWithWorker(wavPath) {
 
 function currentTranscriptCleanupConfig() {
   const runtimePrompt = readRuntimeCleanupPrompt()
+  const basePrompt = runtimePrompt || transcriptCleanupEnv.prompt || defaultCleanupPrompt()
 
   return {
     ...transcriptCleanupEnv,
     temperature: Number.isFinite(transcriptCleanupEnv.temperature) ? transcriptCleanupEnv.temperature : 0,
     timeoutMs: Number.isFinite(transcriptCleanupEnv.timeoutMs) ? transcriptCleanupEnv.timeoutMs : 15_000,
-    prompt: runtimePrompt || transcriptCleanupEnv.prompt || defaultCleanupPrompt(),
+    prompt: customAgentCleanupPrompt(basePrompt, currentCustomAgents()),
   }
+}
+
+function currentCustomAgents() {
+  return normalizeCustomAgents(
+    readRuntimeConfig()?.customAgents,
+    workbenchAgentNames(),
+  )
 }
 
 function readRuntimeCleanupPrompt() {
@@ -1497,6 +1490,7 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
       headers.authorization = `Bearer ${cleanupConfig.apiKey}`
     }
 
+    const maxTokens = Number(cleanupConfig.maxTokens)
     const res = await fetch(cleanupConfig.url, {
       method: 'POST',
       headers,
@@ -1504,6 +1498,9 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
       body: JSON.stringify({
         model: cleanupConfig.model,
         temperature: cleanupConfig.temperature,
+        ...(Number.isFinite(maxTokens) && maxTokens > 0
+          ? { max_tokens: Math.floor(maxTokens) }
+          : {}),
         messages: [
           {
             role: 'system',
@@ -1535,6 +1532,7 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
     }
 
     const content = body?.choices?.[0]?.message?.content ?? body?.choices?.[0]?.text ?? ''
+    const finishReason = stringValue(body?.choices?.[0]?.finish_reason)
     const cleaned = workbenchRouter.preserveCommand(rawTranscript, stripCleanupDecorations(content))
 
     if (!cleaned) {
@@ -1545,7 +1543,10 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
       enabled: true,
       ok: true,
       model: cleanupConfig.model,
+      maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.floor(maxTokens) : undefined,
       text: cleaned,
+      finishReason,
+      usage: body?.usage,
     }
   } catch (err) {
     const error = err?.name === 'AbortError'
@@ -1556,6 +1557,9 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
       enabled: true,
       ok: false,
       model: cleanupConfig.model,
+      maxTokens: Number.isFinite(Number(cleanupConfig.maxTokens))
+        ? Number(cleanupConfig.maxTokens)
+        : undefined,
       text: rawTranscript,
       error,
     }
@@ -1619,27 +1623,14 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
   )
   if (rawTranscript) {
     console.log(`[transcript:raw] ${rawTranscript}`)
-    dispatchDiarization('process saved audio', () => {
-      return diarizationSidecar.processExistingAudio(paths.wav, {
-        transcriptText: rawTranscript,
-        context: {
-          jobId,
-          user,
-          source: 'main-asr',
-        },
-        metadata: {
-          jobId,
-          user,
-          source: 'saved-audio',
-        },
-      })
-    })
+    const diarizationPromise = startSavedAudioDiarization(paths, rawTranscript, jobId, user)
     enqueueRawTranscript({
       rawTranscript,
       paths,
       targetSocket,
       jobId,
       user,
+      diarizationPromise,
     })
   } else {
     console.log(`[asr] no transcript returned job=${jobId} wav=${paths.wav} ${socketDebugLabel(targetSocket)}`)
@@ -1652,6 +1643,43 @@ async function processRecording(paths, bytes, targetSocket, jobId, user) {
       job: jobId,
       status: 'no_transcript',
       file: basename(paths.wav),
+    })
+  }
+}
+
+function startSavedAudioDiarization(paths, rawTranscript, jobId, user) {
+  if (!speakerDiarizationConfig.enabled) {
+    return Promise.resolve({
+      verificationFailed: true,
+      reason: 'diarization_disabled',
+    })
+  }
+
+  try {
+    return diarizationSidecar
+      .processExistingAudio(paths.wav, {
+        transcriptText: rawTranscript,
+        context: {
+          jobId,
+          user,
+          source: 'main-asr',
+        },
+        metadata: {
+          jobId,
+          user,
+          source: 'saved-audio',
+        },
+      })
+      .catch(err => ({
+        verificationFailed: true,
+        reason: 'diarization_failed',
+        error: err?.message || String(err),
+      }))
+  } catch (err) {
+    return Promise.resolve({
+      verificationFailed: true,
+      reason: 'diarization_failed',
+      error: err?.message || String(err),
     })
   }
 }
@@ -1910,12 +1938,253 @@ async function flushRawTranscriptBatch(items) {
     `[transcript] thin-client delivery job=${lastItem.jobId} sent=${transcriptSent} file=${basename(paths.txt)} ${socketDebugLabel(targetSocket)}`,
   )
   console.log(`[asr] queued transcript saved: ${paths.txt}`)
+  const customRoute = findCustomAgentInvocation(
+    cleanedTranscript,
+    rawTranscript,
+    currentCustomAgents(),
+  )
+  if (customRoute) {
+    startCustomAgent(customRoute, {
+      batch,
+      rawTranscript,
+      cleanedTranscript,
+      paths,
+      targetSocket,
+      user,
+      jobId: lastItem.jobId,
+      jobIds,
+    })
+    return
+  }
+
   await maybePostToWorkbench(cleanedTranscript, targetSocket, {
     jobId: lastItem.jobId,
     user,
     rawText: rawTranscript,
   })
   await maybePostToTerminal(cleanedTranscript)
+}
+
+function startCustomAgent(route, context) {
+  try {
+    void handleCustomAgent(route, context).catch(err => {
+      handleCustomAgentFailure(route, context, err)
+    })
+  } catch (err) {
+    handleCustomAgentFailure(route, context, err)
+  }
+}
+
+async function handleCustomAgent(route, context) {
+  console.log(`[custom-agent] ${route.agent.name} invoked job=${context.jobId}`)
+
+  let diarizationResults
+  try {
+    diarizationResults = await withTimeout(
+      Promise.all(context.batch.map(item => item.diarizationPromise)),
+      route.agent.verificationTimeoutMs,
+    )
+  } catch (err) {
+    writeCustomAgentRecordSafely(route, context, {
+      status: 'speaker_verification_failed',
+      error: err?.message || String(err),
+    })
+    sendCustomAgentSavedStatus(route, context, 'speaker_verification_failed')
+    return
+  }
+
+  const invocationVerification = verifyCustomAgentInvocation(
+    context.batch.map(item => item.rawTranscript),
+    diarizationResults,
+    route.agent,
+  )
+  const verification = customAgentVerificationSummary(
+    diarizationResults,
+    invocationVerification.verified,
+    invocationVerification.invocationIndexes,
+    route.agent.speakerMatchThreshold,
+  )
+  if (!invocationVerification.verified) {
+    writeCustomAgentRecordSafely(route, context, {
+      status: 'speaker_unverified',
+      verification,
+    })
+    sendCustomAgentSavedStatus(route, context, 'speaker_unverified')
+    return
+  }
+
+  logThinClientSendForUser(context.targetSocket, context.user, {
+    type: 'agent_status',
+    status: 'sending',
+    agent: route.agent.name,
+    jobId: context.jobId,
+  })
+
+  let processed
+  try {
+    processed = await cleanTranscript(route.message, {
+      ...currentTranscriptCleanupConfig(),
+      enabled: true,
+      prompt: route.agent.processingPrompt,
+      timeoutMs: route.agent.processingTimeoutMs,
+      maxTokens: route.agent.processingMaxTokens,
+    })
+  } catch (err) {
+    processed = {
+      ok: false,
+      text: '',
+      error: err?.message || String(err),
+    }
+  }
+
+  if (!processed.ok || !normalizeTranscript(processed.text || '')) {
+    writeCustomAgentRecordSafely(route, context, {
+      status: 'custom_processing_failed',
+      verification,
+      processing: customAgentProcessingSummary(processed),
+    })
+    sendCustomAgentSavedStatus(route, context, 'custom_processing_failed')
+    return
+  }
+
+  const processedText = normalizeTranscript(processed.text)
+  const detail = customAgentDetail({
+    rawTranscript: context.rawTranscript,
+    cleanedTranscript: context.cleanedTranscript,
+    agentName: route.agent.name,
+    processedText,
+  })
+  const historyLabel = `[${route.agent.name} Memo]`
+  const createdAt = new Date().toISOString()
+
+  writeCustomAgentRecordSafely(route, context, {
+    status: 'processed',
+    verification,
+    processing: customAgentProcessingSummary(processed),
+    processed: processedText,
+    detail,
+    createdAt,
+  })
+  appendMessageHistory({
+    label: historyLabel,
+    text: historyLabel,
+    detail: processedText,
+    createdAt,
+  })
+  logThinClientSendForUser(context.targetSocket, context.user, {
+    type: 'agent_status',
+    status: 'sent',
+    agent: route.agent.name,
+    message: route.message,
+    jobId: context.jobId,
+  })
+  logThinClientSendForUser(context.targetSocket, context.user, {
+    type: 'agent_summary',
+    agent: historyLabel,
+    text: historyLabel,
+    summary: historyLabel,
+    detail: processedText,
+    detail_response: processedText,
+    phase: 'final',
+    is_final: true,
+    createdAt,
+  })
+  console.log(`[custom-agent] ${route.agent.name} memo saved job=${context.jobId}`)
+}
+
+function handleCustomAgentFailure(route, context, err) {
+  const error = err?.message || String(err)
+  console.error(`[custom-agent] ${route.agent.name} failed job=${context.jobId}: ${error}`)
+  writeCustomAgentRecordSafely(route, context, {
+    status: 'custom_agent_failed',
+    error,
+  })
+  sendCustomAgentSavedStatus(route, context, 'custom_agent_failed')
+}
+
+function sendCustomAgentSavedStatus(route, context, reason) {
+  logThinClientSendForUser(context.targetSocket, context.user, {
+    type: 'agent_status',
+    status: 'missing_agent_prefix',
+    reason,
+    agent: route.agent.name,
+    jobId: context.jobId,
+  })
+}
+
+function writeCustomAgentRecordSafely(route, context, result) {
+  const id = basename(context.paths.json, '.json')
+  const path = join(transcriptDirPath, `${id}.${route.agent.id}.custom.json`)
+  try {
+    writeJsonFile(path, {
+      type: 'custom_agent_result',
+      createdAt: result.createdAt || new Date().toISOString(),
+      agentId: route.agent.id,
+      agent: route.agent.name,
+      rawInvocation: route.rawInvocation,
+      cleanedInvocation: route.cleanedInvocation,
+      raw: context.rawTranscript,
+      cleaned: context.cleanedTranscript,
+      message: route.message,
+      processed: result.processed || '',
+      status: result.status,
+      verification: result.verification,
+      processing: result.processing,
+      detail: result.detail,
+      error: result.error,
+      jobId: context.jobId,
+      jobIds: context.jobIds,
+      files: {
+        audio: context.paths.wav,
+        rawTranscript: context.paths.rawTxt,
+        cleanedTranscript: context.paths.cleanTxt,
+        displayTranscript: context.paths.txt,
+      },
+    })
+  } catch (err) {
+    console.warn(`[custom-agent] failed to save ${path}: ${err.message}`)
+  }
+}
+
+function customAgentVerificationSummary(results, verified, invocationIndexes, threshold) {
+  const invocationSegments = new Set(invocationIndexes)
+  return {
+    verified,
+    policy: 'verified_invocation_segments',
+    speakerMatchThreshold: threshold,
+    segments: results.map((result, index) => ({
+      sourceSegmentId: result?.sourceSegmentId,
+      invocation: invocationSegments.has(index),
+      verified: speakerBreakoutVerified(result, threshold),
+      reason: result?.reason || '',
+      turns: (result?.breakout?.turns || []).map(turn => ({
+        speaker: turn.speaker?.displayName || turn.speaker?.id || '',
+        matchedProfile: turn.speaker?.matchedProfile === true,
+        profileId: turn.speaker?.profileId,
+        profileSimilarity: turn.speaker?.profileSimilarity,
+      })),
+    })),
+  }
+}
+
+function customAgentProcessingSummary(processed) {
+  return {
+    ok: processed?.ok === true,
+    model: processed?.model,
+    maxTokens: processed?.maxTokens,
+    finishReason: processed?.finishReason,
+    completionTokens: processed?.usage?.completion_tokens,
+    error: processed?.error,
+  }
+}
+
+function withTimeout(promise, timeoutMs) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs)
+    timer.unref?.()
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }
 
 function queuedSegmentMetadata(item) {
@@ -2670,6 +2939,7 @@ wss.on('connection', (socket, req) => {
 
 server.listen(port, '0.0.0.0', () => {
   const startupCleanupConfig = currentTranscriptCleanupConfig()
+  const startupCustomAgents = currentCustomAgents()
   const startupUserAuthConfig = currentUserAuthConfig()
   console.log(`[server] HTTP health: http://0.0.0.0:${port}/health`)
   console.log(`[server] WebSocket audio: ws://0.0.0.0:${port}/audio`)
@@ -2683,6 +2953,11 @@ server.listen(port, '0.0.0.0', () => {
     `[server] Workbench forwarding: ${workbenchConfig.enabled ? `${workbenchConfig.url.replace(/\/$/, '')}/messages` : 'disabled'}`,
   )
   console.log(`[server] Workbench route: ${workbenchRouter.routeDescription()}`)
+  console.log(
+    `[server] Custom agents: ${startupCustomAgents.length
+      ? startupCustomAgents.map(agent => `${agent.name} (${agent.aliases.join(', ')})`).join('; ')
+      : 'none'}`,
+  )
   console.log(`[server] Workbench summary webhook: http://0.0.0.0:${port}${workbenchConfig.summaryPath}`)
   console.log(`[server] Workbench summary auth: ${workbenchConfig.summaryToken ? 'enabled' : 'disabled'}`)
   console.log(`[server] Even user allowlist: ${startupUserAuthConfig.required ? 'enabled' : 'disabled'}`)

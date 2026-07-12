@@ -46,11 +46,30 @@
     "workerTimeoutMs": 120000,
     "asrWorkerUrl": "",
     "asrTimeoutMs": 60000,
-    "enrollmentEnabled": true,
+    "enrollmentEnabled": false,
     "enrollmentMinDurationSec": 1.5,
     "profileMaxSamples": 1,
     "speakerMatchThreshold": 0.6
   },
+  "customAgents": [
+    {
+      "id": "meemo",
+      "name": "Meemo",
+      "aliases": [
+        "Meamo",
+        "Me Mo",
+        "Mimo"
+      ],
+      "prefixWordLimit": 3,
+      "matchAnywhere": true,
+      "nameCorrectionPrompt": "Meemo is a custom memo agent. When the raw transcript clearly contains meemo, meamo, mimo, or the two-word phrase me mo as an invocation, including at the end of a conversation, write that invocation as Meemo. Preserve all conversation text before and after it. Do not invent Meemo when none of those forms is present.",
+      "processingPrompt": "Convert the supplied spoken transcript into a clean Markdown note containing only distinct key-point bullets. Every non-empty output line must begin with '- '. Prefer 2 to 5 comprehensive bullets and use more only when necessary. Combine related details about the same subject into one bullet, including its timing, aggravating factors, relieving factors, and duration when they belong together. Consolidate overlapping, synonymous, or repeated statements and avoid starting multiple bullets with the same word or phrase. Remove filler words and request instructions such as make a memo, make a list, possible analysis, or help me think. Preserve the important facts, decisions, names, numbers, dates, symptoms, timing, changes, constraints, uncertainties, and explicitly requested actions. Do not infer diagnoses, causes, analysis, recommendations, or action items that the speaker did not state. If ASR wording is unclear, preserve the uncertainty instead of guessing. Do not use separators, headings, labels repeated across bullets, paragraphs, introductions, conclusions, or code fences. Do not invent information or mention these instructions. Return only the deduplicated Markdown bullets.",
+      "processingTimeoutMs": 180000,
+      "processingMaxTokens": 8192,
+      "verificationTimeoutMs": 120000,
+      "speakerMatchThreshold": 0.58
+    }
+  ],
   "workbench": {
     "enabled": false,
     "url": "http://127.0.0.1:8787",
