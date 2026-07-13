@@ -1384,10 +1384,24 @@ function audioActivitySummary(socket) {
 
 function promoteAudioSocketForChunk(socket, user) {
   const key = activeAudioSocketKey(user)
-  if (!key) return
+  if (!key) return true
 
   const previous = activeAudioSocketsByUser.get(key)
-  if (previous === socket) return
+  if (previous === socket) return true
+
+  const previousActivity = previous ? audioSocketActivity.get(previous) : null
+  const previousActivityAt = previousActivity?.lastAudioAt || previousActivity?.startedAt || 0
+  const previousProtectMs = previousActivity?.lastAudioAt
+    ? activeAudioSocketProtectMs
+    : activeAudioSocketStartGraceMs
+  if (
+    previous &&
+    previous.readyState === WebSocket.OPEN &&
+    previousActivityAt &&
+    Date.now() - previousActivityAt <= previousProtectMs
+  ) {
+    return false
+  }
 
   activeAudioSocketsByUser.set(key, socket)
   if (previous && previous.readyState === WebSocket.OPEN) {
@@ -1402,6 +1416,12 @@ function promoteAudioSocketForChunk(socket, user) {
   } else {
     console.log(`[audio] active socket for ${key} selected on audio chunk; ${socketDebugLabel(socket)}`)
   }
+  sendSocketJson(socket, {
+    type: 'receiver_status',
+    status: 'active',
+    reason: 'audio_socket_takeover',
+  })
+  return true
 }
 
 function clearActiveAudioSocket(socket, key) {
@@ -1819,19 +1839,20 @@ function scheduleTranscriptQueueFlush(targetSocket, retryMs = null, user = null)
   queue.timer.unref?.()
 }
 
-async function flushTranscriptQueue(targetSocket, user = null) {
+async function flushTranscriptQueue(targetSocket, user = null, options = {}) {
   const queue = getTranscriptQueue(targetSocket, user)
   if (!queue || !queue.items.length) return
 
+  const force = options.force === true
   const maxHoldReached = transcriptQueueMaxHoldReached(queue)
   const lastActivityAt = queuedTranscriptActivityAt(queue)
   const elapsedMs = Date.now() - lastActivityAt
-  if (!maxHoldReached && elapsedMs < transcriptQueueIdleMs) {
+  if (!force && !maxHoldReached && elapsedMs < transcriptQueueIdleMs) {
     scheduleTranscriptQueueFlush(targetSocket)
     return
   }
 
-  if ((queue.activeSegments > 0 || queue.pendingAsrJobs > 0) && !maxHoldReached) {
+  if (!force && (queue.activeSegments > 0 || queue.pendingAsrJobs > 0) && !maxHoldReached) {
     console.log(
       `[transcript-queue] flush delayed; activeSegments=${queue.activeSegments} pendingAsrJobs=${queue.pendingAsrJobs}`,
     )
@@ -1845,9 +1866,29 @@ async function flushTranscriptQueue(targetSocket, user = null) {
     )
   }
 
+  if (force) {
+    console.log(
+      `[transcript-queue] flush requested by client; queuedSegments=${queue.items.length} activeSegments=${queue.activeSegments} pendingAsrJobs=${queue.pendingAsrJobs}`,
+    )
+  }
+
   const items = queue.items
   queue.items = []
   await flushRawTranscriptBatch(items)
+}
+
+function forceTranscriptQueueFlush(targetSocket, user = null) {
+  const queue = getTranscriptQueue(targetSocket, user)
+  if (!queue || !queue.items.length) return false
+
+  if (queue.timer) {
+    clearTimeout(queue.timer)
+    queue.timer = null
+  }
+  queue.flushPromise = queue.flushPromise
+    .catch(() => {})
+    .then(() => flushTranscriptQueue(targetSocket, user, { force: true }))
+  return true
 }
 
 function transcriptQueueMaxHoldReached(queue) {
@@ -2767,6 +2808,7 @@ wss.on('connection', (socket, req) => {
           status: 'accepted',
           user: evenUser,
           restricted: auth.required,
+          standby: activeAudioSocketPromotion.standby,
         }, {
           auth: 'user_accepted',
           activeKey: activeAudioSocketKeyForConnection,
@@ -2782,6 +2824,14 @@ wss.on('connection', (socket, req) => {
       }
       if (control?.type === 'get_message_history') {
         sendMessageHistory(socket)
+      }
+      if (control?.type === 'flush_transcript_queue') {
+        const auth = currentUserAuthConfig()
+        if (auth.required && !userAuthenticated) {
+          console.warn('[transcript-queue] rejected client flush before Even user authentication')
+          return
+        }
+        forceTranscriptQueueFlush(socket, evenUser)
       }
       if (control?.type === 'peek_progress') {
         const auth = currentUserAuthConfig()
@@ -2819,7 +2869,7 @@ wss.on('connection', (socket, req) => {
       userAuthenticated = true
     }
 
-    promoteAudioSocketForChunk(socket, evenUser)
+    if (!promoteAudioSocketForChunk(socket, evenUser)) return
     handleAudioChunk(chunk)
   }
 

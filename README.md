@@ -142,12 +142,17 @@ When speech is detected, the glasses show a compact waveform. Once ASR returns
 server-confirmed queued text, the glasses show `Queued: ...`. If the transcript
 is sent to Workbench, that changes to `Sent: Agent, ...` for two seconds. If it
 is saved without agent routing, it changes to `Saved: ...` for two seconds.
+Tap while `Queued:` is selected to flush that server queue immediately. The
+client opens history, and the saved transcript replaces the pending row as an
+open detail view.
 
 **4. Open history**
 
 Tap the glasses history control to open recent transcripts and agent summaries.
 Tap an item to open detail. Tap again to return to the list. Opening history
 clears the transient live transcript display.
+When queued text is on the selected Back row, tapping commits it instead of
+closing history.
 When a workbench agent is active and in progress, the history list also shows a
 progress row such as `Flux (...)`; selecting it asks the receiver for an
 on-demand local summary of that agent's latest tmux output. The returned
@@ -187,6 +192,7 @@ workbench.
 **Speech Status Display**
 
 - Server-confirmed queued transcript batches are displayed as `Queued: ...`.
+- A tap on selected queued text requests one immediate server-side flush.
 - Final transcript events append history but do not clear queued live text.
 - Workbench sends display as `Sent: Agent, ...` for two seconds.
 - Ambient saved-only speech displays as `Saved: ...` for two seconds.
@@ -196,6 +202,7 @@ workbench.
 
 - Recent user transcripts and agent summaries are stored in JSONL.
 - Glasses tap navigation opens a list view and detail view.
+- A tap-flushed transcript opens its durable history detail after persistence.
 - Long details page by visual lines to fit the Even text container.
 
 **Private/Public Endpoint Failover**

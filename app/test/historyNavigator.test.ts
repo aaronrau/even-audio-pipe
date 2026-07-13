@@ -291,6 +291,22 @@ const queuedWaitingRow = queuedWaitingContent.split('\n')[0]
 assert.match(queuedWaitingRow, /Queued: queued transcript now waiting/)
 assert.doesNotMatch(queuedWaitingRow, /[⧖⋈⦚]/)
 
+const flushedTranscriptNavigator = new HistoryNavigator({
+  width: CANVAS_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  scrollOverlapLines: 1,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+flushedTranscriptNavigator.open()
+flushedTranscriptNavigator.setPendingTranscript('queued transcript waiting for tap')
+flushedTranscriptNavigator.appendEntry(entry(9, 'You', 'queued transcript saved by tap'))
+const flushedTranscriptDetail = flushedTranscriptNavigator.openLatestTranscriptDetail()
+assert.equal(flushedTranscriptDetail.action, 'opened_detail')
+assert.equal(flushedTranscriptDetail.mode, 'detail')
+assert.match(flushedTranscriptDetail.content, /queued transcript saved by tap/)
+assertViewportSafe(flushedTranscriptDetail.content)
+
 const progressNavigator = new HistoryNavigator({
   width: CANVAS_WIDTH,
   height: CANVAS_HEIGHT,

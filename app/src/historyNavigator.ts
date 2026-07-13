@@ -361,6 +361,22 @@ export class HistoryNavigator {
     return this.result('opened_detail', item.label)
   }
 
+  openLatestTranscriptDetail(): HistoryNavigatorResult {
+    if (this.mode === 'closed') return this.result('none')
+
+    const item = this.currentEntryItems()
+      .find(candidate => candidate.kind === 'transcript')
+    if (!item) return this.result('none')
+
+    this.selectedItemId = item.id
+    this.seenDetailIds.add(item.id)
+    this.pendingProgressDetailItem = null
+    this.retainedDetailItem = null
+    this.activeProgressDetailAgentKey = ''
+    this.openDetail(item)
+    return this.result('opened_detail')
+  }
+
   setPendingTranscript(text: string, _frame = '') {
     const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID

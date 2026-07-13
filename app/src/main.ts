@@ -80,6 +80,8 @@ let historyUpdatePending = false
 let lastHistoryRequestedContent = ''
 let lastHistoryRenderedContent = ''
 let lastStatusContainerUpgradeAt = 0
+let lastStatusContainerContent = ''
+let pendingStatusContainerContent = ''
 let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
@@ -92,6 +94,7 @@ const micWatchdogState = new WeakMap<WebSocket, {
 let micWatchdogTimer: number | null = null
 let micWatchdogSocket: WebSocket | null = null
 let receiverState = 'disconnected'
+let receiverStandby = false
 let lastReceiverClose = ''
 let reconnectTimer: number | null = null
 let connectionAttempt = 0
@@ -108,6 +111,8 @@ let startupPromptVisible = true
 let backendStartupPrompt = ''
 let speechDispatchDisplay: SpeechDispatchDisplay | null = null
 let deferredLiveTranscript: { text: string; label: string; detail: string } | null = null
+let queuedTranscriptFlushRequested = false
+let openFlushedTranscriptDetail = false
 
 const GLASSES_LINE_WIDTH = 52
 const GLASSES_MAX_LINES = 7
@@ -645,6 +650,7 @@ function requestHistoryWindowUpdate() {
 
 function cancelPendingStatusRender() {
   statusRenderRevision += 1
+  pendingStatusContainerContent = ''
 }
 
 function requestMessageHistory(reason: string) {
@@ -653,6 +659,19 @@ function requestMessageHistory(reason: string) {
     type: 'get_message_history',
     reason,
   }))
+}
+
+function requestQueuedTranscriptFlush() {
+  if (queuedTranscriptFlushRequested) return true
+  if (ws?.readyState !== WebSocket.OPEN) {
+    setUiStatus('Receiver disconnected')
+    return false
+  }
+
+  queuedTranscriptFlushRequested = true
+  ws.send(JSON.stringify({ type: 'flush_transcript_queue' }))
+  setUiStatus('Saving queued transcript...')
+  return true
 }
 
 function requestPeekProgress(agent: string) {
@@ -736,15 +755,26 @@ async function renderHistoryContent(content = historyNavigator.content()) {
 }
 
 function upgradeStatusContainer(content: string) {
-  const revision = ++statusRenderRevision
+  if (receiverStandby) return Promise.resolve(true)
+
   const safeContent = content.slice(0, TEXT_UPGRADE_LIMIT)
+  if (safeContent === pendingStatusContainerContent) return statusRenderQueue
+  if (!pendingStatusContainerContent && safeContent === lastStatusContainerContent) {
+    return Promise.resolve(true)
+  }
+
+  const revision = ++statusRenderRevision
+  pendingStatusContainerContent = safeContent
 
   statusRenderQueue = statusRenderQueue
     .catch(() => false)
     .then(async () => {
-      if (revision !== statusRenderRevision) return true
+      if (revision !== statusRenderRevision) {
+        if (pendingStatusContainerContent === safeContent) pendingStatusContainerContent = ''
+        return true
+      }
       lastStatusContainerUpgradeAt = Date.now()
-      return bridge.textContainerUpgrade(
+      const rendered = await bridge.textContainerUpgrade(
         new TextContainerUpgrade({
           containerID: STATUS_CONTAINER_ID,
           containerName: STATUS_CONTAINER_NAME,
@@ -753,6 +783,9 @@ function upgradeStatusContainer(content: string) {
           content: safeContent,
         }),
       )
+      if (rendered) lastStatusContainerContent = safeContent
+      if (pendingStatusContainerContent === safeContent) pendingStatusContainerContent = ''
+      return rendered
     })
 
   return statusRenderQueue
@@ -846,6 +879,16 @@ async function handleHistoryTap() {
   historyTransitioning = true
 
   try {
+    const queuedBackSelected = speechDispatchDisplay?.state === 'queued' && (
+      !isHistoryMode() || historyNavigator.debug().selectedRow === 0
+    )
+    if (queuedBackSelected) {
+      if (!requestQueuedTranscriptFlush()) return
+      openFlushedTranscriptDetail = true
+      if (!isHistoryMode()) await showHistoryWindow()
+      return
+    }
+
     if (!isHistoryMode()) {
       await showHistoryWindow()
       return
@@ -898,6 +941,8 @@ function clearSpeechProcessingState() {
   speechDetected = false
   waveformFrameIndex = 0
   clearSpeechDispatchDisplay()
+  queuedTranscriptFlushRequested = false
+  openFlushedTranscriptDetail = false
   clearLiveTranscriptDisplay()
   historyNavigator.clearPendingTranscript()
   requestHistoryWindowUpdate()
@@ -975,6 +1020,7 @@ function showLiveTranscript(text: string) {
 function setQueuedSpeechDisplay(text: string) {
   const queuedText = normalizeSpeechDispatchText(text)
   if (!queuedText) return
+  if (speechDispatchDisplay?.state === 'queued' && speechDispatchDisplay.text === queuedText) return
 
   speechDetected = false
   waveformFrameIndex = 0
@@ -988,6 +1034,7 @@ function setQueuedSpeechDisplay(text: string) {
     state: 'queued',
     text: queuedText,
   }
+  queuedTranscriptFlushRequested = false
   historyNavigator.setPendingTranscript(queuedText)
   transcriptEl.textContent = formatSpeechDispatchDisplay(speechDispatchDisplay)
   requestHistoryWindowUpdate()
@@ -1006,6 +1053,7 @@ function setTerminalSpeechDisplay(display: SpeechDispatchDisplay) {
     message: normalizedMessage,
     agent: normalizedAgent,
   }
+  queuedTranscriptFlushRequested = false
   clearLiveTranscriptDisplay()
   historyNavigator.clearPendingTranscript()
   transcriptEl.textContent = formatSpeechDispatchDisplay(speechDispatchDisplay)
@@ -1135,7 +1183,15 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
         : normalized
       if (!speechDispatchDisplay) showLiveTranscript(normalized)
     }
-    requestHistoryWindowUpdate()
+    queuedTranscriptFlushRequested = false
+    if (openFlushedTranscriptDetail && isHistoryMode()) {
+      openFlushedTranscriptDetail = false
+      const result = historyNavigator.openLatestTranscriptDetail()
+      syncHistoryMode()
+      void renderHistoryContent(result.content)
+    } else {
+      requestHistoryWindowUpdate()
+    }
     setUiStatus('Transcript saved')
     return
   }
@@ -1303,6 +1359,21 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
 
   if (payload.type === 'receiver_status') {
     updateWorkbenchProgressAgents(payload)
+    if (payload.status === 'standby') {
+      receiverStandby = true
+      cancelPendingStatusRender()
+      statusEl.textContent = 'Receiver standby'
+      return
+    }
+    if (payload.status === 'active') {
+      const wasStandby = receiverStandby
+      receiverStandby = false
+      if (wasStandby) lastStatusContainerContent = ''
+      if (isHistoryMode()) requestHistoryWindowUpdate()
+      else void renderGlassesStatus()
+      setUiStatus('Receiver connected')
+      return
+    }
     if (payload.status === 'retry_listen') {
       clearSpeechProcessingState()
       setUiStatus('Retrying audio listener...')
@@ -1324,6 +1395,16 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
 
   if (payload.type === 'auth_status') {
     if (payload.status === 'accepted') {
+      if (typeof payload.standby === 'boolean') {
+        const wasStandby = receiverStandby
+        receiverStandby = payload.standby
+        if (receiverStandby) cancelPendingStatusRender()
+        else if (wasStandby) {
+          lastStatusContainerContent = ''
+          if (isHistoryMode()) requestHistoryWindowUpdate()
+          else void renderGlassesStatus()
+        }
+      }
       void startAudioStream(socket)
     } else if (payload.status === 'rejected') {
       setUiStatus('Authentication rejected')
@@ -1526,6 +1607,7 @@ if (created !== 0) {
   setUiStatus(`Startup page failed: ${created}`)
   throw new Error(`createStartUpPageContainer failed: ${created}`)
 }
+lastStatusContainerContent = currentLiveGlassesContent().slice(0, TEXT_UPGRADE_LIMIT)
 
 async function startAudioStream(socket: WebSocket) {
   if (socket !== ws || socket.readyState !== WebSocket.OPEN || startedAudioSockets.has(socket)) return
@@ -1789,12 +1871,11 @@ unsubscribe = bridge.onEvenHubEvent(event => {
   const pcm = normalizePcm(event.audioEvent?.audioPcm)
   if (pcm) {
     const currentSocket = ws
-    if (currentSocket?.readyState === WebSocket.OPEN) {
+    if (currentSocket?.readyState === WebSocket.OPEN && startedAudioSockets.has(currentSocket)) {
       currentSocket.send(pcm)
       markAudioChunkSent(currentSocket, pcm.byteLength)
       if (sentChunks % 10 === 0) {
         setStats()
-        void renderGlassesStatus()
       }
     } else {
       droppedChunks += 1

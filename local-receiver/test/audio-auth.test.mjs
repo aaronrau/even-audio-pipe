@@ -359,6 +359,115 @@ test('receiver keeps current audio socket active for the same Even user', async 
   }
 })
 
+test('receiver ignores simultaneous standby audio without switching active sockets', async () => {
+  const { child, dir, port } = await startReceiver()
+
+  try {
+    const first = await openSocket(port)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    sendAudioChunks(first, 6)
+    await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+
+    const second = await openSocket(port)
+    const standbyStatus = waitForJson(second, message => (
+      message.type === 'receiver_status' &&
+      message.status === 'standby' &&
+      message.reason === 'active_socket_has_audio'
+    ))
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await standbyStatus
+
+    for (let index = 0; index < 12; index += 1) {
+      first.send(Buffer.alloc(3200, 1))
+      second.send(Buffer.alloc(3200, 1))
+      await delay(10)
+    }
+    await delay(100)
+
+    assert.equal(first.readyState, WebSocket.OPEN)
+    assert.equal(second.readyState, WebSocket.OPEN)
+    assert.equal(
+      countOccurrences(child.stdoutText, /\[audio\] stream started: receiving G2 mic chunks/g),
+      1,
+    )
+    assert.doesNotMatch(child.stdoutText, /switching active socket for uid:same-user on audio chunk/)
+    first.close()
+    second.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver emits one queued transcript when duplicate sockets send the same audio', async () => {
+  const { child, dir, port } = await startReceiver({
+    ASR_COMMAND: "printf 'single queued transcript'",
+    ASR_CHUNK_MODE: 'fixed',
+    ASR_SEGMENT_SECONDS: '0.01',
+    MIN_ASR_BYTES: '1',
+    TRANSCRIPT_QUEUE_IDLE_MS: '60000',
+  })
+
+  try {
+    const first = await openSocket(port)
+    first.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await waitForJson(first, message => message.type === 'onboarding_prompt')
+
+    const second = await openSocket(port)
+    const secondPrompt = waitForJson(second, message => message.type === 'onboarding_prompt')
+    second.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'same-user' },
+    }))
+    await secondPrompt
+
+    const firstMessages = collectJson(first, 500)
+    const secondMessages = collectJson(second, 500)
+    first.send(Buffer.alloc(320, 1))
+    second.send(Buffer.alloc(320, 1))
+    const messages = [...await firstMessages, ...await secondMessages]
+    const queued = messages.filter(message => (
+      message.type === 'asr_status' && message.status === 'queued'
+    ))
+
+    assert.equal(queued.length, 1)
+    assert.equal(queued[0].queuedText, 'single queued transcript')
+    assert.equal(countOccurrences(child.stdoutText, /\[asr\] request queued job=/g), 1)
+    assert.doesNotMatch(child.stdoutText, /switching active socket for uid:same-user on audio chunk/)
+    first.close()
+    second.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('receiver lets newer socket replace zero-audio same-user socket inside start grace', async () => {
   const secret = 'local-test-secret'
   const { child, dir, port } = await startReceiver({
@@ -526,7 +635,7 @@ test('receiver closes an open socket when audio chunks stall', async () => {
   }
 })
 
-test('receiver does not close standby sockets when their audio goes idle', async () => {
+test('receiver keeps an ignored standby socket open while active audio continues', async () => {
   const { child, dir, port } = await startReceiver({
     RECEIVER_STALLED_AUDIO_CLOSE_MS: '1000',
   })
@@ -561,14 +670,19 @@ test('receiver does not close standby sockets when their audio goes idle', async
     }))
     await standbyStatus
 
-    for (let index = 0; index < 30 && !child.stdoutText.includes('[audio] standby idle: no chunks'); index += 1) {
+    for (let index = 0; index < 15; index += 1) {
+      first.send(Buffer.alloc(3200, 1))
       second.send(Buffer.alloc(3200, 1))
       await delay(100)
     }
 
-    assert.match(child.stdoutText, /\[audio\] standby idle: no chunks/)
     assert.equal(first.readyState, WebSocket.OPEN)
     assert.equal(second.readyState, WebSocket.OPEN)
+    assert.equal(
+      countOccurrences(child.stdoutText, /\[audio\] stream started: receiving G2 mic chunks/g),
+      1,
+    )
+    assert.doesNotMatch(child.stdoutText, /switching active socket for uid:same-user on audio chunk/)
     assert.doesNotMatch(child.stdoutText, /retry listen: reason=audio_stream_stalled/)
     assert.doesNotMatch(child.stdoutText, /closed: code=4002/)
     first.close()
@@ -965,6 +1079,46 @@ test('receiver delivers transcript from closed socket audio to current user sock
     assert.equal(transcript.text, 'simulated transcript')
     assert.match(child.stdoutText, /\[thin-client\] rerouting send/)
     second.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver flushes a queued transcript immediately when the client taps', async () => {
+  const { child, dir, port } = await startReceiver({
+    ASR_COMMAND: "printf 'tap flushed transcript'",
+    ASR_CHUNK_MODE: 'fixed',
+    ASR_SEGMENT_SECONDS: '0.01',
+    MIN_ASR_BYTES: '1',
+    TRANSCRIPT_QUEUE_IDLE_MS: '60000',
+    TRANSCRIPT_QUEUE_MAX_HOLD_MS: '60000',
+    TRANSCRIPT_CLEANUP_ENABLED: '0',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'tap-user' },
+    }))
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+
+    const queued = waitForJson(ws, message => (
+      message.type === 'asr_status' && message.status === 'queued'
+    ))
+    ws.send(Buffer.alloc(320, 1))
+    assert.equal((await queued).queuedText, 'tap flushed transcript')
+
+    const transcript = waitForJson(ws, message => message.type === 'transcript')
+    ws.send(JSON.stringify({ type: 'flush_transcript_queue' }))
+    assert.equal((await transcript).text, 'tap flushed transcript')
+    assert.match(child.stdoutText, /\[transcript-queue\] flush requested by client/)
+    ws.close()
   } finally {
     await stopReceiver(child)
     rmSync(dir, { recursive: true, force: true })

@@ -34,7 +34,9 @@ sequenceDiagram
   R->>Q: enqueue raw transcript
   R-->>C: asr_status queued + queuedText
   C->>G: Queued: queuedText
-  Q-->>R: flush after idle/max hold
+  G->>C: tap selected queued text
+  C->>R: flush_transcript_queue
+  Q-->>R: flush after tap, idle, or max hold
   R-->>C: transcript
   C->>H: visible history model append
   R->>H: durable transcript append
@@ -105,6 +107,11 @@ Flush waits until:
 - no speech segment is active;
 - no ASR job is pending;
 - or `transcriptQueue.maxHoldMs` forces a flush.
+
+A tap while queued text is selected sends the authenticated
+`flush_transcript_queue` control. That flushes the completed ASR items already
+in the user's queue immediately; an unfinished speech segment remains a later
+queue item.
 
 Queued event:
 
@@ -215,6 +222,8 @@ History remains durable-event driven:
 - `transcript` appends a `You` row.
 - `agent_summary` appends an agent row with optional detail.
 - queued text appears only as pending state in the history Back row.
+- tapping that selected pending row requests one queue flush and opens the
+  resulting durable transcript detail.
 - terminal `Sent:` and `Saved:` states clear pending history state.
 - details strip repetitive agent introductions so agent names do not duplicate.
 
@@ -225,6 +234,8 @@ The text-container limits still apply:
 - max update payload of `2000` characters;
 - no native scroll dependency;
 - serialized bridge writes through the status render queue.
+- identical content is not sent to the bridge again, and standby client
+  instances do not repaint the shared glasses container.
 
 ## Files
 
