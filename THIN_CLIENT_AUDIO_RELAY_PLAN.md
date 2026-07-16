@@ -48,6 +48,12 @@ and the receiver talks to it through the configured local workbench URL.
 Workbench command parsing/routing is server-side in
 `local-receiver/workbench-router.js`.
 
+When workbench routing is enabled, run `./run-auto.sh --disable-stt` from the
+`speech-agent-workbench` checkout. `linux-voice-codex/run-auto.sh` is a separate
+dictation dashboard and does not provide the required `POST /messages` API.
+For a persistent API, leave workbench terminate commands disabled; terminating
+the tmux session also removes the listener on port `8787`.
+
 ## Intent
 
 - Make the uploaded Even app simple enough to package and maintain.

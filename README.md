@@ -57,6 +57,22 @@ It does not run a cloud service, manage production auth, or replace the Even app
 npm start
 ```
 
+When `workbench.enabled` is `true`, start the separate workbench in another
+terminal. Run this command from the `speech-agent-workbench` checkout, not from
+`linux-voice-codex`; only `speech-agent-workbench` provides the required
+`POST /messages` API on port `8787`:
+
+```bash
+cd /path/to/speech-agent-workbench
+./run-auto.sh --disable-stt
+```
+
+`--disable-stt` is intentional because Agent Audio Pipe already supplies ASR.
+For a persistent API, keep `auto_enable_terminate_commands` set to `false` in
+the workbench config. Enabling and sending `Wolf terminate session` stops the
+entire workbench, including port `8787`; routing then reports `fetch failed`
+until the workbench is started again.
+
 The launcher will:
 
 1. Detect your LAN IP address.
@@ -131,12 +147,22 @@ Agent Audio Pipe
   Receiver health http://127.0.0.1:8788/health
 ```
 
-**2. Scan the QR code**
+**2. Start Speech Agent Workbench when command routing is enabled**
+
+```bash
+cd /path/to/speech-agent-workbench
+./run-auto.sh --disable-stt
+```
+
+Confirm its panes use the same names as `workbench.agents` in `config.json`.
+The default names are `Flux`, `Brock`, `Pike`, and `Wolf`.
+
+**3. Scan the QR code**
 
 Open the Even app and scan the launcher QR. The sideload page should show the
 receiver URL and stream counters.
 
-**3. Speak**
+**4. Speak**
 
 When speech is detected, the glasses show a compact waveform. Once ASR returns
 server-confirmed queued text, the glasses show `Queued: ...`. If the transcript
@@ -146,7 +172,7 @@ Tap while `Queued:` is selected to flush that server queue immediately. The
 client opens history, and the saved transcript replaces the pending row as an
 open detail view.
 
-**4. Open history**
+**5. Open history**
 
 Tap the glasses history control to open recent transcripts and agent summaries.
 Tap an item to open detail. Tap again to return to the list. Opening history
@@ -161,20 +187,19 @@ summary is loading, the detail view shows `Checking...`. If the workbench does
 not send new progress content for three minutes, the receiver clears the
 progress row.
 
-**5. Route a command**
+**6. Route a command**
 
 Enable the workbench integration, then speak an agent-prefixed command:
 
 ```text
 Flux pull latest changes
 Brock check the tests
-Wolf terminate session
 ```
 
 The receiver sends:
 
 ```json
-{ "agent": "Wolf", "message": "terminate session" }
+{ "agent": "Flux", "message": "pull latest changes" }
 ```
 
 Ambient speech without an agent prefix is saved and shown, but not sent to the
@@ -528,6 +553,7 @@ Enable command routing:
   "workbench": {
     "enabled": true,
     "url": "http://127.0.0.1:8787",
+    "token": "local-secret",
     "agents": ["Flux", "Brock", "Pike", "Wolf"],
     "requireAgentPrefix": true,
     "agentPrefixWordLimit": 3,
@@ -540,15 +566,24 @@ Enable command routing:
 
 Start
 [`speech-agent-workbench`](https://github.com/aaronrau/speech-agent-workbench)
-with the receiver webhook:
+from its own checkout with the matching API token and receiver webhook. Do not
+run this command from `linux-voice-codex`; that launcher does not expose the
+workbench `/messages` API:
 
 ```bash
 VOICE_API_ENABLED=1 \
 VOICE_API_PORT=8787 \
+VOICE_API_TOKEN=local-secret \
 VOICE_TMUX_SUMMARY_WEBHOOK_URL=http://127.0.0.1:8788/workbench/summary \
 VOICE_TMUX_SUMMARY_WEBHOOK_TOKEN=summary-secret \
-./run-auto.sh
+./run-auto.sh --disable-stt
 ```
+
+The names in `workbench.agents` must match the names in
+`speech-agent-workbench/config.json` exactly.
+Keep `auto_enable_terminate_commands` disabled when the workbench should remain
+available to the glasses. If termination commands are enabled intentionally,
+`Wolf terminate session` also stops the `/messages` API and requires a restart.
 
 The receiver sends final commands to `/messages` only when an agent name appears
 within the configured prefix window. Agent summaries posted back to

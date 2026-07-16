@@ -34,3 +34,25 @@ The ladder is not code golf. It runs after understanding the touched flow.
   new flags.
 - For app changes, run at least `npm --prefix app run build`. For history or
   glasses navigation changes, also run `npm --prefix app run test:history`.
+
+## Speech Agent Workbench Integration
+
+- Agent Audio Pipe does not start the workbench. When `workbench.enabled` is
+  true, run `./run-auto.sh --disable-stt` separately from the
+  `speech-agent-workbench` checkout. Do not use `linux-voice-codex`; it does not
+  provide the required `POST /messages` API.
+- Keep `workbench.url` aligned with the workbench API bind, normally
+  `http://127.0.0.1:8787`, and keep `workbench.token` identical to the
+  workbench `VOICE_API_TOKEN`/`api_token` value.
+- Keep `workbench.agents` identical to the configured workbench pane names.
+  The default integrated set is `Flux`, `Brock`, `Pike`, and `Wolf`.
+- Keep the summary callback aligned in both processes: the workbench posts to
+  the receiver's `workbench.summaryPath`, normally
+  `http://127.0.0.1:8788/workbench/summary`, using the configured
+  `workbench.summaryToken`.
+- For a persistent Agent Audio Pipe API, keep the workbench's
+  `auto_enable_terminate_commands` disabled. If enabled, a command such as
+  `Wolf terminate session` kills the tmux session and its API on port `8787`,
+  so subsequent receiver requests correctly fail until the workbench restarts.
+- When changing this contract, update `README.md`, `config.example.json`, and
+  the startup guidance in `scripts/start-local.mjs` together.
