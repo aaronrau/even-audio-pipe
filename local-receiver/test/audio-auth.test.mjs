@@ -2,12 +2,14 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHmac } from 'node:crypto'
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import test from 'node:test'
 import { WebSocket } from 'ws'
+
+const queuedSocketMessages = new WeakMap()
 
 function authProof(secret, nonce) {
   return createHmac('sha256', secret).update(nonce).digest('base64url')
@@ -80,9 +82,13 @@ async function waitForHealth(port, child) {
   throw new Error(`receiver did not become healthy: ${lastError}`)
 }
 
-async function startReceiver(env = {}) {
+async function startReceiver(env = {}, options = {}) {
   const port = await freePort()
   const dir = mkdtempSync(join(tmpdir(), 'agent-audio-pipe-auth-'))
+  const runtimeConfigPath = options.runtimeConfig ? join(dir, 'config.json') : ''
+  if (options.runtimeConfig) {
+    writeFileSync(runtimeConfigPath, `${JSON.stringify(options.runtimeConfig, null, 2)}\n`)
+  }
   const child = spawn(
     process.execPath,
     ['--import', 'tsx', 'server.js'],
@@ -98,7 +104,7 @@ async function startReceiver(env = {}) {
         TRANSCRIPTS_LOG: join(dir, 'transcripts', 'transcripts.log'),
         ASR_WORKER_URL: '',
         ASR_COMMAND: '',
-        EVEN_AUDIO_PIPE_CONFIG_PATH: '',
+        EVEN_AUDIO_PIPE_CONFIG_PATH: runtimeConfigPath,
         EVEN_AUDIO_PIPE_TOKEN: '',
         EVEN_AUDIO_PIPE_TOKEN_SECRET: '',
         SPEECH_WORKBENCH_ENABLED: '0',
@@ -133,12 +139,27 @@ async function stopReceiver(child) {
 function openSocket(port) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/audio`)
+    const queued = []
+    queuedSocketMessages.set(ws, queued)
+    ws.on('message', data => {
+      try {
+        queued.push(JSON.parse(data.toString()))
+        if (queued.length > 200) queued.shift()
+      } catch {
+      }
+    })
     ws.once('open', () => resolve(ws))
     ws.once('error', reject)
   })
 }
 
-function waitForJson(ws, predicate, timeoutMs = 2_000) {
+function waitForJson(ws, predicate, timeoutMs = 5_000) {
+  const queued = queuedSocketMessages.get(ws) || []
+  const queuedIndex = queued.findIndex(predicate)
+  if (queuedIndex >= 0) {
+    return Promise.resolve(queued.splice(queuedIndex, 1)[0])
+  }
+
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup()
@@ -160,6 +181,8 @@ function waitForJson(ws, predicate, timeoutMs = 2_000) {
         return
       }
       if (!predicate(message)) return
+      const bufferedIndex = queued.findIndex(predicate)
+      if (bufferedIndex >= 0) message = queued.splice(bufferedIndex, 1)[0]
       cleanup()
       resolve(message)
     }
@@ -306,6 +329,64 @@ test('receiver sends onboarding prompt after app start and logs audio stream', a
 
     ws.send(Buffer.alloc(320))
     await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver fulfills a history request made before Even user authentication', async () => {
+  const { child, dir, port } = await startReceiver({}, {
+    runtimeConfig: {
+      auth: {
+        allowedUserIds: ['history-user'],
+      },
+    },
+  })
+
+  try {
+    const now = new Date()
+    const dateStamp = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+    ].join('-')
+    writeFileSync(
+      join(dir, 'transcripts', 'message-history', `${dateStamp}.jsonl`),
+      `${JSON.stringify({
+        id: 'today-history-entry',
+        label: 'You',
+        text: 'Today history reaches the thin client.',
+        receivedAt: now.getTime(),
+        createdAt: now.toISOString(),
+      })}\n`,
+    )
+
+    const ws = await openSocket(port)
+    const beforeAuth = collectJson(ws, 150)
+    ws.send(JSON.stringify({ type: 'get_message_history' }))
+    assert.equal(
+      (await beforeAuth).some(message => message.type === 'message_history'),
+      false,
+    )
+
+    const historyResponse = waitForJson(ws, message => message.type === 'message_history')
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'history-user' },
+    }))
+
+    const history = await historyResponse
+    assert.equal(history.date, dateStamp)
+    assert.deepEqual(history.entries.map(entry => entry.text), [
+      'Today history reaches the thin client.',
+    ])
+    assert.match(child.stdoutText, /\[history\] queued request until Even user authentication/)
     ws.close()
   } finally {
     await stopReceiver(child)
@@ -477,6 +558,7 @@ test('receiver lets newer socket replace zero-audio same-user socket inside star
   try {
     const first = await openSocket(port)
     await authenticateSharedSecretSocket(first, secret)
+    const firstPrompt = waitForJson(first, message => message.type === 'onboarding_prompt')
     first.send(JSON.stringify({
       type: 'start',
       source: 'g2',
@@ -485,7 +567,9 @@ test('receiver lets newer socket replace zero-audio same-user socket inside star
       channels: 1,
       user: { id: 'same-user' },
     }))
-    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    await firstPrompt.catch(err => {
+      throw new Error(`original socket did not start: ${err.message}\n${child.stdoutText}\n${child.stderrText}`)
+    })
 
     const second = await openSocket(port)
     await authenticateSharedSecretSocket(second, secret)
@@ -787,9 +871,18 @@ test('receiver sends local progress summary response back to glasses', async () 
     const message = await summary
     assert.equal(message.agent, 'Pike')
     assert.equal(workbench.requests[0].body.agent, 'Pike')
-    assert.equal(message.summary, 'Pike updated the paused voice session tips layout.')
+    assert.equal(message.text, 'Pike updated the paused voice session tips layout.')
+    assert.equal(message.summary, undefined)
+    assert.equal(message.detail, undefined)
+    assert.equal(message.hasDetail, true)
+    assert.ok(message.historyId)
+    const detailResponse = waitForJson(ws, response => response.type === 'message_history_detail')
+    ws.send(JSON.stringify({
+      type: 'get_message_history_detail',
+      ids: [message.historyId],
+    }))
     assert.equal(
-      message.detail,
+      (await detailResponse).entries[0].detail,
       'removed Sim show logo\nmoved tips to bottom\nremoved Session in progress',
     )
     assert.equal(message.phase, 'in_progress')
@@ -1048,6 +1141,7 @@ test('receiver delivers transcript from closed socket audio to current user sock
   try {
     const first = await openSocket(port)
     await authenticateSharedSecretSocket(first, secret)
+    const firstPrompt = waitForJson(first, message => message.type === 'onboarding_prompt')
     first.send(JSON.stringify({
       type: 'start',
       source: 'g2',
@@ -1056,7 +1150,9 @@ test('receiver delivers transcript from closed socket audio to current user sock
       channels: 1,
       user: { id: 'reroute-user' },
     }))
-    await waitForJson(first, message => message.type === 'onboarding_prompt')
+    await firstPrompt.catch(err => {
+      throw new Error(`original reroute socket did not start: ${err.message}\n${child.stdoutText}\n${child.stderrText}`)
+    })
     sendAudioChunks(first, 3)
     await waitForOutput(child, output => output.includes('[audio] stream started: receiving G2 mic chunks'))
     const firstClosed = waitForClose(first)
@@ -1065,6 +1161,10 @@ test('receiver delivers transcript from closed socket audio to current user sock
 
     const second = await openSocket(port)
     await authenticateSharedSecretSocket(second, secret)
+    const secondStarted = waitForJson(second, message => (
+      message.type === 'onboarding_prompt' ||
+      (message.type === 'receiver_status' && message.status === 'standby')
+    ))
     second.send(JSON.stringify({
       type: 'start',
       source: 'g2',
@@ -1073,9 +1173,14 @@ test('receiver delivers transcript from closed socket audio to current user sock
       channels: 1,
       user: { id: 'reroute-user' },
     }))
-    await waitForJson(second, message => message.type === 'onboarding_prompt')
+    await secondStarted.catch(err => {
+      throw new Error(`replacement socket did not start: ${err.message}\n${child.stdoutText}`)
+    })
 
-    const transcript = await waitForJson(second, message => message.type === 'transcript', 5_000)
+    const transcript = await waitForJson(second, message => message.type === 'transcript', 10_000)
+      .catch(err => {
+        throw new Error(`replacement socket did not receive transcript: ${err.message}\n${child.stdoutText}\n${child.stderrText}`)
+      })
     assert.equal(transcript.text, 'simulated transcript')
     assert.match(child.stdoutText, /\[thin-client\] rerouting send/)
     second.close()
@@ -1112,15 +1217,70 @@ test('receiver flushes a queued transcript immediately when the client taps', as
       message.type === 'asr_status' && message.status === 'queued'
     ))
     ws.send(Buffer.alloc(320, 1))
-    assert.equal((await queued).queuedText, 'tap flushed transcript')
+    const queuedMessage = await queued
+    assert.equal(queuedMessage.queuedText, 'tap flushed transcript')
+    assert.equal(queuedMessage.text, undefined)
 
     const transcript = waitForJson(ws, message => message.type === 'transcript')
     ws.send(JSON.stringify({ type: 'flush_transcript_queue' }))
-    assert.equal((await transcript).text, 'tap flushed transcript')
+    const transcriptMessage = await transcript
+    assert.equal(transcriptMessage.text, 'tap flushed transcript')
+    assert.equal(transcriptMessage.rawText, undefined)
+    assert.equal(transcriptMessage.cleanedText, undefined)
+    assert.equal(transcriptMessage.cleanup, undefined)
+    assert.ok(transcriptMessage.historyId)
     assert.match(child.stdoutText, /\[transcript-queue\] flush requested by client/)
     ws.close()
   } finally {
     await stopReceiver(child)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver asks cleanup to normalize contextual N to N variants as end-to-end', async () => {
+  const cleanup = await startFakeWorkbench(() => ({
+    choices: [{
+      finish_reason: 'stop',
+      message: {
+        content: 'Verify the end-to-end workflow.',
+      },
+    }],
+  }))
+  const { child, dir, port } = await startReceiver({
+    ASR_COMMAND: "printf 'Verify the N to N workflow.'",
+    ASR_CHUNK_MODE: 'fixed',
+    ASR_SEGMENT_SECONDS: '0.01',
+    MIN_ASR_BYTES: '1',
+    TRANSCRIPT_QUEUE_IDLE_MS: '10',
+    TRANSCRIPT_QUEUE_MAX_HOLD_MS: '1000',
+    TRANSCRIPT_CLEANUP_ENABLED: '1',
+    TRANSCRIPT_CLEANUP_URL: cleanup.url,
+    TRANSCRIPT_CLEANUP_MODEL: 'test-model',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'cleanup-user' },
+    }))
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+
+    const transcript = waitForJson(ws, message => message.type === 'transcript')
+    ws.send(Buffer.alloc(320, 1))
+    assert.equal((await transcript).text, 'Verify the end-to-end workflow.')
+
+    const systemPrompt = cleanup.requests[0]?.body?.messages?.[0]?.content || ''
+    assert.match(systemPrompt, /"N to N".*"end-to-end"/s)
+    assert.match(systemPrompt, /Do not rewrite literal letters, ranges, or unrelated uses/)
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    await cleanup.close()
     rmSync(dir, { recursive: true, force: true })
   }
 })

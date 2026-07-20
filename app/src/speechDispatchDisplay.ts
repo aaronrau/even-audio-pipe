@@ -7,8 +7,27 @@ export type SpeechDispatchDisplay = {
   message?: string
 }
 
+export const LIVE_TRANSCRIPT_PREVIEW_CHARS = 100
+
 export function normalizeSpeechDispatchText(text: string) {
   return String(text || '').replace(/\s+/g, ' ').trim()
+}
+
+export function transcriptPreview(text: string, limit = LIVE_TRANSCRIPT_PREVIEW_CHARS) {
+  const normalized = normalizeSpeechDispatchText(text)
+  const safeLimit = Math.max(0, Math.floor(limit))
+  if (normalized.length <= safeLimit) return normalized
+  if (safeLimit <= 3) return '.'.repeat(safeLimit)
+  return `...${normalized.slice(-(safeLimit - 3))}`
+}
+
+function prefixedPreview(prefix: string, text: string) {
+  const normalized = normalizeSpeechDispatchText(text)
+  if (!normalized) return prefix.replace(/:$/, '')
+  return `${prefix} ${transcriptPreview(
+    normalized,
+    LIVE_TRANSCRIPT_PREVIEW_CHARS - prefix.length - 1,
+  )}`
 }
 
 function escapedRegExp(value: string) {
@@ -30,12 +49,12 @@ export function stripLeadingDispatchAgent(text: string, agent = '') {
 }
 
 export function formatSpeechDispatchDisplay(display: SpeechDispatchDisplay) {
-  const text = normalizeSpeechDispatchText(display.text)
-  if (display.state === 'queued') return text ? `Queued: ${text}` : 'Queued'
-  if (display.state === 'saved') return text ? `Saved: ${text}` : 'Saved'
+  const text = transcriptPreview(display.text)
+  if (display.state === 'queued') return prefixedPreview('Queued:', text)
+  if (display.state === 'saved') return prefixedPreview('Saved:', text)
 
-  const agent = normalizeSpeechDispatchText(display.agent || '')
+  const agent = transcriptPreview(display.agent || '', 32)
   const message = stripLeadingDispatchAgent(display.message || text, agent)
-  if (!agent) return message || text ? `Sent: ${message || text}` : 'Sent'
-  return `Sent: ${agent}${message ? `, ${message}` : ''}`
+  if (!agent) return prefixedPreview('Sent:', message || text)
+  return prefixedPreview(`Sent: ${agent},`, message).replace(/,$/, '')
 }

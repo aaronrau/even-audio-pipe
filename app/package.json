@@ -1,7 +1,7 @@
 {
   "name": "agent-audio-pipe-app",
   "private": true,
-  "version": "0.1.17",
+  "version": "0.1.18",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "test:endpoints": "tsx test/audioEndpoints.test.ts",
     "test:bundle-urls": "node test/bundleUrls.test.mjs",
     "test:speech-dispatch": "tsx test/speechDispatchDisplay.test.ts",
+    "test:memory": "tsx test/memoryBounds.test.ts",
     "test:startup-prompt": "tsx test/startupPrompt.test.ts",
     "test:history": "tsx test/historyCanvas.test.ts && tsx test/historyNavigator.test.ts",
     "test:history:current": "tsx test/historyCurrentData.test.ts",

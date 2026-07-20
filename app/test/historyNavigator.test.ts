@@ -132,6 +132,25 @@ assert.match(duplicateNameDetail.content, /^12:03 Pike has updated the paused vo
 assert.doesNotMatch(duplicateNameDetail.content, /Pike Pike/i)
 assertViewportSafe(duplicateNameDetail.content)
 
+const onDemandNavigator = new HistoryNavigator({
+  width: CANVAS_WIDTH,
+  height: CANVAS_HEIGHT,
+  visibleLineCount: VISIBLE_LINES,
+  maxContentLength: MAX_CONTENT_LENGTH,
+})
+onDemandNavigator.replaceEntries([{
+  id: 'server-detail-1',
+  label: 'Flux',
+  text: '...latest compact summary',
+  hasDetail: true,
+  receivedAt: atMinute(5),
+}])
+onDemandNavigator.open()
+onDemandNavigator.scroll(1)
+const onDemandDetail = onDemandNavigator.tap()
+assert.equal(onDemandDetail.action, 'load_detail')
+assert.deepEqual(onDemandDetail.entryIds, ['server-detail-1'])
+
 const selectedFromBackWithOlderGesture = navigator.open()
 assert.match(selectedFromBackWithOlderGesture.content.split('\n')[0], /^< Back$/)
 const olderGestureSelection = navigator.scroll(-1)

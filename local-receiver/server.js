@@ -1,6 +1,6 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { appendFileSync, createWriteStream, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
@@ -22,6 +22,12 @@ import {
   transcriptQueueMaxHoldReached as transcriptQueueMaxHoldReachedSinceActivity,
 } from './transcript-queue.js'
 import { createWorkbenchRouter } from './workbench-router.js'
+import {
+  boundedThinClientDetail,
+  THIN_CLIENT_DETAIL_TOTAL_CHARS,
+  THIN_CLIENT_HISTORY_LIMIT,
+  thinClientTextPreview,
+} from './thin-client-text.js'
 
 const port = Number(process.env.PORT || 8788)
 const audioDir = process.env.AUDIO_DIR || process.env.OUT_DIR || 'recordings'
@@ -111,7 +117,13 @@ const activeAudioSocketMinProtectChunks = Number(process.env.RECEIVER_ACTIVE_AUD
 const activeAudioSocketMinProtectBytes = Number(process.env.RECEIVER_ACTIVE_AUDIO_SOCKET_MIN_PROTECT_BYTES || 16_000)
 const transcriptsLog = process.env.TRANSCRIPTS_LOG || join(transcriptDirPath, 'transcripts.log')
 const messageHistoryDirPath = resolve(process.env.MESSAGE_HISTORY_DIR || join(transcriptDirPath, 'message-history'))
-const messageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || 0)
+const configuredMessageHistoryLimit = Number(process.env.MESSAGE_HISTORY_LIMIT || THIN_CLIENT_HISTORY_LIMIT)
+const messageHistoryLimit = Math.min(
+  THIN_CLIENT_HISTORY_LIMIT,
+  Number.isFinite(configuredMessageHistoryLimit) && configuredMessageHistoryLimit > 0
+    ? Math.floor(configuredMessageHistoryLimit)
+    : THIN_CLIENT_HISTORY_LIMIT,
+)
 const summaryTextFields = ['text', 'summary', 'message', 'response']
 const detailTextFields = [
   'detail',
@@ -387,11 +399,17 @@ function sanitizeMessageHistoryEntry(value) {
       ? Date.parse(createdAt)
       : Date.now()
 
+  const normalizedTimestamp = Number.isFinite(timestamp) ? timestamp : Date.now()
+  const label = stringValue(value.label || value.agent || value.source || 'Message') || 'Message'
   const entry = {
-    label: stringValue(value.label || value.agent || value.source || 'Message') || 'Message',
+    id: stringValue(value.id) || createHash('sha256')
+      .update(JSON.stringify([normalizedTimestamp, label, text, detail]))
+      .digest('base64url')
+      .slice(0, 16),
+    label,
     text,
-    receivedAt: Number.isFinite(timestamp) ? timestamp : Date.now(),
-    createdAt: new Date(Number.isFinite(timestamp) ? timestamp : Date.now()).toISOString(),
+    receivedAt: normalizedTimestamp,
+    createdAt: new Date(normalizedTimestamp).toISOString(),
   }
   if (detail) entry.detail = detail
   return entry
@@ -457,7 +475,7 @@ function readMessageHistory(limit = messageHistoryLimit, dateStamp = historyDate
 
 function appendMessageHistory(entry) {
   const normalized = sanitizeMessageHistoryEntry(entry)
-  if (!normalized) return
+  if (!normalized) return null
 
   const path = messageHistoryPathForTimestamp(normalized.receivedAt)
   try {
@@ -465,15 +483,57 @@ function appendMessageHistory(entry) {
   } catch (err) {
     console.warn(`[history] failed to append ${path}: ${err.message}`)
   }
+  return normalized
 }
 
 function sendMessageHistory(socket) {
   const date = historyDateStamp()
   const entries = readMessageHistory(messageHistoryLimit, date)
+    .map(entry => {
+      const text = thinClientTextPreview(entry.text)
+      return {
+        id: entry.id,
+        label: entry.label,
+        text,
+        receivedAt: entry.receivedAt,
+        createdAt: entry.createdAt,
+        hasDetail: Boolean(entry.detail || text !== entry.text),
+      }
+    })
   sendSocketJson(socket, {
     type: 'message_history',
     date,
     entries,
+  })
+}
+
+function sendMessageHistoryDetails(socket, requestedIds) {
+  const ids = Array.from(new Set(
+    (Array.isArray(requestedIds) ? requestedIds : [])
+      .map(stringValue)
+      .filter(Boolean),
+  )).slice(0, THIN_CLIENT_HISTORY_LIMIT)
+  if (!ids.length) return
+
+  const requested = new Set(ids)
+  const entries = readMessageHistory(messageHistoryLimit)
+    .filter(entry => requested.has(entry.id))
+  const perEntryLimit = Math.min(
+    8_000,
+    Math.max(240, Math.floor(THIN_CLIENT_DETAIL_TOTAL_CHARS / Math.max(1, entries.length))),
+  )
+
+  sendSocketJson(socket, {
+    type: 'message_history_detail',
+    entries: entries.map(entry => ({
+      id: entry.id,
+      label: entry.label,
+      text: thinClientTextPreview(entry.text),
+      detail: boundedThinClientDetail(entry.detail || entry.text, perEntryLimit),
+      receivedAt: entry.receivedAt,
+      createdAt: entry.createdAt,
+      hasDetail: false,
+    })),
   })
 }
 
@@ -519,6 +579,7 @@ function defaultCleanupPrompt() {
     'You clean short ASR transcript chunks from smart glasses.',
     'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
     'Always rewrite the misheard phrases "ling few", "lane view", and "lanefuse" as "Langfuse".',
+    'When software, testing, integration, or workflow context clearly means complete-path coverage, rewrite ASR variants such as "N to N", "N two N", "end to N", "N to end", "end two end", and "E to E" as "end-to-end". Do not rewrite literal letters, ranges, or unrelated uses.',
     "Preserve the speaker's meaning and wording.",
     'Do not remove command words after a routing target; keep "Wolf terminate session" as "Wolf terminate session", not "Wolf".',
     'Do not add facts, commands, explanations, or markdown.',
@@ -841,7 +902,7 @@ function publishWorkbenchSummary(payload, options = {}) {
   setWorkbenchAgentInProgress(agent, !isFinal, {
     signature: detail || summary,
   })
-  appendMessageHistory({
+  const historyEntry = appendMessageHistory({
     label: agent || 'Agent',
     text: summary,
     detail,
@@ -849,12 +910,11 @@ function publishWorkbenchSummary(payload, options = {}) {
   })
   const delivered = broadcastSocketJson({
     type: 'agent_summary',
-    text: summary,
-    summary,
-    detail,
-    detail_response: detail,
+    text: thinClientTextPreview(summary),
+    historyId: historyEntry?.id,
+    hasDetail: Boolean(detail || thinClientTextPreview(summary) !== summary),
     agent,
-    command,
+    command: thinClientTextPreview(command),
     is_final: isFinal,
     phase,
     timestamp,
@@ -1009,7 +1069,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
       type: 'agent_status',
       status: 'sent',
       agent: sentAgent,
-      message: responseBody.message || route.message,
+      message: thinClientTextPreview(responseBody.message || route.message),
       jobId: context.jobId,
     })
   } catch (err) {
@@ -1024,7 +1084,7 @@ async function maybePostToWorkbench(text, targetSocket, context = {}) {
     })
     logThinClientSendForUser(thinClientSocket, context.user, {
       type: 'agent_error',
-      error,
+      error: thinClientTextPreview(error),
       agent: canonicalWorkbenchAgent(route.agent || workbenchConfig.agent) ||
         displayWorkbenchAgentName(route.agent || workbenchConfig.agent),
       jobId: context.jobId,
@@ -1041,7 +1101,7 @@ async function postWorkbenchLocalSummary(agent, targetSocket, context = {}) {
     console.warn(`[workbench] ${error}`)
     sendSocketJson(targetSocket, {
       type: 'agent_error',
-      error,
+      error: thinClientTextPreview(error),
       agent: stringValue(agent),
       availableAgents: workbenchAgentNames(),
       jobId: context.jobId,
@@ -1156,7 +1216,7 @@ async function postWorkbenchLocalSummary(agent, targetSocket, context = {}) {
     })
     sendSocketJson(targetSocket, {
       type: 'agent_error',
-      error,
+      error: thinClientTextPreview(error),
       agent: requestedAgent,
       jobId: context.jobId,
       requestType: 'local',
@@ -1802,8 +1862,7 @@ function enqueueRawTranscript(item) {
     status: 'queued',
     jobId: item.jobId,
     queuedSegments: queue.items.length,
-    queuedText,
-    text: queuedText,
+    queuedText: thinClientTextPreview(queuedText),
     debounceMs: transcriptQueueIdleMs,
     activeSegments: queue.activeSegments,
     pendingAsrJobs: queue.pendingAsrJobs,
@@ -1917,9 +1976,6 @@ async function flushRawTranscriptBatch(items) {
       jobId: lastItem.jobId,
       jobIds,
       queuedSegments: batch.length,
-      queuedText: rawTranscript,
-      text: rawTranscript,
-      file: basename(paths.wav),
     }, {
       job: lastItem.jobId,
       status: 'cleaning',
@@ -1940,7 +1996,7 @@ async function flushRawTranscriptBatch(items) {
     queuedSegments: batch.map(batchItem => queuedSegmentMetadata(batchItem)),
   })
   const createdAt = new Date().toISOString()
-  appendMessageHistory({
+  const historyEntry = appendMessageHistory({
     label: 'You',
     text: cleanedTranscript,
     createdAt,
@@ -1951,22 +2007,13 @@ async function flushRawTranscriptBatch(items) {
   )
   const transcriptSent = logThinClientSendForUser(targetSocket, user, {
     type: 'transcript',
-    text: cleanedTranscript,
-    rawText: rawTranscript,
-    cleanedText: cleanedTranscript,
-    cleanup: {
-      enabled: cleanup.enabled,
-      ok: cleanup.ok,
-      model: cleanup.model,
-      error: cleanup.error,
-    },
+    text: thinClientTextPreview(cleanedTranscript),
+    historyId: historyEntry?.id,
+    hasDetail: thinClientTextPreview(cleanedTranscript) !== cleanedTranscript,
     user,
     jobId: lastItem.jobId,
     jobIds,
     queuedSegments: batch.length,
-    file: basename(paths.txt),
-    rawFile: basename(paths.rawTxt),
-    cleanFile: basename(paths.cleanTxt),
     createdAt,
   }, {
     job: lastItem.jobId,
@@ -2106,7 +2153,7 @@ async function handleCustomAgent(route, context) {
     detail,
     createdAt,
   })
-  appendMessageHistory({
+  const historyEntry = appendMessageHistory({
     label: historyLabel,
     text: historyLabel,
     detail: processedText,
@@ -2116,16 +2163,15 @@ async function handleCustomAgent(route, context) {
     type: 'agent_status',
     status: 'sent',
     agent: route.agent.name,
-    message: route.message,
+    message: thinClientTextPreview(route.message),
     jobId: context.jobId,
   })
   logThinClientSendForUser(context.targetSocket, context.user, {
     type: 'agent_summary',
     agent: historyLabel,
-    text: historyLabel,
-    summary: historyLabel,
-    detail: processedText,
-    detail_response: processedText,
+    text: thinClientTextPreview(historyLabel),
+    historyId: historyEntry?.id,
+    hasDetail: true,
     phase: 'final',
     is_final: true,
     createdAt,
@@ -2441,6 +2487,7 @@ wss.on('connection', (socket, req) => {
   let bytes = 0
   let chunks = 0
   let userAuthenticated = false
+  let pendingMessageHistoryRequest = false
   let evenUser = null
   let activeAudioSocketKeyForConnection = ''
   let authTimer = null
@@ -2817,13 +2864,29 @@ wss.on('connection', (socket, req) => {
         console.log(
           `[audio] start accepted stamp=${connectionStamp} activeKey=${activeAudioSocketKeyForConnection || 'none'} user=${userLabel(evenUser)} standby=${activeAudioSocketPromotion.standby}`,
         )
+        if (pendingMessageHistoryRequest) {
+          pendingMessageHistoryRequest = false
+          sendMessageHistory(socket)
+        }
         if (!activeAudioSocketPromotion.standby) {
           sendOnboardingPrompt()
           flushPreStartAudio()
         }
       }
       if (control?.type === 'get_message_history') {
-        sendMessageHistory(socket)
+        const auth = currentUserAuthConfig()
+        if (auth.required && !userAuthenticated) {
+          pendingMessageHistoryRequest = true
+          console.log(`[history] queued request until Even user authentication stamp=${connectionStamp}`)
+        } else {
+          sendMessageHistory(socket)
+        }
+      }
+      if (control?.type === 'get_message_history_detail') {
+        const auth = currentUserAuthConfig()
+        if (!auth.required || userAuthenticated) {
+          sendMessageHistoryDetails(socket, control.ids)
+        }
       }
       if (control?.type === 'flush_transcript_queue') {
         const auth = currentUserAuthConfig()

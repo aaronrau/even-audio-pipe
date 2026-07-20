@@ -2,11 +2,13 @@ import { measureTextWrap } from '@evenrealities/pretext'
 import {
   HistoryCanvas,
   formatHistoryTime,
+  type HistoryScrollDirection,
+} from './historyCanvas'
+import {
   normalizeHistoryBlock,
   normalizeInlineText,
   type HistoryEntry,
-  type HistoryScrollDirection,
-} from './historyCanvas'
+} from './historyText'
 
 export type HistoryNavigatorMode = 'closed' | 'list' | 'detail'
 
@@ -16,6 +18,7 @@ export type HistoryNavigatorAction =
   | 'closed_back'
   | 'closed_seen'
   | 'opened_detail'
+  | 'load_detail'
   | 'closed_detail'
   | 'peek_progress'
   | 'selected'
@@ -29,6 +32,7 @@ export type HistoryNavigatorResult = {
   mode: HistoryNavigatorMode
   content: string
   debug: HistoryNavigatorDebug
+  entryIds?: string[]
 }
 
 export type HistoryNavigatorDebug = {
@@ -58,6 +62,7 @@ type HistoryItem = {
   listText: string
   detailText: string
   detailEntries: HistoryEntry[]
+  detailEntryIds: string[]
   receivedAt: number
 }
 
@@ -210,6 +215,8 @@ export class HistoryNavigator {
   private selectedItemId: string | null = BACK_ROW_ID
   private seenDetailIds = new Set<string>()
   private listTopLine = 0
+  private entryItemsCache: HistoryItem[] | null = null
+  private itemsCache: HistoryItem[] | null = null
 
   constructor(options: HistoryNavigatorOptions) {
     this.width = options.width
@@ -241,6 +248,7 @@ export class HistoryNavigator {
     this.retainedDetailItem = null
     this.activeProgressDetailAgentKey = ''
     this.listTopLine = 0
+    this.detailCanvas.replaceEntries([])
     return this.result('opened')
   }
 
@@ -251,6 +259,7 @@ export class HistoryNavigator {
     this.retainedDetailItem = null
     this.activeProgressDetailAgentKey = ''
     this.listTopLine = 0
+    this.detailCanvas.replaceEntries([])
     return this.result(action)
   }
 
@@ -262,6 +271,7 @@ export class HistoryNavigator {
       this.pendingProgressDetailItem = null
       this.retainedDetailItem = null
       this.activeProgressDetailAgentKey = ''
+      this.detailCanvas.replaceEntries([])
       this.ensureSelectedVisible()
       return this.result('closed_detail')
     }
@@ -290,7 +300,7 @@ export class HistoryNavigator {
 
     this.seenDetailIds.add(item.id)
     this.openDetail(item)
-    return this.result('opened_detail')
+    return this.detailResult(item)
   }
 
   scroll(direction: HistoryScrollDirection): HistoryNavigatorResult {
@@ -312,6 +322,11 @@ export class HistoryNavigator {
   }
 
   replaceEntries(entries: HistoryEntry[]) {
+    if (this.mode === 'closed') {
+      this.entries = entries.slice()
+      this.invalidateItems()
+      return
+    }
     const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
@@ -320,21 +335,30 @@ export class HistoryNavigator {
       : null
 
     this.entries = entries.slice()
+    this.invalidateItems()
     if (previousDetailItem && this.preserveDetailItem(previousDetailItem)) return
     this.reconcileSelection(wasNewestSelected)
   }
 
   replaceProgressAgents(agents: string[]) {
     this.progressAgents = uniqueLabels(agents)
+    this.invalidateItems()
+    if (this.mode === 'closed') return
     this.reconcileSelection(false)
   }
 
   appendEntry(entry: HistoryEntry) {
+    if (this.mode === 'closed') {
+      this.entries.push(entry)
+      this.invalidateItems()
+      return
+    }
     const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
 
     this.entries.push(entry)
+    this.invalidateItems()
     if (this.replacePendingProgressDetail(entry, this.entries.length - 1)) return
     if (this.replaceActiveProgressDetail(entry, this.entries.length - 1)) return
 
@@ -358,7 +382,7 @@ export class HistoryNavigator {
     this.retainedDetailItem = null
     this.activeProgressDetailAgentKey = key
     this.openDetail(item)
-    return this.result('opened_detail', item.label)
+    return this.detailResult(item, item.label)
   }
 
   openLatestTranscriptDetail(): HistoryNavigatorResult {
@@ -374,20 +398,28 @@ export class HistoryNavigator {
     this.retainedDetailItem = null
     this.activeProgressDetailAgentKey = ''
     this.openDetail(item)
-    return this.result('opened_detail')
+    return this.detailResult(item)
   }
 
   setPendingTranscript(text: string, _frame = '') {
+    if (this.mode === 'closed') {
+      this.pendingTranscript = normalizeInlineText(text)
+      this.invalidateItems()
+      return
+    }
     const previousNewestId = this.currentEntryItems()[0]?.id
     const wasNewestSelected = this.selectedItemId !== BACK_ROW_ID
       && this.selectedItemId === previousNewestId
 
     this.pendingTranscript = normalizeInlineText(text)
+    this.invalidateItems()
     this.reconcileSelection(wasNewestSelected)
   }
 
   clearPendingTranscript() {
     this.pendingTranscript = ''
+    this.invalidateItems()
+    if (this.mode === 'closed') return
     this.reconcileSelection(false)
   }
 
@@ -426,20 +458,33 @@ export class HistoryNavigator {
     return result
   }
 
+  private detailResult(item: HistoryItem, agent = '') {
+    const result = this.result(
+      item.detailEntryIds.length ? 'load_detail' : 'opened_detail',
+      agent,
+    )
+    if (item.detailEntryIds.length) result.entryIds = item.detailEntryIds.slice()
+    return result
+  }
+
   private currentItems() {
-    return [
+    if (this.itemsCache) return this.itemsCache
+    this.itemsCache = [
       ...this.progressAgents.map(agent => this.progressAgentItem(agent)),
       ...this.currentEntryItems(),
     ]
+    return this.itemsCache
   }
 
   private currentEntryItems() {
+    if (this.entryItemsCache) return this.entryItemsCache
     const items = this.entries
       .map((entry, index) => ({ entry, index }))
       .sort(compareEntryRecords)
       .map(({ entry, index }) => this.entryItem(entry, index))
 
-    return this.groupAdjacentTranscripts(items)
+    this.entryItemsCache = this.groupAdjacentTranscripts(items)
+    return this.entryItemsCache
   }
 
   private progressAgentItem(agent: string): HistoryItem {
@@ -458,6 +503,7 @@ export class HistoryNavigator {
       listText: '(...)',
       detailText: 'Checking...',
       detailEntries: [detailEntry],
+      detailEntryIds: [],
       receivedAt: 0,
     }
   }
@@ -485,6 +531,7 @@ export class HistoryNavigator {
       listText,
       detailText: detailText || listText,
       detailEntries: [detailEntry],
+      detailEntryIds: entry.hasDetail && !entry.detail && entry.id ? [entry.id] : [],
       receivedAt: entry.receivedAt,
     }
   }
@@ -521,6 +568,7 @@ export class HistoryNavigator {
       .slice()
       .reverse()
       .flatMap(item => item.detailEntries)
+    const detailEntryIds = Array.from(new Set(group.flatMap(item => item.detailEntryIds)))
 
     return {
       id: `transcripts:${newest.id}:${oldest.id}:${group.length}`,
@@ -531,6 +579,7 @@ export class HistoryNavigator {
         .map(entry => entry.detail || entry.text)
         .join('\n'),
       detailEntries,
+      detailEntryIds,
       receivedAt: newest.receivedAt,
     }
   }
@@ -608,7 +657,7 @@ export class HistoryNavigator {
     const replacement = previousItem.kind === 'progress'
       ? null
       : this.currentEntryItems()
-        .find(item => this.sameDetailItem(previousItem, item))
+        .find(item => item.id === previousItem.id || this.sameDetailItem(previousItem, item))
     if (replacement) {
       this.retainedDetailItem = null
       this.selectedItemId = replacement.id
@@ -630,6 +679,11 @@ export class HistoryNavigator {
       normalizedLabelKey(a.label) === normalizedLabelKey(b.label) &&
       a.listText === b.listText &&
       a.detailText === b.detailText
+  }
+
+  private invalidateItems() {
+    this.entryItemsCache = null
+    this.itemsCache = null
   }
 
   private reconcileSelection(selectNewest: boolean) {

@@ -144,9 +144,23 @@ test('streams enrolled voice and produces a Meemo Markdown memo', { timeout: 180
   await streamPcm(socket, Buffer.alloc(16_000 * 2), 3_200, 2)
 
   const result = await resultPromise
-  assert.match(result.detail, /^- The architecture decision/)
-  assert.match(result.detail, /Aaron will test it Friday/)
-  assert.equal(result.summary, '[Meemo Memo]')
+  assert.equal(result.text, '[Meemo Memo]')
+  assert.equal(result.detail, undefined)
+  assert.equal(result.summary, undefined)
+  assert.equal(result.hasDetail, true)
+  const detailsPromise = waitForJson(
+    socket,
+    message => message.type === 'message_history_detail',
+    10_000,
+    receiver,
+  )
+  socket.send(JSON.stringify({
+    type: 'get_message_history_detail',
+    ids: [result.historyId],
+  }))
+  const detail = (await detailsPromise).entries[0].detail
+  assert.match(detail, /^- The architecture decision/)
+  assert.match(detail, /Aaron will test it Friday/)
   assert.ok(
     receivedTypes.indexOf('transcript') < receivedTypes.indexOf('agent_summary'),
     `normal transcript was not delivered before Meemo: ${receivedTypes.join(', ')}`,

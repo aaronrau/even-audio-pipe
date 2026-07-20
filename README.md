@@ -168,6 +168,8 @@ When speech is detected, the glasses show a compact waveform. Once ASR returns
 server-confirmed queued text, the glasses show `Queued: ...`. If the transcript
 is sent to Workbench, that changes to `Sent: Agent, ...` for two seconds. If it
 is saved without agent routing, it changes to `Saved: ...` for two seconds.
+These transient displays keep only the newest 100 characters, including the
+leading `...` marker; complete transcripts remain on the receiver.
 Tap while `Queued:` is selected to flush that server queue immediately. The
 client opens history, and the saved transcript replaces the pending row as an
 open detail view.
@@ -222,10 +224,13 @@ workbench.
 - Workbench sends display as `Sent: Agent, ...` for two seconds.
 - Ambient saved-only speech displays as `Saved: ...` for two seconds.
 - Unstable partial ASR text is not displayed.
+- Live, queued, sent, and saved text is capped at a 100-character tail preview.
 
 **History And Details**
 
-- Recent user transcripts and agent summaries are stored in JSONL.
+- Complete user transcripts and agent summaries are stored in receiver JSONL.
+- The client keeps at most the newest 100 compact entries and fetches a
+  selected full detail from the receiver on demand.
 - Glasses tap navigation opens a list view and detail view.
 - A tap-flushed transcript opens its durable history detail after persistence.
 - Long details page by visual lines to fit the Even text container.
@@ -368,9 +373,29 @@ sequenceDiagram
 - **Private-first failover:** `ws://` is preferred for private LAN use. `wss://`
   is the fallback for public WAN or tunnel access.
 - **History is pullable:** The client can request message history after
-  reconnect or when opening the menu.
+  reconnect or when Back opens the menu. A request that arrives before Even
+  user authentication is fulfilled as soon as that user is accepted instead
+  of being dropped. History layout/font data loads only when the menu is first
+  opened.
+- **Runtime queues are bounded:** stale audio beyond 64 KiB triggers reconnect,
+  and glasses rendering retains at most one active and one latest pending job.
+- **High-rate SDK audio logs are suppressed:** SDK 0.0.10 logs every parsed
+  EvenHub event by default. The client drops only that per-event console log so
+  an active WebView/host console cannot accumulate PCM event objects.
 - **Text container safe:** Glasses output is paged and capped to fit Even text
   container limits.
+
+For an accelerated continuously-active client check, build and run:
+
+```bash
+ACTIVE_SOAK_SECONDS=600 npm run test:active-soak
+```
+
+This drives the production browser client with continuous PCM events and
+frequent compact transcript events, samples post-GC JavaScript heap, and
+asserts the live socket, rendering, history, and text bounds. In a connected
+WebView inspector, `window.__evenAudioPipeMemorySnapshot()` returns the same
+on-demand state snapshot without starting a monitoring timer.
 
 ## Configuration
 

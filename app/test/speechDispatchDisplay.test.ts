@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import {
   formatSpeechDispatchDisplay,
   stripLeadingDispatchAgent,
+  transcriptPreview,
 } from '../src/speechDispatchDisplay'
 
 assert.equal(
@@ -74,4 +75,27 @@ assert.equal(
 assert.equal(
   stripLeadingDispatchAgent('Pike update Pike interaction docs', 'Pike'),
   'update interaction docs',
+)
+
+const longTranscript = `beginning ${'x'.repeat(120)} important ending`
+const preview = transcriptPreview(longTranscript)
+assert.equal(preview.length, 100)
+assert.match(preview, /^\.\.\./)
+assert.match(preview, /important ending$/)
+assert.equal(
+  formatSpeechDispatchDisplay({ state: 'queued', text: longTranscript }).length,
+  100,
+)
+assert.equal(
+  formatSpeechDispatchDisplay({ state: 'saved', text: longTranscript }).length,
+  100,
+)
+assert.equal(
+  formatSpeechDispatchDisplay({
+    state: 'sent',
+    agent: 'Pike',
+    text: longTranscript,
+    message: longTranscript,
+  }).length,
+  100,
 )

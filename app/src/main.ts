@@ -11,8 +11,8 @@ import {
   normalizeHistoryBlock,
   normalizeInlineText,
   type HistoryEntry,
-  type HistoryScrollDirection,
-} from './historyCanvas'
+} from './historyText'
+import type { HistoryScrollDirection } from './historyCanvas'
 import {
   blankAudioEndpointSettings,
   buildAudioWsEndpoints,
@@ -21,13 +21,29 @@ import {
   type AudioEndpointSettings,
 } from './audioEndpoints'
 import { historyScrollDirectionFromEventType } from './historyInput'
-import { HistoryNavigator } from './historyNavigator'
+import type { HistoryNavigator } from './historyNavigator'
+import {
+  MAX_AUDIO_SOCKET_BUFFER_BYTES,
+  wouldExceedAudioBacklog,
+} from './audioBackpressure'
+import { LatestTaskQueue } from './latestTaskQueue'
 import { backendStartupPromptContent, nextStartupPromptVisible, startupLiveContent } from './startupPrompt'
 import {
   formatSpeechDispatchDisplay,
-  normalizeSpeechDispatchText,
+  transcriptPreview,
   type SpeechDispatchDisplay,
 } from './speechDispatchDisplay'
+
+const originalConsoleLog = console.log
+let suppressedSdkEventLogs = 0
+function filteredConsoleLog(...args: unknown[]) {
+  if (args[0] === '[EvenAppBridge] EvenHub event:') {
+    suppressedSdkEventLogs += 1
+    return
+  }
+  originalConsoleLog.apply(console, args)
+}
+console.log = filteredConsoleLog
 
 const RECEIVER_ADDRESS_STORAGE_KEY = 'evenAudioPipe.receiverAddress'
 const PRIVATE_ADDRESS_STORAGE_KEY = 'evenAudioPipe.privateAddress'
@@ -81,7 +97,6 @@ let lastHistoryRequestedContent = ''
 let lastHistoryRenderedContent = ''
 let lastStatusContainerUpgradeAt = 0
 let lastStatusContainerContent = ''
-let pendingStatusContainerContent = ''
 let cleanedUp = false
 let audioOpen = false
 let ws: WebSocket | null = null
@@ -110,7 +125,7 @@ let evenUserInfo: UserPayload | null = null
 let startupPromptVisible = true
 let backendStartupPrompt = ''
 let speechDispatchDisplay: SpeechDispatchDisplay | null = null
-let deferredLiveTranscript: { text: string; label: string; detail: string } | null = null
+let deferredLiveTranscript = ''
 let queuedTranscriptFlushRequested = false
 let openFlushedTranscriptDetail = false
 
@@ -145,6 +160,10 @@ const CANVAS_BORDER_WIDTH = 0
 const HISTORY_VISIBLE_LINES = positiveNumber(import.meta.env.VITE_HISTORY_VISIBLE_LINES, 9)
 const HISTORY_WRAP_WIDTH = positiveNumber(import.meta.env.VITE_HISTORY_WRAP_WIDTH, CANVAS_WIDTH)
 const TEXT_UPGRADE_LIMIT = 2000
+const STATUS_RENDER_TIMEOUT_MS = 2_000
+const MAX_RECEIVER_MESSAGE_CHARS = 64 * 1024
+const RECENT_HISTORY_ENTRY_LIMIT = 100
+const HISTORY_ENTRY_TEXT_LIMIT = 32 * 1024
 const HISTORY_DUPLICATE_WINDOW_MS = 10_000
 // Some host builds normalize ring clicks into source-less text events.
 const ALLOW_UNSOURCED_HISTORY_TOGGLE = true
@@ -164,15 +183,10 @@ const DETAIL_TEXT_FIELDS = [
 const messageHistory: HistoryEntry[] = []
 let lastHistoryToggleInputAt = 0
 let lastHistoryScrollInputAt = 0
-let statusRenderRevision = 0
-let statusRenderQueue: Promise<boolean> = Promise.resolve(true)
-const historyNavigator = new HistoryNavigator({
-  width: HISTORY_WRAP_WIDTH,
-  height: CANVAS_HEIGHT,
-  visibleLineCount: HISTORY_VISIBLE_LINES,
-  scrollOverlapLines: 1,
-  maxContentLength: TEXT_UPGRADE_LIMIT,
-})
+let statusRenderUnavailable = false
+let statusRenderQueue: LatestTaskQueue<string> | null = null
+let historyNavigator: HistoryNavigator | null = null
+let workbenchProgressAgents: string[] = []
 let pendingPeekAgent = ''
 
 function isHistoryMode() {
@@ -180,12 +194,40 @@ function isHistoryMode() {
 }
 
 function syncHistoryMode() {
+  if (!historyNavigator) {
+    glassesMode = 'live'
+    return
+  }
   const mode = historyNavigator.currentMode()
   glassesMode = mode === 'detail'
     ? 'history_detail'
     : mode === 'list'
       ? 'history_list'
       : 'live'
+}
+
+async function getHistoryNavigator() {
+  if (historyNavigator) return historyNavigator
+  const { HistoryNavigator } = await import('./historyNavigator')
+  const navigator = new HistoryNavigator({
+    width: HISTORY_WRAP_WIDTH,
+    height: CANVAS_HEIGHT,
+    visibleLineCount: HISTORY_VISIBLE_LINES,
+    scrollOverlapLines: 1,
+    maxContentLength: TEXT_UPGRADE_LIMIT,
+  })
+  navigator.replaceEntries(messageHistory)
+  navigator.replaceProgressAgents(workbenchProgressAgents)
+  if (speechDispatchDisplay?.state === 'queued') {
+    navigator.setPendingTranscript(speechDispatchDisplay.text)
+  }
+  historyNavigator = navigator
+  return navigator
+}
+
+function currentHistoryNavigator() {
+  if (!historyNavigator) throw new Error('History navigator is not loaded')
+  return historyNavigator
 }
 
 function setUiStatus(text: string) {
@@ -197,6 +239,50 @@ function setStats() {
   statsEl.textContent =
     `${receiverState}, audio ${audioOpen ? 'on' : 'off'}, ${sentChunks} chunks, ${sentBytes} bytes, ${droppedChunks} dropped${lastReceiverClose ? `, last close: ${lastReceiverClose}` : ''}`
 }
+
+function memorySnapshot() {
+  return {
+    receiverState,
+    receiverStandby,
+    audioOpen,
+    socketBufferedBytes: ws?.bufferedAmount || 0,
+    sentChunks,
+    sentBytes,
+    droppedChunks,
+    suppressedSdkEventLogs,
+    historyEntries: messageHistory.length,
+    historyCharacters: messageHistory.reduce(
+      (total, entry) => total + entry.text.length + (entry.detail?.length || 0),
+      0,
+    ),
+    historyMode: glassesMode,
+    historyNavigatorLoaded: historyNavigator !== null,
+    render: statusRenderQueue?.snapshot() || {
+      running: false,
+      pending: false,
+      stopped: true,
+    },
+    renderUnavailable: statusRenderUnavailable,
+    textCharacters: {
+      transcript: transcriptText.length,
+      lastTranscript: lastTranscriptEventText.length,
+      deferredTranscript: deferredLiveTranscript.length,
+      dispatch: speechDispatchDisplay?.text.length || 0,
+      backendIdle: backendIdleFrame.length,
+    },
+    activeTimers: {
+      reconnect: reconnectTimer !== null,
+      transcript: clearTranscriptTimer !== null,
+      speechDispatch: clearSpeechDispatchTimer !== null,
+      waveform: spinnerTimer !== null,
+      microphoneWatchdog: micWatchdogTimer !== null,
+    },
+  }
+}
+
+Object.assign(window, {
+  __evenAudioPipeMemorySnapshot: memorySnapshot,
+})
 
 function launchToken() {
   const params = new URLSearchParams(window.location.search)
@@ -451,11 +537,12 @@ function sanitizeAgentList(value: unknown) {
   const agents: string[] = []
   const seen = new Set<string>()
   for (const item of value) {
-    const agent = stringValue(item)
+    const agent = stringValue(item).slice(0, 64)
     const key = normalizeAgentLabel(agent)
     if (!agent || seen.has(key)) continue
     seen.add(key)
     agents.push(agent)
+    if (agents.length >= 32) break
   }
   return agents
 }
@@ -509,32 +596,43 @@ function sanitizeHistoryEntry(value: unknown): HistoryEntry | null {
   if (!text || !Number.isFinite(receivedAt)) return null
 
   const entry: HistoryEntry = {
-    label: stringValue(record.label) || 'Message',
-    text,
+    id: stringValue(record.id) || undefined,
+    label: stringValue(record.label).slice(0, 64) || 'Message',
+    text: text.slice(0, HISTORY_ENTRY_TEXT_LIMIT),
+    hasDetail: record.hasDetail === true,
     receivedAt,
   }
-  if (detail) entry.detail = detail
+  if (detail) entry.detail = detail.slice(0, HISTORY_ENTRY_TEXT_LIMIT)
   return entry
 }
 
 function replaceHistory(entries: HistoryEntry[]) {
+  const recentEntries = entries.slice(-RECENT_HISTORY_ENTRY_LIMIT)
   messageHistory.splice(
     0,
     messageHistory.length,
-    ...entries,
+    ...recentEntries,
   )
-  historyNavigator.replaceEntries(messageHistory)
+  historyNavigator?.replaceEntries(messageHistory)
 }
 
-function pushHistory(label: string, text: string, detail = '') {
-  const normalized = normalizeInlineText(text)
+function pushHistory(
+  label: string,
+  text: string,
+  detail = '',
+  metadata: { id?: string; hasDetail?: boolean } = {},
+) {
+  const normalized = transcriptPreview(text)
   if (!normalized) return null
   const now = Date.now()
   let duplicate: HistoryEntry | undefined
   for (let index = messageHistory.length - 1; index >= 0; index -= 1) {
     const entry = messageHistory[index]
     if (now - entry.receivedAt > HISTORY_DUPLICATE_WINDOW_MS) break
-    if (entry.label === label && entry.text === normalized) {
+    const sameEntry = metadata.id
+      ? entry.id === metadata.id
+      : entry.label === label && entry.text === normalized
+    if (sameEntry) {
       duplicate = entry
       break
     }
@@ -542,28 +640,39 @@ function pushHistory(label: string, text: string, detail = '') {
   if (duplicate) {
     if (detail && !duplicate.detail) {
       const normalizedDetail = normalizeHistoryBlock(detail)
-      if (normalizedDetail) duplicate.detail = normalizedDetail
+      if (normalizedDetail) duplicate.detail = normalizedDetail.slice(0, HISTORY_ENTRY_TEXT_LIMIT)
     }
+    if (metadata.id) duplicate.id = metadata.id
+    if (metadata.hasDetail) duplicate.hasDetail = true
+    historyNavigator?.replaceEntries(messageHistory)
     return duplicate
   }
 
   const entry: HistoryEntry = {
-    label,
+    id: metadata.id,
+    label: label.slice(0, 64),
     text: normalized,
+    hasDetail: metadata.hasDetail,
     receivedAt: now,
   }
   const normalizedDetail = normalizeHistoryBlock(detail)
   if (normalizedDetail) {
-    entry.detail = normalizedDetail
+    entry.detail = normalizedDetail.slice(0, HISTORY_ENTRY_TEXT_LIMIT)
   }
 
   messageHistory.push(entry)
-  historyNavigator.appendEntry(entry)
+  if (messageHistory.length > RECENT_HISTORY_ENTRY_LIMIT) {
+    messageHistory.splice(0, messageHistory.length - RECENT_HISTORY_ENTRY_LIMIT)
+    historyNavigator?.replaceEntries(messageHistory)
+  } else {
+    historyNavigator?.appendEntry(entry)
+  }
   return entry
 }
 
 async function scrollHistoryWindow(direction: HistoryScrollDirection) {
-  const result = historyNavigator.scroll(direction)
+  const navigator = currentHistoryNavigator()
+  const result = navigator.scroll(direction)
   syncHistoryMode()
   const displayContent = historyDisplayContent(result.content)
   const skippedSameFrame = displayContent === lastHistoryRenderedContent
@@ -649,8 +758,15 @@ function requestHistoryWindowUpdate() {
 }
 
 function cancelPendingStatusRender() {
-  statusRenderRevision += 1
-  pendingStatusContainerContent = ''
+  statusRenderQueue?.clear()
+}
+
+function requestMessageHistoryDetail(ids: string[]) {
+  if (ws?.readyState !== WebSocket.OPEN || !ids.length) return
+  ws.send(JSON.stringify({
+    type: 'get_message_history_detail',
+    ids,
+  }))
 }
 
 function requestMessageHistory(reason: string) {
@@ -694,18 +810,21 @@ function updateWorkbenchProgressAgents(payload: Record<string, unknown>) {
 
   const record = workbench as Record<string, unknown>
   const agents = record.enabled === false ? [] : sanitizeAgentList(record.activeAgents)
-  historyNavigator.replaceProgressAgents(agents)
+  workbenchProgressAgents = agents
+  historyNavigator?.replaceProgressAgents(agents)
   requestHistoryWindowUpdate()
 }
 
 function renderPeekProgressDetail(agent: string) {
-  if (!isHistoryMode()) return
+  if (!isHistoryMode() || !historyNavigator) return
 
-  const result = historyNavigator.openLatestDetailForAgent(agent)
+  const navigator = historyNavigator
+  const result = navigator.openLatestDetailForAgent(agent)
   syncHistoryMode()
-  const content = result.action === 'opened_detail'
+  if (result.entryIds?.length) requestMessageHistoryDetail(result.entryIds)
+  const content = result.action === 'opened_detail' || result.action === 'load_detail'
     ? result.content
-    : historyNavigator.content()
+    : navigator.content()
 
   void renderHistoryContent(content).then(rendered => {
     if (!rendered) {
@@ -715,9 +834,11 @@ function renderPeekProgressDetail(agent: string) {
 
     sendControlDebug({
       type: 'history_debug',
-      action: result.action === 'opened_detail' ? result.action : 'opened_detail',
+      action: result.action === 'opened_detail' || result.action === 'load_detail'
+        ? result.action
+        : 'opened_detail',
       mode: glassesMode,
-      ...navigatorDebugPayload(historyNavigator.debug(content)),
+      ...navigatorDebugPayload(navigator.debug(content)),
     })
   })
 }
@@ -734,16 +855,18 @@ function navigatorDebugPayload(debug: ReturnType<HistoryNavigator['debug']>) {
   }
 }
 
-function historyDisplayContent(content = historyNavigator.content()) {
-  const lines = content ? content.split('\n') : ['']
+function historyDisplayContent(content?: string) {
+  const resolvedContent = content ?? historyNavigator?.content() ?? ''
+  const lines = resolvedContent ? resolvedContent.split('\n') : ['']
   while (lines.length < HISTORY_VISIBLE_LINES) {
     lines.push('')
   }
   return lines.slice(0, HISTORY_VISIBLE_LINES).join('\n')
 }
 
-async function renderHistoryContent(content = historyNavigator.content()) {
-  const displayContent = historyDisplayContent(content)
+async function renderHistoryContent(content?: string) {
+  const resolvedContent = content ?? historyNavigator?.content() ?? ''
+  const displayContent = historyDisplayContent(resolvedContent)
   lastHistoryRequestedContent = displayContent
 
   const rendered = await upgradeStatusContainer(displayContent)
@@ -758,37 +881,9 @@ function upgradeStatusContainer(content: string) {
   if (receiverStandby) return Promise.resolve(true)
 
   const safeContent = content.slice(0, TEXT_UPGRADE_LIMIT)
-  if (safeContent === pendingStatusContainerContent) return statusRenderQueue
-  if (!pendingStatusContainerContent && safeContent === lastStatusContainerContent) {
-    return Promise.resolve(true)
-  }
-
-  const revision = ++statusRenderRevision
-  pendingStatusContainerContent = safeContent
-
-  statusRenderQueue = statusRenderQueue
-    .catch(() => false)
-    .then(async () => {
-      if (revision !== statusRenderRevision) {
-        if (pendingStatusContainerContent === safeContent) pendingStatusContainerContent = ''
-        return true
-      }
-      lastStatusContainerUpgradeAt = Date.now()
-      const rendered = await bridge.textContainerUpgrade(
-        new TextContainerUpgrade({
-          containerID: STATUS_CONTAINER_ID,
-          containerName: STATUS_CONTAINER_NAME,
-          contentOffset: 0,
-          contentLength: 0,
-          content: safeContent,
-        }),
-      )
-      if (rendered) lastStatusContainerContent = safeContent
-      if (pendingStatusContainerContent === safeContent) pendingStatusContainerContent = ''
-      return rendered
-    })
-
-  return statusRenderQueue
+  if (safeContent === lastStatusContainerContent) return Promise.resolve(true)
+  if (statusRenderUnavailable || !statusRenderQueue) return Promise.resolve(false)
+  return statusRenderQueue.submit(safeContent)
 }
 
 async function flushHistoryWindowUpdate() {
@@ -820,7 +915,8 @@ async function showHistoryWindow() {
   cancelPendingStatusRender()
   clearLiveTranscriptDisplay()
   const previousMode = glassesMode
-  const result = historyNavigator.open()
+  const navigator = await getHistoryNavigator()
+  const result = navigator.open()
   syncHistoryMode()
   requestMessageHistory('open_history')
   const rendered = await renderHistoryContent(result.content)
@@ -836,7 +932,7 @@ async function showHistoryWindow() {
   }
 
   glassesMode = previousMode
-  historyNavigator.close()
+  navigator.close()
   sendControlDebug({
     type: 'history_debug',
     action: 'open_failed',
@@ -847,7 +943,8 @@ async function showHistoryWindow() {
 
 async function closeHistoryWindow() {
   const previousMode = glassesMode
-  historyNavigator.close()
+  const navigator = currentHistoryNavigator()
+  navigator.close()
   glassesMode = 'live'
 
   const rendered = await upgradeStatusContainer(currentLiveGlassesContent())
@@ -879,8 +976,9 @@ async function handleHistoryTap() {
   historyTransitioning = true
 
   try {
+    const navigator = await getHistoryNavigator()
     const queuedBackSelected = speechDispatchDisplay?.state === 'queued' && (
-      !isHistoryMode() || historyNavigator.debug().selectedRow === 0
+      !isHistoryMode() || navigator.debug().selectedRow === 0
     )
     if (queuedBackSelected) {
       if (!requestQueuedTranscriptFlush()) return
@@ -894,7 +992,8 @@ async function handleHistoryTap() {
       return
     }
 
-    const result = historyNavigator.tap()
+    const result = navigator.tap()
+    if (result.entryIds?.length) requestMessageHistoryDetail(result.entryIds)
     syncHistoryMode()
     const content = isHistoryMode()
       ? result.content
@@ -940,11 +1039,12 @@ async function handleHistoryTap() {
 function clearSpeechProcessingState() {
   speechDetected = false
   waveformFrameIndex = 0
+  stopSpeechWaveform()
   clearSpeechDispatchDisplay()
   queuedTranscriptFlushRequested = false
   openFlushedTranscriptDetail = false
   clearLiveTranscriptDisplay()
-  historyNavigator.clearPendingTranscript()
+  historyNavigator?.clearPendingTranscript()
   requestHistoryWindowUpdate()
 }
 
@@ -959,7 +1059,7 @@ function clearLiveTranscriptDisplay() {
 
 function clearSpeechDispatchDisplay() {
   speechDispatchDisplay = null
-  deferredLiveTranscript = null
+  deferredLiveTranscript = ''
   if (clearSpeechDispatchTimer !== null) {
     window.clearTimeout(clearSpeechDispatchTimer)
     clearSpeechDispatchTimer = null
@@ -969,8 +1069,9 @@ function clearSpeechDispatchDisplay() {
 function stopSpeechProcessingIndicator(options: { clearPending?: boolean } = {}) {
   speechDetected = false
   waveformFrameIndex = 0
+  stopSpeechWaveform()
   if (options.clearPending !== false) {
-    historyNavigator.clearPendingTranscript()
+    historyNavigator?.clearPendingTranscript()
   }
   requestHistoryWindowUpdate()
 }
@@ -978,6 +1079,7 @@ function stopSpeechProcessingIndicator(options: { clearPending?: boolean } = {})
 function startSpeechProcessingState() {
   if (!isSpeechProcessingActive()) waveformFrameIndex = 0
   speechDetected = true
+  startSpeechWaveform()
 }
 
 function dismissStartupPrompt() {
@@ -1004,7 +1106,7 @@ function appendTranscript(
 }
 
 function showLiveTranscript(text: string) {
-  const normalized = normalizeInlineText(text)
+  const normalized = transcriptPreview(text)
   if (!normalized) return
 
   transcriptText = takeTail(normalized, GLASSES_TEXT_LIMIT)
@@ -1018,13 +1120,14 @@ function showLiveTranscript(text: string) {
 }
 
 function setQueuedSpeechDisplay(text: string) {
-  const queuedText = normalizeSpeechDispatchText(text)
+  const queuedText = transcriptPreview(text)
   if (!queuedText) return
   if (speechDispatchDisplay?.state === 'queued' && speechDispatchDisplay.text === queuedText) return
 
   speechDetected = false
   waveformFrameIndex = 0
-  deferredLiveTranscript = null
+  stopSpeechWaveform()
+  deferredLiveTranscript = ''
   clearLiveTranscriptDisplay()
   if (clearSpeechDispatchTimer !== null) {
     window.clearTimeout(clearSpeechDispatchTimer)
@@ -1035,18 +1138,19 @@ function setQueuedSpeechDisplay(text: string) {
     text: queuedText,
   }
   queuedTranscriptFlushRequested = false
-  historyNavigator.setPendingTranscript(queuedText)
+  historyNavigator?.setPendingTranscript(queuedText)
   transcriptEl.textContent = formatSpeechDispatchDisplay(speechDispatchDisplay)
   requestHistoryWindowUpdate()
   if (!isHistoryMode()) void renderGlassesStatus()
 }
 
 function setTerminalSpeechDisplay(display: SpeechDispatchDisplay) {
-  const normalizedText = normalizeSpeechDispatchText(display.text)
-  const normalizedMessage = normalizeSpeechDispatchText(display.message || '')
-  const normalizedAgent = normalizeSpeechDispatchText(display.agent || '')
+  const normalizedText = transcriptPreview(display.text)
+  const normalizedMessage = transcriptPreview(display.message || '')
+  const normalizedAgent = transcriptPreview(display.agent || '', 32)
   speechDetected = false
   waveformFrameIndex = 0
+  stopSpeechWaveform()
   speechDispatchDisplay = {
     ...display,
     text: normalizedText,
@@ -1055,7 +1159,7 @@ function setTerminalSpeechDisplay(display: SpeechDispatchDisplay) {
   }
   queuedTranscriptFlushRequested = false
   clearLiveTranscriptDisplay()
-  historyNavigator.clearPendingTranscript()
+  historyNavigator?.clearPendingTranscript()
   transcriptEl.textContent = formatSpeechDispatchDisplay(speechDispatchDisplay)
   requestHistoryWindowUpdate()
   if (!isHistoryMode()) void renderGlassesStatus()
@@ -1067,12 +1171,13 @@ function setTerminalSpeechDisplay(display: SpeechDispatchDisplay) {
   clearSpeechDispatchTimer = window.setTimeout(() => {
     clearSpeechDispatchTimer = null
     speechDispatchDisplay = null
+    lastTranscriptEventText = ''
     transcriptEl.textContent = 'Listening...'
     const deferred = deferredLiveTranscript
-    deferredLiveTranscript = null
+    deferredLiveTranscript = ''
 
     if (deferred) {
-      showLiveTranscript(deferred.text)
+      showLiveTranscript(deferred)
       return
     }
 
@@ -1123,18 +1228,27 @@ function scheduleTranscriptClear() {
   }, TRANSCRIPT_CLEAR_MS)
 }
 
-function startIdleSpinner() {
+function startSpeechWaveform() {
   if (spinnerTimer !== null) return
 
   spinnerTimer = window.setInterval(() => {
-    if (!speechDetected) return
-
     waveformFrameIndex = (waveformFrameIndex + 1) % SPEECH_WAVEFORM_FRAMES.length
     void renderGlassesStatus()
   }, SPINNER_INTERVAL_MS)
 }
 
+function stopSpeechWaveform() {
+  if (spinnerTimer !== null) window.clearInterval(spinnerTimer)
+  spinnerTimer = null
+}
+
 function handleReceiverMessage(socket: WebSocket, raw: string) {
+  if (raw.length > MAX_RECEIVER_MESSAGE_CHARS) {
+    console.warn(`Ignored oversized receiver message (${raw.length} characters)`)
+    setUiStatus('Receiver message was too large')
+    return
+  }
+
   let message: unknown
   try {
     message = JSON.parse(raw)
@@ -1165,19 +1279,39 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
     return
   }
 
+  if (payload.type === 'message_history_detail' && Array.isArray(payload.entries)) {
+    const details = payload.entries
+      .map(sanitizeHistoryEntry)
+      .filter((entry): entry is HistoryEntry => entry !== null)
+    const detailsById = new Map(details.map(entry => [entry.id, entry]))
+    for (const entry of messageHistory) {
+      if (!entry.id) continue
+      const detail = detailsById.get(entry.id)
+      if (!detail) continue
+      entry.detail = detail.detail || detail.text
+      entry.hasDetail = false
+    }
+    historyNavigator?.replaceEntries(messageHistory)
+    requestHistoryWindowUpdate()
+    return
+  }
+
   if (payload.type === 'onboarding_prompt' && typeof payload.message === 'string') {
-    backendStartupPrompt = payload.message
-    setUiStatus(payload.message)
+    backendStartupPrompt = payload.message.slice(0, TEXT_UPGRADE_LIMIT)
+    setUiStatus(backendStartupPrompt)
     void renderGlassesStatus()
     return
   }
 
   if (payload.type === 'transcript' && typeof payload.text === 'string') {
     stopSpeechProcessingIndicator({ clearPending: false })
-    const normalized = normalizeInlineText(payload.text)
+    const normalized = transcriptPreview(payload.text)
     if (normalized) {
       lastTranscriptEventText = normalized
-      pushHistory('You', normalized)
+      pushHistory('You', normalized, '', {
+        id: stringValue(payload.historyId),
+        hasDetail: payload.hasDetail === true,
+      })
       transcriptEl.textContent = speechDispatchDisplay
         ? formatSpeechDispatchDisplay(speechDispatchDisplay)
         : normalized
@@ -1186,7 +1320,8 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
     queuedTranscriptFlushRequested = false
     if (openFlushedTranscriptDetail && isHistoryMode()) {
       openFlushedTranscriptDetail = false
-      const result = historyNavigator.openLatestTranscriptDetail()
+      const result = currentHistoryNavigator().openLatestTranscriptDetail()
+      if (result.entryIds?.length) requestMessageHistoryDetail(result.entryIds)
       syncHistoryMode()
       void renderHistoryContent(result.content)
     } else {
@@ -1198,7 +1333,7 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
 
   if (payload.type === 'agent_summary') {
     const detail = normalizeHistoryBlock(textFromFields(payload, DETAIL_TEXT_FIELDS))
-    const summary = normalizeInlineText(textFromFields(payload, SUMMARY_TEXT_FIELDS) || detail)
+    const summary = transcriptPreview(textFromFields(payload, SUMMARY_TEXT_FIELDS) || detail)
     if (!summary) return
 
     const agent = typeof payload.agent === 'string' && payload.agent
@@ -1215,26 +1350,37 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
       waveformFrameIndex = 0
       clearSpeechDispatchDisplay()
       clearLiveTranscriptDisplay()
-      historyNavigator.clearPendingTranscript()
-      pushHistory(agent, summary, detail)
+      historyNavigator?.clearPendingTranscript()
+      pushHistory(agent, summary, detail, {
+        id: stringValue(payload.historyId),
+        hasDetail: payload.hasDetail === true,
+      })
       renderPeekProgressDetail(agent)
       statusEl.textContent = 'Agent summary received'
       return
     }
     if (isTerminalSpeechDisplayActive()) {
-      pushHistory(agent, summary, detail)
-      deferredLiveTranscript = { text: summary, label: agent, detail }
+      pushHistory(agent, summary, detail, {
+        id: stringValue(payload.historyId),
+        hasDetail: payload.hasDetail === true,
+      })
+      deferredLiveTranscript = summary
       requestHistoryWindowUpdate()
       setUiStatus('Agent summary received')
       return
     }
-    appendTranscript(summary, agent, detail)
+    clearSpeechProcessingState()
+    pushHistory(agent, summary, detail, {
+      id: stringValue(payload.historyId),
+      hasDetail: payload.hasDetail === true,
+    })
+    showLiveTranscript(summary)
     setUiStatus('Agent summary received')
     return
   }
 
   if (payload.type === 'receiver_idle' && typeof payload.frame === 'string') {
-    backendIdleFrame = payload.frame
+    backendIdleFrame = payload.frame.slice(0, TEXT_UPGRADE_LIMIT)
     if (historyTransitioning || isHistoryMode()) {
       requestHistoryWindowUpdate()
       return
@@ -1346,6 +1492,7 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
   if (payload.type === 'asr_status' && payload.status === 'cleaning') {
     speechDetected = false
     waveformFrameIndex = 0
+    stopSpeechWaveform()
     requestHistoryWindowUpdate()
     setUiStatus('Cleaning transcript...')
     return
@@ -1368,7 +1515,10 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
     if (payload.status === 'active') {
       const wasStandby = receiverStandby
       receiverStandby = false
-      if (wasStandby) lastStatusContainerContent = ''
+      statusRenderUnavailable = false
+      if (wasStandby) {
+        lastStatusContainerContent = ''
+      }
       if (isHistoryMode()) requestHistoryWindowUpdate()
       else void renderGlassesStatus()
       setUiStatus('Receiver connected')
@@ -1589,6 +1739,32 @@ function logInputEvent(event: EvenHubEvent) {
 }
 
 const bridge = await waitForEvenAppBridge()
+statusRenderQueue = new LatestTaskQueue(async content => {
+  if (cleanedUp || receiverStandby || statusRenderUnavailable) return false
+  lastStatusContainerUpgradeAt = Date.now()
+  try {
+    const rendered = await withTimeout(
+      bridge.textContainerUpgrade(
+        new TextContainerUpgrade({
+          containerID: STATUS_CONTAINER_ID,
+          containerName: STATUS_CONTAINER_NAME,
+          contentOffset: 0,
+          contentLength: 0,
+          content,
+        }),
+      ),
+      STATUS_RENDER_TIMEOUT_MS,
+      'textContainerUpgrade',
+    )
+    if (rendered) lastStatusContainerContent = content
+    else statusRenderUnavailable = true
+    return rendered
+  } catch (err) {
+    statusRenderUnavailable = true
+    console.warn('Text container rendering paused until receiver reactivation', err)
+    return false
+  }
+})
 audioEndpointSettings = await readAudioEndpointSettings()
 audioWsEndpoints = buildAudioWsEndpoints(audioEndpointSettings, launchToken())
 evenUserInfo = await loadUserInfo()
@@ -1610,7 +1786,7 @@ if (created !== 0) {
 lastStatusContainerContent = currentLiveGlassesContent().slice(0, TEXT_UPGRADE_LIMIT)
 
 async function startAudioStream(socket: WebSocket) {
-  if (socket !== ws || socket.readyState !== WebSocket.OPEN || startedAudioSockets.has(socket)) return
+  if (cleanedUp || socket !== ws || socket.readyState !== WebSocket.OPEN || startedAudioSockets.has(socket)) return
   startedAudioSockets.add(socket)
   const endpoint = currentAudioEndpoint()
   const attempt = socketConnectionAttempts.get(socket) || 0
@@ -1631,6 +1807,10 @@ async function startAudioStream(socket: WebSocket) {
   socket.send(JSON.stringify(startMessage))
   scheduleMicWatchdog(socket, { baselineChunks: sentChunks, restarted: false })
   await setAudio(true)
+  if (cleanedUp || socket !== ws || socket.readyState !== WebSocket.OPEN) {
+    void audioControlWithTimeout(false).catch(() => {})
+    return
+  }
   if (!backendStartupPrompt) {
     setUiStatus(`Streaming G2 mic audio${endpoint ? ` via ${endpoint.label}` : ''}`)
   }
@@ -1643,6 +1823,7 @@ async function renderGlassesStatus() {
 }
 
 async function setAudio(open: boolean) {
+  if (cleanedUp && open) return
   if (audioOpen === open) return
   audioOpen = open
   setStats()
@@ -1651,7 +1832,7 @@ async function setAudio(open: boolean) {
   } catch (err) {
     audioOpen = !open
     setStats()
-    setUiStatus(`audioControl(${String(open)}) failed`)
+    if (!cleanedUp) setUiStatus(`audioControl(${String(open)}) failed`)
     console.error(err)
   }
 }
@@ -1688,6 +1869,7 @@ function delayMs(ms: number) {
 }
 
 async function restartAudioControl(reason: string) {
+  if (cleanedUp) return
   console.warn(`Restarting G2 audio: ${reason}`)
   setUiStatus('Restarting mic audio...')
   try {
@@ -1695,6 +1877,7 @@ async function restartAudioControl(reason: string) {
     setStats()
     await audioControlWithTimeout(false)
     await delayMs(MIC_WATCHDOG_RESTART_DELAY_MS)
+    if (cleanedUp) return
     audioOpen = true
     setStats()
     await audioControlWithTimeout(true)
@@ -1762,6 +1945,7 @@ function scheduleReconnect() {
 }
 
 function connect() {
+  if (cleanedUp) return
   const endpoint = currentAudioEndpoint()
   if (!endpoint) {
     setUiStatus('Missing audio WebSocket URL')
@@ -1845,6 +2029,7 @@ function connect() {
     backendIdleFrame = ''
     setStats()
     speechDetected = false
+    stopSpeechWaveform()
     setUiStatus(`${endpoint.label} receiver connection error`)
   })
 }
@@ -1855,16 +2040,24 @@ function cleanup() {
   backendIdleFrame = ''
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
   if (clearTranscriptTimer !== null) window.clearTimeout(clearTranscriptTimer)
-  if (spinnerTimer !== null) window.clearInterval(spinnerTimer)
+  if (clearSpeechDispatchTimer !== null) window.clearTimeout(clearSpeechDispatchTimer)
+  stopSpeechWaveform()
   clearMicWatchdog()
   reconnectTimer = null
   clearTranscriptTimer = null
-  spinnerTimer = null
+  clearSpeechDispatchTimer = null
+  statusRenderQueue?.stop()
+  statusRenderQueue = null
+  historyNavigator?.close()
+  historyNavigator = null
+  lastTranscriptEventText = ''
   void setAudio(false)
   ws?.close()
   ws = null
   unsubscribe?.()
   unsubscribe = null
+  window.removeEventListener('beforeunload', cleanup)
+  if (console.log === filteredConsoleLog) console.log = originalConsoleLog
 }
 
 unsubscribe = bridge.onEvenHubEvent(event => {
@@ -1872,6 +2065,13 @@ unsubscribe = bridge.onEvenHubEvent(event => {
   if (pcm) {
     const currentSocket = ws
     if (currentSocket?.readyState === WebSocket.OPEN && startedAudioSockets.has(currentSocket)) {
+      if (wouldExceedAudioBacklog(currentSocket.bufferedAmount, pcm.byteLength)) {
+        droppedChunks += 1
+        setStats()
+        setUiStatus('Audio network stalled, reconnecting...')
+        currentSocket.close(4005, `audio backlog exceeded ${MAX_AUDIO_SOCKET_BUFFER_BYTES} bytes`)
+        return
+      }
       currentSocket.send(pcm)
       markAudioChunkSent(currentSocket, pcm.byteLength)
       if (sentChunks % 10 === 0) {
@@ -1885,6 +2085,7 @@ unsubscribe = bridge.onEvenHubEvent(event => {
 
   const inputType = getEventType(event)
   if (inputType === OsEventTypeList.SYSTEM_EXIT_EVENT) {
+    cleanup()
     return
   }
 
@@ -1920,5 +2121,4 @@ window.addEventListener('beforeunload', cleanup)
 
 setStats()
 setupEndpointForm()
-startIdleSpinner()
 connect()
