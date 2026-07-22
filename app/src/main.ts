@@ -761,6 +761,14 @@ function cancelPendingStatusRender() {
   statusRenderQueue?.clear()
 }
 
+function reactivateStatusRendering() {
+  receiverStandby = false
+  statusRenderUnavailable = false
+  lastStatusContainerContent = ''
+  if (isHistoryMode()) requestHistoryWindowUpdate()
+  else void renderGlassesStatus()
+}
+
 function requestMessageHistoryDetail(ids: string[]) {
   if (ws?.readyState !== WebSocket.OPEN || !ids.length) return
   ws.send(JSON.stringify({
@@ -1513,14 +1521,7 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
       return
     }
     if (payload.status === 'active') {
-      const wasStandby = receiverStandby
-      receiverStandby = false
-      statusRenderUnavailable = false
-      if (wasStandby) {
-        lastStatusContainerContent = ''
-      }
-      if (isHistoryMode()) requestHistoryWindowUpdate()
-      else void renderGlassesStatus()
+      reactivateStatusRendering()
       setUiStatus('Receiver connected')
       return
     }
@@ -1546,14 +1547,9 @@ function handleReceiverMessage(socket: WebSocket, raw: string) {
   if (payload.type === 'auth_status') {
     if (payload.status === 'accepted') {
       if (typeof payload.standby === 'boolean') {
-        const wasStandby = receiverStandby
         receiverStandby = payload.standby
         if (receiverStandby) cancelPendingStatusRender()
-        else if (wasStandby) {
-          lastStatusContainerContent = ''
-          if (isHistoryMode()) requestHistoryWindowUpdate()
-          else void renderGlassesStatus()
-        }
+        else reactivateStatusRendering()
       }
       void startAudioStream(socket)
     } else if (payload.status === 'rejected') {

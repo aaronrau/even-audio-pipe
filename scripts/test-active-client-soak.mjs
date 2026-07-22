@@ -63,6 +63,8 @@ try {
   await cdp.send('Performance.enable')
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
     source: `
+      window.__evenAudioPipeFailNextRender = false;
+      window.__evenAudioPipeRenderedContents = [];
       window.flutter_inappwebview = {
         callHandler: async (_handler, rawRequest) => {
           const request = typeof rawRequest === 'string'
@@ -71,6 +73,15 @@ try {
           if (request?.method === 'getUserInfo') return null;
           if (request?.method === 'getLocalStorage') return '';
           if (request?.method === 'createStartUpPageContainer') return 0;
+          if (request?.method === 'textContainerUpgrade') {
+            if (window.__evenAudioPipeFailNextRender) {
+              window.__evenAudioPipeFailNextRender = false;
+              return false;
+            }
+            window.__evenAudioPipeRenderedContents.push(JSON.stringify(request));
+            window.__evenAudioPipeRenderedContents =
+              window.__evenAudioPipeRenderedContents.slice(-100);
+          }
           return true;
         },
       };
@@ -85,6 +96,43 @@ try {
       document.getElementById('stats')?.textContent?.includes('chunks')
     )
   `)
+  await waitForCondition(() => receiver.starts() >= 1, 'initial receiver start')
+
+  await cdp.evaluate('window.__evenAudioPipeFailNextRender = true')
+  receiver.broadcast({
+    type: 'transcript',
+    historyId: 'render-failure-probe',
+    text: 'render failure recovery probe',
+  })
+  await waitForRuntime(cdp, 'window.__evenAudioPipeMemorySnapshot().renderUnavailable === true')
+
+  receiver.disconnectClients()
+  await waitForCondition(() => receiver.starts() >= 2, 'receiver restart after render failure')
+  await waitForRuntime(cdp, `
+    window.__evenAudioPipeMemorySnapshot().receiverState === 'open' &&
+    window.__evenAudioPipeMemorySnapshot().renderUnavailable === false
+  `)
+
+  const recoveredResponse = 'Pike response rendered after reconnect'
+  const renderCountBeforeResponse = await cdp.evaluate(
+    'window.__evenAudioPipeRenderedContents.length',
+  )
+  receiver.broadcast({
+    type: 'agent_summary',
+    agent: 'Pike',
+    text: recoveredResponse,
+    is_final: true,
+    phase: 'final',
+  })
+  await waitForRuntime(
+    cdp,
+    `document.getElementById('transcript')?.textContent === ${JSON.stringify(recoveredResponse)}`,
+  )
+  await waitForRuntime(
+    cdp,
+    `window.__evenAudioPipeRenderedContents.length > ${renderCountBeforeResponse}`,
+  )
+  receiver.startTranscripts()
 
   const pcmBase64 = Buffer.alloc(3_200).toString('base64')
   await cdp.evaluate(`
@@ -146,7 +194,13 @@ try {
   for (const task of cleanupTasks.reverse()) {
     await task()
   }
-  rmSync(chromeProfile, { recursive: true, force: true })
+  await delay(1_000)
+  rmSync(chromeProfile, {
+    recursive: true,
+    force: true,
+    maxRetries: 20,
+    retryDelay: 200,
+  })
 }
 
 function positiveNumber(value, fallback) {
@@ -202,9 +256,13 @@ function contentType(path) {
 
 function startFakeReceiver(port) {
   let transcriptId = 0
+  let startedClients = 0
+  let transcriptsEnabled = false
   const intervals = new Set()
+  const sockets = new Set()
   const server = new WebSocketServer({ host: '127.0.0.1', port })
   server.on('connection', socket => {
+    sockets.add(socket)
     socket.on('message', (data, isBinary) => {
       if (isBinary) return
       let control
@@ -215,16 +273,17 @@ function startFakeReceiver(port) {
       }
       if (control.type !== 'start') return
       socket.send(JSON.stringify({
-        type: 'receiver_status',
-        status: 'active',
-        workbench: { enabled: false, activeAgents: [] },
+        type: 'auth_status',
+        status: 'accepted',
+        standby: false,
       }))
       socket.send(JSON.stringify({
         type: 'onboarding_prompt',
         message: 'Active soak',
       }))
+      startedClients += 1
       const interval = setInterval(() => {
-        if (socket.readyState !== WebSocket.OPEN) return
+        if (!transcriptsEnabled || socket.readyState !== WebSocket.OPEN) return
         transcriptId += 1
         socket.send(JSON.stringify({
           type: 'transcript',
@@ -236,6 +295,7 @@ function startFakeReceiver(port) {
       }, 25)
       intervals.add(interval)
       socket.once('close', () => {
+        sockets.delete(socket)
         clearInterval(interval)
         intervals.delete(interval)
       })
@@ -247,6 +307,18 @@ function startFakeReceiver(port) {
         for (const interval of intervals) clearInterval(interval)
         await new Promise(resolveClose => server.close(resolveClose))
       },
+      broadcast: payload => {
+        for (const socket of sockets) {
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload))
+        }
+      },
+      disconnectClients: () => {
+        for (const socket of sockets) socket.close(1012, 'render recovery probe')
+      },
+      startTranscripts: () => {
+        transcriptsEnabled = true
+      },
+      starts: () => startedClients,
       transcriptsSent: () => transcriptId,
     }))
     server.once('error', reject)
@@ -314,6 +386,14 @@ async function waitForRuntime(cdp, expression) {
     await delay(100)
   }
   throw new Error('thin client did not initialize in Chrome')
+}
+
+async function waitForCondition(predicate, label) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return
+    await delay(50)
+  }
+  throw new Error(`timed out waiting for ${label}`)
 }
 
 async function sampleClient(cdp) {

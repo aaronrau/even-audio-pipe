@@ -913,7 +913,9 @@ function publishWorkbenchSummary(payload, options = {}) {
     createdAt,
   })
 
-  console.log(`[workbench] summary received${agent ? ` from ${agent}` : ''}: ${summary}`)
+  console.log(
+    `[workbench] summary received${agent ? ` from ${agent}` : ''} delivered=${delivered}: ${summary}`,
+  )
   return { delivered, summary, detail, agent, command, phase, isFinal }
 }
 
