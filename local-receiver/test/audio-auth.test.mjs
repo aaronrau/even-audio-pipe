@@ -1277,6 +1277,207 @@ test('receiver asks cleanup to normalize contextual N to N variants as end-to-en
     const systemPrompt = cleanup.requests[0]?.body?.messages?.[0]?.content || ''
     assert.match(systemPrompt, /"N to N".*"end-to-end"/s)
     assert.match(systemPrompt, /Do not rewrite literal letters, ranges, or unrelated uses/)
+    assert.match(systemPrompt, /length view.*lang fuse.*land fuse.*Langfuse/s)
+    assert.match(systemPrompt, /code x.*condex.*codec.*kodex.*Codex/s)
+    assert.match(systemPrompt, /yaws.*evalues.*e values.*e vals.*evals.*EVALS/s)
+    assert.match(systemPrompt, /Semcha.*Symtra.*Simchot.*Simchad.*sim chat.*asim chat.*SMCAT/s)
+    assert.doesNotMatch(systemPrompt, /local AI coding agent/)
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    await cleanup.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver gives agent-prefixed cleanup coding command and planning context', async () => {
+  const cleanup = await startFakeWorkbench(() => ({
+    choices: [{
+      finish_reason: 'stop',
+      message: {
+        content: 'Pike, plan the implementation, then run the type-check and git diff.',
+      },
+    }],
+  }))
+  const { child, dir, port } = await startReceiver({
+    ASR_COMMAND: "printf 'Hey Pipe plan the implementation then run the type check and get diff.'",
+    ASR_CHUNK_MODE: 'fixed',
+    ASR_SEGMENT_SECONDS: '0.01',
+    MIN_ASR_BYTES: '1',
+    TRANSCRIPT_QUEUE_IDLE_MS: '10',
+    TRANSCRIPT_QUEUE_MAX_HOLD_MS: '1000',
+    TRANSCRIPT_CLEANUP_ENABLED: '1',
+    TRANSCRIPT_CLEANUP_URL: cleanup.url,
+    TRANSCRIPT_CLEANUP_MODEL: 'test-model',
+  })
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'coding-cleanup-user' },
+    }))
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+
+    const transcript = waitForJson(ws, message => message.type === 'transcript')
+    ws.send(Buffer.alloc(320, 1))
+    assert.equal(
+      (await transcript).text,
+      'Pike, plan the implementation, then run the type-check and git diff.',
+    )
+
+    const systemPrompt = cleanup.requests[0]?.body?.messages?.[0]?.content || ''
+    assert.match(systemPrompt, /addresses Pike, a local AI coding agent/)
+    assert.match(systemPrompt, /length view.*lang fuse.*land fuse.*Langfuse/s)
+    assert.match(systemPrompt, /code x.*condex.*codec.*kodex.*Codex/s)
+    assert.match(systemPrompt, /yaws.*evalues.*e values.*e vals.*evals.*EVALS/s)
+    assert.match(systemPrompt, /flex.*Flux.*block.*brook.*Brock.*pipe.*Pike.*wolfe.*Wolf/s)
+    assert.match(systemPrompt, /engineering task or planning prompt/)
+    assert.match(systemPrompt, /implement.*debug.*type-check.*pull request.*worktree/s)
+    assert.match(systemPrompt, /do not improve the plan, invent steps, execute the task/i)
+    assert.match(systemPrompt, /Never summarize, shorten, or omit an informational clause/)
+    assert.match(systemPrompt, /implementation plan.*git status.*npm test/s)
+    assert.match(
+      systemPrompt,
+      /new one called End-to-End Conversation Flow Workshop Test/s,
+    )
+    assert.match(systemPrompt, /dev branch.*worktrees/s)
+    assert.match(systemPrompt, /Claire session.*Brock, clear session/s)
+    assert.match(systemPrompt, /length view traces.*Langfuse traces/s)
+    assert.match(systemPrompt, /hen all the chains push to death.*changes get pushed to dev/s)
+    ws.close()
+  } finally {
+    await stopReceiver(child)
+    await cleanup.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('receiver guards the unsafe Flux sound-alike behind coding command context', async () => {
+  const cleanup = await startFakeWorkbench(() => ({
+    choices: [{
+      finish_reason: 'stop',
+      message: { content: 'checked transcript' },
+    }],
+  }))
+  const cases = [
+    { raw: 'Fuck, run the tests and get status.', codingAgent: true },
+    { raw: 'I got it. Fuck. That was frustrating.', codingAgent: false },
+  ]
+
+  try {
+    for (const [index, item] of cases.entries()) {
+      const requestIndex = cleanup.requests.length
+      const { child, dir, port } = await startReceiver({
+        ASR_COMMAND: 'node -e "process.stdout.write(process.env.TEST_ASR)"',
+        TEST_ASR: item.raw,
+        ASR_CHUNK_MODE: 'fixed',
+        ASR_SEGMENT_SECONDS: '0.01',
+        MIN_ASR_BYTES: '1',
+        TRANSCRIPT_QUEUE_IDLE_MS: '10',
+        TRANSCRIPT_QUEUE_MAX_HOLD_MS: '1000',
+        TRANSCRIPT_CLEANUP_ENABLED: '1',
+        TRANSCRIPT_CLEANUP_URL: cleanup.url,
+        TRANSCRIPT_CLEANUP_MODEL: 'test-model',
+      })
+
+      try {
+        const ws = await openSocket(port)
+        ws.send(JSON.stringify({
+          type: 'start',
+          source: 'g2',
+          encoding: 'pcm_s16le',
+          sampleRate: 16000,
+          channels: 1,
+          user: { id: `guarded-alias-user-${index}` },
+        }))
+        await waitForJson(ws, message => message.type === 'onboarding_prompt')
+
+        const transcript = waitForJson(ws, message => message.type === 'transcript')
+        ws.send(Buffer.alloc(320, 1))
+        await transcript
+
+        const systemPrompt = cleanup.requests[requestIndex]?.body?.messages?.[0]?.content || ''
+        if (item.codingAgent) {
+          assert.match(systemPrompt, /addresses Flux, a local AI coding agent/)
+        } else {
+          assert.doesNotMatch(systemPrompt, /local AI coding agent/)
+        }
+        ws.close()
+      } finally {
+        await stopReceiver(child)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  } finally {
+    await cleanup.close()
+  }
+})
+
+test('receiver hot-reloads the configured coding-agent cleanup prompt', async () => {
+  const cleanup = await startFakeWorkbench(() => ({
+    choices: [{
+      finish_reason: 'stop',
+      message: { content: 'Pike, plan the test.' },
+    }],
+  }))
+  const firstConfig = {
+    transcriptCleanup: {
+      prompt: 'Configured base cleanup marker.',
+      codingAgentPrompt: 'Configured first coding marker for {agent}.',
+    },
+  }
+  const { child, dir, port } = await startReceiver({
+    ASR_COMMAND: "printf 'Hey Pipe plan the test.'",
+    ASR_CHUNK_MODE: 'fixed',
+    ASR_SEGMENT_SECONDS: '0.01',
+    MIN_ASR_BYTES: '1',
+    TRANSCRIPT_QUEUE_IDLE_MS: '10',
+    TRANSCRIPT_QUEUE_MAX_HOLD_MS: '1000',
+    TRANSCRIPT_CLEANUP_ENABLED: '1',
+    TRANSCRIPT_CLEANUP_URL: cleanup.url,
+    TRANSCRIPT_CLEANUP_MODEL: 'test-model',
+  }, { runtimeConfig: firstConfig })
+
+  try {
+    const ws = await openSocket(port)
+    ws.send(JSON.stringify({
+      type: 'start',
+      source: 'g2',
+      encoding: 'pcm_s16le',
+      sampleRate: 16000,
+      channels: 1,
+      user: { id: 'configurable-coding-prompt-user' },
+    }))
+    await waitForJson(ws, message => message.type === 'onboarding_prompt')
+
+    let transcript = waitForJson(ws, message => message.type === 'transcript')
+    ws.send(Buffer.alloc(320, 1))
+    await transcript
+    assert.equal(
+      cleanup.requests[0]?.body?.messages?.[0]?.content,
+      'Configured base cleanup marker. Configured first coding marker for Pike.',
+    )
+
+    await delay(20)
+    writeFileSync(join(dir, 'config.json'), `${JSON.stringify({
+      transcriptCleanup: {
+        ...firstConfig.transcriptCleanup,
+        codingAgentPrompt: 'Configured second coding marker for {agent}.',
+      },
+    }, null, 2)}\n`)
+
+    transcript = waitForJson(ws, message => message.type === 'transcript')
+    ws.send(Buffer.alloc(320, 1))
+    await transcript
+    assert.equal(
+      cleanup.requests[1]?.body?.messages?.[0]?.content,
+      'Configured base cleanup marker. Configured second coding marker for Pike.',
+    )
     ws.close()
   } finally {
     await stopReceiver(child)

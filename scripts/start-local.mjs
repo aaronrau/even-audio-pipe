@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url'
 import { cpus, networkInterfaces } from 'node:os'
 import { createServer as createNetServer } from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
+import {
+  defaultCleanupPrompt,
+  defaultCodingAgentPrompt,
+} from '../local-receiver/transcript-cleanup-prompt.js'
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const appDir = join(rootDir, 'app')
@@ -149,6 +153,7 @@ spawnManaged('receiver', 'npm', ['start'], {
     TRANSCRIPT_CLEANUP_TEMPERATURE: String(transcriptCleanupConfig.temperature),
     TRANSCRIPT_CLEANUP_TIMEOUT_MS: String(transcriptCleanupConfig.timeoutMs),
     TRANSCRIPT_CLEANUP_PROMPT: transcriptCleanupConfig.prompt,
+    TRANSCRIPT_CLEANUP_CODING_AGENT_PROMPT: transcriptCleanupConfig.codingAgentPrompt,
     TRANSCRIPT_CLEANUP_API_KEY: transcriptCleanupConfig.apiKey,
     SPEECH_WORKBENCH_ENABLED: workbenchConfig.enabled ? '1' : '0',
     SPEECH_WORKBENCH_URL: workbenchConfig.url,
@@ -766,6 +771,11 @@ function resolveTranscriptCleanupConfig(cleanup = {}) {
     cleanup.prompt ||
     defaultCleanupPrompt(),
   )
+  const codingAgentPrompt = String(
+    process.env.TRANSCRIPT_CLEANUP_CODING_AGENT_PROMPT ||
+    cleanup.codingAgentPrompt ||
+    defaultCodingAgentPrompt(),
+  )
   const apiKey = String(
     process.env.TRANSCRIPT_CLEANUP_API_KEY ||
     cleanup.apiKey ||
@@ -796,6 +806,7 @@ function resolveTranscriptCleanupConfig(cleanup = {}) {
     temperature: Number.isFinite(temperature) ? temperature : 0,
     timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15_000,
     prompt,
+    codingAgentPrompt,
     apiKey,
     required,
     llamaCpp,
@@ -891,20 +902,6 @@ function chatCompletionsUrl(baseUrl) {
   if (cleaned.endsWith('/chat/completions')) return cleaned
   if (cleaned.endsWith('/v1')) return `${cleaned}/chat/completions`
   return `${cleaned}/v1/chat/completions`
-}
-
-function defaultCleanupPrompt() {
-  return [
-    'You clean short ASR transcript chunks from smart glasses.',
-    'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
-    'Always rewrite the misheard phrases "ling few", "lane view", and "lanefuse" as "Langfuse".',
-    'When software, testing, integration, or workflow context clearly means complete-path coverage, rewrite ASR variants such as "N to N", "N two N", "end to N", "N to end", "end two end", and "E to E" as "end-to-end". Do not rewrite literal letters, ranges, or unrelated uses.',
-    "Preserve the speaker's meaning and wording.",
-    'Do not remove command words after a routing target; keep "Wolf terminate session" as "Wolf terminate session", not "Wolf".',
-    'Do not add facts, commands, explanations, or markdown.',
-    'If uncertain, keep the original wording.',
-    'Return only the cleaned transcript text.',
-  ].join(' ')
 }
 
 function resolveConfigPath(value) {

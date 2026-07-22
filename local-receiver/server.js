@@ -28,6 +28,11 @@ import {
   THIN_CLIENT_HISTORY_LIMIT,
   thinClientTextPreview,
 } from './thin-client-text.js'
+import {
+  cleanupPromptForTranscript,
+  defaultCleanupPrompt,
+  defaultCodingAgentPrompt,
+} from './transcript-cleanup-prompt.js'
 
 const port = Number(process.env.PORT || 8788)
 const audioDir = process.env.AUDIO_DIR || process.env.OUT_DIR || 'recordings'
@@ -148,6 +153,7 @@ const transcriptCleanupEnv = {
   temperature: Number(process.env.TRANSCRIPT_CLEANUP_TEMPERATURE || 0),
   timeoutMs: Number(process.env.TRANSCRIPT_CLEANUP_TIMEOUT_MS || 15_000),
   prompt: process.env.TRANSCRIPT_CLEANUP_PROMPT || defaultCleanupPrompt(),
+  codingAgentPrompt: process.env.TRANSCRIPT_CLEANUP_CODING_AGENT_PROMPT || defaultCodingAgentPrompt(),
   apiKey: process.env.TRANSCRIPT_CLEANUP_API_KEY || '',
 }
 
@@ -572,20 +578,6 @@ function stripCleanupDecorations(text) {
     .replace(/^cleaned:\s*/i, '')
     .replace(/^["“](.*)["”]$/s, '$1')
     .trim()
-}
-
-function defaultCleanupPrompt() {
-  return [
-    'You clean short ASR transcript chunks from smart glasses.',
-    'Fix obvious speech recognition errors, capitalization, punctuation, and light grammar only.',
-    'Always rewrite the misheard phrases "ling few", "lane view", and "lanefuse" as "Langfuse".',
-    'When software, testing, integration, or workflow context clearly means complete-path coverage, rewrite ASR variants such as "N to N", "N two N", "end to N", "N to end", "end two end", and "E to E" as "end-to-end". Do not rewrite literal letters, ranges, or unrelated uses.',
-    "Preserve the speaker's meaning and wording.",
-    'Do not remove command words after a routing target; keep "Wolf terminate session" as "Wolf terminate session", not "Wolf".',
-    'Do not add facts, commands, explanations, or markdown.',
-    'If uncertain, keep the original wording.',
-    'Return only the cleaned transcript text.',
-  ].join(' ')
 }
 
 function isDisabled(value) {
@@ -1249,14 +1241,17 @@ async function transcribeWithWorker(wavPath) {
 }
 
 function currentTranscriptCleanupConfig() {
-  const runtimePrompt = readRuntimeCleanupPrompt()
-  const basePrompt = runtimePrompt || transcriptCleanupEnv.prompt || defaultCleanupPrompt()
+  const runtimePrompts = readRuntimeCleanupPrompts()
+  const basePrompt = runtimePrompts.prompt || transcriptCleanupEnv.prompt || defaultCleanupPrompt()
 
   return {
     ...transcriptCleanupEnv,
     temperature: Number.isFinite(transcriptCleanupEnv.temperature) ? transcriptCleanupEnv.temperature : 0,
     timeoutMs: Number.isFinite(transcriptCleanupEnv.timeoutMs) ? transcriptCleanupEnv.timeoutMs : 15_000,
     prompt: customAgentCleanupPrompt(basePrompt, currentCustomAgents()),
+    codingAgentPrompt: runtimePrompts.codingAgentPrompt ||
+      transcriptCleanupEnv.codingAgentPrompt ||
+      defaultCodingAgentPrompt(),
   }
 }
 
@@ -1267,10 +1262,15 @@ function currentCustomAgents() {
   )
 }
 
-function readRuntimeCleanupPrompt() {
+function readRuntimeCleanupPrompts() {
   const config = readRuntimeConfig()
-  const prompt = config?.transcriptCleanup?.prompt
-  return typeof prompt === 'string' ? prompt : ''
+  const cleanup = config?.transcriptCleanup
+  return {
+    prompt: typeof cleanup?.prompt === 'string' ? cleanup.prompt : '',
+    codingAgentPrompt: typeof cleanup?.codingAgentPrompt === 'string'
+      ? cleanup.codingAgentPrompt
+      : '',
+  }
 }
 
 function readRuntimeConfig() {
@@ -1584,7 +1584,12 @@ async function cleanTranscript(rawTranscript, cleanupConfig = currentTranscriptC
         messages: [
           {
             role: 'system',
-            content: cleanupConfig.prompt,
+            content: cleanupPromptForTranscript(
+              cleanupConfig.prompt,
+              cleanupConfig.codingAgentPrompt,
+              rawTranscript,
+              workbenchRouter,
+            ),
           },
           {
             role: 'user',

@@ -554,6 +554,8 @@ Example:
     "enabled": true,
     "baseUrl": "http://127.0.0.1:8080/v1",
     "model": "gemma-4-e4b-it-q4_0",
+    "prompt": "General ASR cleanup instructions...",
+    "codingAgentPrompt": "The transcript addresses {agent}, a local AI coding agent...",
     "llamaCpp": {
       "autoStart": false
     }
@@ -561,7 +563,23 @@ Example:
 }
 ```
 
-Prompt changes in `config.json` are picked up on the next cleanup request.
+`prompt` is applied to every transcript. `codingAgentPrompt` is appended only
+when the workbench router recognizes an agent target, and each `{agent}` token is
+replaced with that agent's canonical name. Changes to either prompt in
+`config.json` are picked up on the next cleanup request. The equivalent coding
+prompt environment override is `TRANSCRIPT_CLEANUP_CODING_AGENT_PROMPT`.
+
+When the existing workbench router recognizes an agent in the transcript prefix,
+the receiver also tells the cleanup model that the utterance is a prompt for that
+AI coding agent. That conditional context covers common implementation, planning,
+debugging, Git, build, lint, and test language while preserving paths, flags,
+identifiers, ordering, scope, and constraints. Transcripts without a recognized
+agent prefix keep the general cleanup context.
+
+Established pronunciation corrections remain active in both contexts. Ambiguous
+routing sound-alikes are guarded: safe aliases use the existing router, while an
+unsafe sound-alike such as `fuck` is treated as `Flux` only near the transcript
+start when a recognizable coding command follows it.
 
 The cleanup guard preserves commands when a model collapses an utterance such as
 `Wolf terminate session` into only `Wolf`.
